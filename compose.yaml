@@ -1,0 +1,21 @@
+services:
+  web:
+    build: .
+    restart: unless-stopped
+    ports: ["127.0.0.1:8000:8000"]
+    environment:
+      FLOWHUB_HTTPS: "1"
+    volumes: ["flowhub_data:/app/data"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 30s
+  worker:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "flowhub.worker"]
+    volumes: ["flowhub_data:/app/data"]
+    depends_on:
+      web:
+        condition: service_healthy
+volumes:
+  flowhub_data:
