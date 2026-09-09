@@ -21,6 +21,9 @@ async def check(db):
         ]
         heartbeat = c.execute("SELECT heartbeat FROM health WHERE name='worker'").fetchone()
         samples = [r[0] for r in c.execute("SELECT at FROM health_samples ORDER BY at")]
+        phases = dict(
+            c.execute("SELECT phase,COUNT(*) FROM jobs WHERE owner=? GROUP BY phase", (state["owner"],))
+        )
     result = []
     for j in jobs:
         context = (
@@ -56,7 +59,11 @@ async def check(db):
         verified=verified,
         worker_alive=bool(heartbeat and time.time() - heartbeat[0] < 20),
         sample_count=len(samples),
+        phase_counts=phases,
     )
+    if jobs and not state.get("first_batch_verified_at"):
+        state["started"] = state.get("started") or min(j["updated"] for j in jobs)
+        state["status"] = "real_listing_in_progress"
     if verified >= state["max_publications"] and len(result) == verified:
         state.setdefault("first_batch_verified_at", time.time())
         state["status"] = "first_batch_verified_24h_observation_pending"
