@@ -12,6 +12,24 @@ from . import compat
 from .modules import ModuleError, image_url, number
 
 ROOT = Path(__file__).resolve().parents[1]
+MATCH_THRESHOLD = 0.60
+
+
+def decide(ranking):
+    """Apply the user's inclusive DINOv2 threshold, independent of size and Qwen."""
+    rows = ranking["candidates"]
+    best = max(rows, key=lambda row: number(row["dinov2_similarity"], -1, 1), default=None)
+    approved = best is not None and number(best["dinov2_similarity"], -1, 1) >= MATCH_THRESHOLD
+    return {
+        "search_and_rank": ranking,
+        "decision": {
+            "outcome": "approved" if approved else "rejected",
+            "selected_offer_id": str(best["candidate"]["offer_id"]) if approved else None,
+            "reason": "dinov2_at_least_60" if approved else "dinov2_below_60_or_no_candidates",
+            "policy": "dinov2-only",
+            "threshold": MATCH_THRESHOLD,
+        },
+    }
 
 
 def manifest(candidate):
@@ -22,7 +40,7 @@ def manifest(candidate):
         "image_url": image_url(candidate["image"]),
         "additional_image_urls": origin.get("additional_image_urls", []),
         "specifications": origin.get("specifications", {}),
-        # No size guess from weight or category: unknown routes to human review.
+        # Retained as metadata; size does not affect matching.
         "size": origin.get("size", "unknown"),
     }
 
@@ -31,10 +49,8 @@ async def screen(candidate, api_key=""):
     module_root = ROOT / "vendor/compareBot"
     env = os.environ.copy()
     env["PYTHONPATH"] = str(module_root / "src")
-    # A user's key never falls back to a different user's process credentials.
+    # Ranking-only CLI never receives Qwen credentials, including legacy saved keys.
     env.pop("DASHSCOPE_API_KEY", None)
-    if api_key:
-        env["DASHSCOPE_API_KEY"] = api_key
     env["PYTHON_DOTENV_DISABLED"] = "1"
     with tempfile.TemporaryDirectory(prefix="flowhub-comparebot-") as directory:
         folder = Path(directory)
@@ -43,7 +59,7 @@ async def screen(candidate, api_key=""):
         args = [
             os.environ.get("FLOWHUB_COMPAREBOT_PYTHON", sys.executable),
             "-m",
-            "comparebot.interfaces.screen_cli",
+            "comparebot.interfaces.cli",
             "--manifest",
             str(inputs),
             "--product-id",
@@ -68,7 +84,7 @@ async def screen(candidate, api_key=""):
                 )
             if output.stat().st_size > 2_000_000:
                 raise ModuleError("oversized compareBot response")
-            return json.loads(output.read_text(encoding="utf-8"))
+            return decide(json.loads(output.read_text(encoding="utf-8")))
         except BaseException:
             if process.returncode is None:
                 process.kill()
@@ -99,6 +115,8 @@ def source_from_result(result, candidate):
     if len(selected) != 1:
         raise ModuleError("compareBot selected offer missing or duplicated")
     row = selected[0]
+    if number(row["dinov2_similarity"], -1, 1) < MATCH_THRESHOLD:
+        raise ModuleError("compareBot selected offer below DINOv2 threshold")
     offer = row["candidate"]
     offer_id = str(offer["offer_id"])
     if (
@@ -124,11 +142,11 @@ def source_from_result(result, candidate):
 async def invoke(operation, context, secret=""):
     if operation != "match":
         raise ModuleError("unsupported compareBot operation")
-    # Keep the previous plain ERP token format. JSON also supports a per-user Qwen key.
+    # Preserve saved credential compatibility; any legacy Qwen key is unused.
     credentials = json.loads(secret) if secret.lstrip().startswith("{") else {"erp_token": secret}
     if not credentials.get("erp_token"):
         raise ModuleError("workspace ERP token required")
-    result = await screen(context["candidate"], credentials.get("dashscope_api_key", ""))
+    result = await screen(context["candidate"])
     source = source_from_result(result, context["candidate"])
     if source.get("manual_review") or source.get("rejected"):
         return source

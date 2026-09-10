@@ -50,7 +50,7 @@ async function main(){
   const d=source.comparebot?.decision;
   const rows=source.comparebot?.search_and_rank?.candidates||[];
   const row=rows.find(r=>String(r.candidate.offer_id)===String(d?.selected_offer_id));
-  if(d?.outcome!=='approved'||!row||String(source.selected_offer_id)!==String(d.selected_offer_id)
+  if(d?.outcome!=='approved'||!row||!Number.isFinite(Number(row.dinov2_similarity))||Number(row.dinov2_similarity)<0.60||Number(row.dinov2_similarity)>1||String(source.selected_offer_id)!==String(d.selected_offer_id)
    ||!/^\d+$/.test(String(source.selected_offer_id))
    ||source.selected_offer_url!==`https://detail.1688.com/offer/${source.selected_offer_id}.html`
    ||!(Number(source.selected_cost_cny)>0)||!Number.isFinite(Number(source.selected_cost_cny))

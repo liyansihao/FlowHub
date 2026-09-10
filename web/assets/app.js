@@ -598,7 +598,7 @@ async function render() {
           )
           .join(
             "",
-          )}</div><div class="formarea"><h2>商业规则</h2><p class="muted tiny">compareBot 使用自身的 75 / 55 分匹配分流和千问复核；下方图片、结构阈值仅适用于旧匹配模块。商品大小未知或证据不足时进入人工审核。</p><div class="row2">${[
+          )}</div><div class="formarea"><h2>商业规则</h2><p class="muted tiny">compareBot 全部使用 DINOv2，相似度达到 60%（含）即判为同款，不调用千问，也不按大小分流。下方图片、结构阈值仅适用于旧匹配模块。利润与上架检查仍独立执行。</p><div class="row2">${[
           ["profit_min", "成本利润率最低值 %"],
           ["stock", "目标库存"],
           ["image_min", "图片分数最低值 / 100"],
