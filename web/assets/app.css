@@ -1235,3 +1235,5 @@ td > small.muted {
 .product-actions .row2 { margin:10px 0 16px; gap:10px; }
 .product-actions label { display:block; margin-top:12px; }
 #action-review:not(:empty) { padding:14px; margin-top:16px; background:#fff3e8; border-radius:10px; }
+
+#guoo-fees[hidden] { display: none; }

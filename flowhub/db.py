@@ -74,6 +74,11 @@ class Database:
             db.execute(
                 "INSERT OR IGNORE INTO modules(id,kind,name,driver) VALUES('maozi-publisher','publisher','毛子ERP + Ozon 回查','maozi')"
             )
+            for provider, title in [('ChinaPost', '邮政本地利润'), ('GUOO', 'GUOO 本地利润')]:
+                db.execute(
+                    "INSERT OR IGNORE INTO modules(id,kind,name,driver,endpoint) VALUES(?,?,?,?,?)",
+                    ('local-profit-' + provider.lower(), 'profit', title, 'local-profit', provider),
+                )
             if not db.execute("SELECT 1 FROM users LIMIT 1").fetchone():
                 password = secrets.token_urlsafe(18)
                 self.create_user(db, "admin", password, "admin")

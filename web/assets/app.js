@@ -49,7 +49,7 @@ const kinds = {
 
 const navGroups = [
   ["上架工作", ["overview", "运行概览"], ["jobs", "上架商品"]],
-  ["自动化", ["workflow", "工作流配置"], ["modules", "模块中心"]],
+  ["自动化", ["calculator", "利润计算器"], ["workflow", "工作流配置"], ["modules", "模块中心"]],
   ["店铺资产", ["stores", "店铺连接"], ["blocks", "禁止上架清单"]],
 ];
 const paths = {
@@ -297,6 +297,63 @@ function detail(j) {
     }
   };
 }
+async function renderProfitCalculator(container) {
+  const catalog = await api('/profit/catalog');
+  const field = (name, label, value = '', step = '0.01') => `<div><label>${label}</label><input aria-label="${label}" name="${name}" type="number" min="0" step="${step}" value="${value}" required></div>`;
+  container.innerHTML = head('利润计算器', '邮政与 GUOO · 本地核算，不消耗毛子 ERP 请求额度') +
+    `<div class="notice"><strong>类目佣金需确认</strong><p>${esc(catalog.commission.message)}</p><a href="${esc(catalog.commission.official_url)}" target="_blank" rel="noopener">查看 Ozon 官方佣金说明 ↗</a></div>
+    <form id="profitform" class="formarea" style="max-width:none">
+    <div class="grid2"><div><label>物流商</label><select name="provider"><option value="ChinaPost">邮政陆运</option><option value="GUOO">GUOO</option></select></div>
+    <div><label>配送模式</label><select name="mode"><option value="realFBS">realFBS</option><option value="FBP">FBP</option></select></div>
+    <div><label>测算线路</label><select name="route_id"></select></div><div><label>具体商品类目</label><input name="category" required placeholder="请填商品的具体类目"></div>
+    ${field('sell_cny','预计成交价 · 人民币')}${field('rub_per_cny','结算汇率 · 1 人民币 = 多少卢布','','0.0001')}
+    ${field('purchase_cny','采购成本 · 元')}${field('weight_g','包装后重量 · 克','','1')}
+    ${field('length','长 · 厘米')}${field('width','宽 · 厘米')}${field('height','高 · 厘米')}
+    ${field('commission_pct','该类目佣金 · %')}
+    <div><label>佣金来源 / 核实日期</label><input name="commission_source" required placeholder="例如：店铺后台费率，2026-09-10"></div>
+    ${field('domestic_cny','国内运费 · 元','0')}${field('packing_cny','包装 / 贴单 · 元','0')}${field('other_cny','其他固定费用 · 元','0')}
+    ${field('ads_pct','广告费占售价 · %','0')}${field('reserve_pct','退货 / 损耗预留占售价 · %','0')}${field('profit_min','成本利润率门槛 · %','30')}
+    </div><div id="guoo-fees" class="grid2" hidden>
+    ${field('acquiring_pct','GUOO 收单业务费 · %')}${field('last_mile_cny','GUOO 另计尾程费用 · 元')}${field('withdrawal_pct','GUOO 提现手续费 · %')}
+    </div><p id="feehelp" class="muted tiny"></p>
+    <button class="primary" type="submit">计算各线路利润</button><p class="muted tiny">附加费用默认 0 表示未预留，请按实际填写。计算不会上架、改价或切换生产物流。</p></form>
+    <div id="profitresult" style="margin-top:24px"></div>`;
+  const form = $('#profitform');
+  function routes() {
+    const provider = form.elements.provider.value;
+    const postal = provider === 'ChinaPost';
+    if (postal) form.elements.mode.value = 'realFBS';
+    form.elements.mode.disabled = postal;
+    const options = catalog.routes.filter(r => r.provider === provider && r.mode === form.elements.mode.value);
+    form.elements.route_id.innerHTML = '<option value="">比较全部适用线路</option>' + options.map(r => `<option value="${esc(r.id)}">${esc(r.name)}</option>`).join('');
+    $('#guoo-fees').hidden = postal;
+    for (const key of ['acquiring_pct','last_mile_cny','withdrawal_pct']) form.elements[key].disabled = postal;
+    $('#feehelp').textContent = postal ? '邮政按原表：26 元/公斤 + 1.9 元/票；收单 1.9%；尾程为售价的 2%（最低 1.3 元，最高 18 元）；结算余额提现 1.2%。已修正原表漏扣收单费的错误。' : 'GUOO 表只提供运费。请填写实际收单费、另计尾程费和提现费；已经包含的费用明确填 0，避免重复扣费。';
+  }
+  form.oninput = form.onchange = () => { $("#profitresult").innerHTML = ""; };
+  form.elements.provider.onchange = routes;
+  form.elements.mode.onchange = routes;
+  routes();
+  form.onsubmit = async e => {
+    e.preventDefault();
+    const payload = Object.fromEntries(new FormData(form));
+    payload.mode = form.elements.mode.value;
+    payload.dimensions_cm = [payload.length, payload.width, payload.height];
+    for (const key of ['length','width','height']) delete payload[key];
+    const button = form.querySelector('button[type=submit]');
+    button.disabled = true;
+    try {
+      const r = await api('/profit/calculate', 'POST', payload);
+      const feeNames = {purchase:'采购',domestic:'国内运费',packing:'包装贴单',freight:'国际运费',commission:'佣金',acquiring:'收单费',last_mile:'另计尾程',withdrawal:'提现费',ads:'广告费',reserve:'损耗预留',other:'其他'};
+      $('#profitresult').innerHTML = `<div class="panel"><h2>预计成交 ${r.sell_rub.toFixed(2)} ₽ · 佣金 ${r.commission_pct}%</h2><p class="muted">成本利润率 = 利润 ÷ 总成本。利润达标仍需核实店铺线路与商品承运条件。</p>
+      ${r.quotes.length ? `<div class="table-wrap"><table><thead><tr><th>适用线路</th><th>计费重</th><th>国际运费</th><th>总成本</th><th>利润</th><th>成本利润率</th><th>净利率</th></tr></thead><tbody>${r.quotes.map(q => `<tr><td>${esc(q.name)}</td><td>${q.billed_kg} kg</td><td>¥${q.fees_cny.freight.toFixed(2)}</td><td>¥${q.total_cost.toFixed(2)}</td><td>¥${q.profit_cny.toFixed(2)}</td><td><span class="badge ${q.profit_pass ? 'success' : 'gray'}">${q.cost_return.toFixed(2)}% · ${q.profit_pass ? '达标' : '未达标'}</span></td><td>${q.net_margin.toFixed(2)}%</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty">没有适用线路，请查看重量、货值和尺寸限制。</div>'}
+      ${r.quotes.map(q => `<details style="margin-top:16px"><summary>${esc(q.name)} · 费用明细与承运备注</summary><p>${Object.entries(q.fees_cny).map(([k,v]) => `${feeNames[k]} ¥${v.toFixed(2)}`).join(' · ')}</p><p>${esc(q.battery_note)}</p><p class="muted tiny">来源：${esc(q.source_cell)}</p></details>`).join('')}
+      <details style="margin-top:16px"><summary>不适用线路（${r.unavailable.length}）</summary>${r.unavailable.map(q => `<p>${esc(q.name)}：${q.reasons.map(esc).join('、')}</p>`).join('')}</details>
+      <p class="muted tiny">${r.warnings.map(esc).join('<br>')}</p><p class="muted tiny">费率版本 ${esc(r.version)} · 佣金由用户填写：${esc(r.commission_source)}</p></div>`;
+    } catch (error) { toast(error.message); } finally { button.disabled = false; }
+  };
+}
+
 async function render() {
   if (rendering) return;
   rendering = true;
@@ -551,6 +608,8 @@ async function render() {
           toast(e.message);
         }
       };
+    } else if (page === "calculator") {
+      await renderProfitCalculator(c);
     } else if (page === "modules") {
       c.innerHTML =
         head(

@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from .db import ROOT, Database, password_hash, password_ok
+from .local_profit import ProfitInput, calculate, catalog
 from .modules import ModuleHost, public_endpoint
 
 
@@ -365,6 +366,17 @@ def create_app(database=None):
                 ),
             )
         return {"ok": True}
+
+    @app.get("/api/profit/catalog")
+    def profit_catalog(user=Depends(auth)):
+        return catalog()
+
+    @app.post("/api/profit/calculate")
+    def profit_calculate(p: ProfitInput, user=Depends(auth)):
+        try:
+            return calculate(p)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
 
     @app.get("/api/modules")
     def modules(user=Depends(auth)):
