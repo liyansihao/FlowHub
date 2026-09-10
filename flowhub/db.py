@@ -57,6 +57,7 @@ class Database:
             CREATE TABLE IF NOT EXISTS demo_effects(id TEXT PRIMARY KEY,owner TEXT NOT NULL,stock INTEGER DEFAULT 0);
             CREATE TABLE IF NOT EXISTS health_samples(at REAL PRIMARY KEY,pid INTEGER NOT NULL,processed INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS candidate_pages(owner TEXT PRIMARY KEY,body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS ozon_direct_writes(offer_id TEXT PRIMARY KEY,owner TEXT NOT NULL,binding_hash TEXT NOT NULL,payload_hash TEXT NOT NULL,task_id TEXT,created REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS quotas(store_id TEXT PRIMARY KEY,remaining INTEGER NOT NULL,reset_at REAL NOT NULL,observed REAL NOT NULL);
             CREATE INDEX IF NOT EXISTS jobs_due ON jobs(phase,next_at,lease_until);
             CREATE INDEX IF NOT EXISTS events_owner ON events(owner,created);
@@ -74,10 +75,13 @@ class Database:
             db.execute(
                 "INSERT OR IGNORE INTO modules(id,kind,name,driver) VALUES('maozi-publisher','publisher','毛子ERP + Ozon 回查','maozi')"
             )
-            for provider, title in [('ChinaPost', '邮政本地利润'), ('GUOO', 'GUOO 本地利润')]:
+            db.execute(
+                "INSERT OR IGNORE INTO modules(id,kind,name,driver) VALUES('ozon-direct-publisher','publisher','Ozon 官方直发（本地商品资料）','ozon-direct')"
+            )
+            for provider, title in [("ChinaPost", "邮政本地利润"), ("GUOO", "GUOO 本地利润")]:
                 db.execute(
                     "INSERT OR IGNORE INTO modules(id,kind,name,driver,endpoint) VALUES(?,?,?,?,?)",
-                    ('local-profit-' + provider.lower(), 'profit', title, 'local-profit', provider),
+                    ("local-profit-" + provider.lower(), "profit", title, "local-profit", provider),
                 )
             if not db.execute("SELECT 1 FROM users LIMIT 1").fetchone():
                 password = secrets.token_urlsafe(18)

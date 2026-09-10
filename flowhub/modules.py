@@ -86,6 +86,10 @@ class ModuleHost:
             return await invoke(operation, context, secret)
         if module["driver"] == "demo":
             return await self.demo(operation, context)
+        if module["driver"] == "ozon-direct":
+            from .ozon_direct import OzonDirectPublisher
+
+            return await OzonDirectPublisher(context, self.db).invoke(operation)
         if module["driver"] == "maozi":
             from .maozi import MaoziPublisher
 

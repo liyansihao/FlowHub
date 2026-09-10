@@ -237,6 +237,7 @@ function detail(j) {
     ...(j.price != null ? [["价格参考（CNY）", j.price.toFixed(2)]] : []),
     ...(j.observed_stock != null ? [["最近操作确认库存", j.observed_stock]] : []),
     ["当前说明", j.note],
+    ["资料缺项", (j.dossier_missing || []).join("；") || "—"],
   ]
     .map(
       ([k, v]) =>
@@ -512,7 +513,7 @@ async function render() {
     } else if (page === "stores") {
       c.innerHTML =
         head("店铺连接", "各店铺使用自己的账号与仓库；额度不足时按顺序切换。") +
-        `<div class="grid2"><div class="panel"><div class="panel-title"><h2>已连接店铺</h2></div><table><thead><tr><th>顺序 / 店铺</th><th>连接</th><th>操作</th></tr></thead><tbody>${stores.map((s) => `<tr><td>${s.position + 1} · ${esc(s.name)}<br><small class="muted">${s.kind === "demo" ? "模拟店铺" : esc(s.config.shop_id)}</small></td><td>${s.verified ? "已核验" : "待核验"}<br><small class="muted">${overview.quotas.find((q) => q.store_id === s.id) ? "余 " + overview.quotas.find((q) => q.store_id === s.id).remaining + " 个额度" : ""}</small></td><td><button class="linkbutton" data-verify="${s.id}">核验</button><button class="linkbutton" data-enable="${s.id}">${s.enabled ? "停用" : "启用"}</button></td></tr>`).join("") || '<tr><td colspan="3" class="empty">还没有连接店铺</td></tr>'}</tbody></table></div><form id="storeform" class="formarea"><h2>连接新店铺</h2><label>店铺名称</label><input name="name" placeholder="例如：我的一号店" required><div class="row2"><div><label>连接方式</label><select name="kind"><option value="demo">模拟店铺</option><option value="maozi">毛子 ERP + Ozon</option><option value="http">自定义上架 API</option></select></div><div><label>排序 · 0 为第一家</label><input name="position" type="number" min="0" value="${stores.length}"></div></div>${[
+        `<div class="grid2"><div class="panel"><div class="panel-title"><h2>已连接店铺</h2></div><table><thead><tr><th>顺序 / 店铺</th><th>连接</th><th>操作</th></tr></thead><tbody>${stores.map((s) => `<tr><td>${s.position + 1} · ${esc(s.name)}<br><small class="muted">${s.kind === "demo" ? "模拟店铺" : esc(s.config.shop_id)}</small></td><td>${s.verified ? "已核验" : "待核验"}<br><small class="muted">${overview.quotas.find((q) => q.store_id === s.id) ? "余 " + overview.quotas.find((q) => q.store_id === s.id).remaining + " 个额度" : ""}</small></td><td><button class="linkbutton" data-verify="${s.id}">核验</button><button class="linkbutton" data-enable="${s.id}">${s.enabled ? "停用" : "启用"}</button></td></tr>`).join("") || '<tr><td colspan="3" class="empty">还没有连接店铺</td></tr>'}</tbody></table></div><form id="storeform" class="formarea"><h2>连接新店铺</h2><label>店铺名称</label><input name="name" placeholder="例如：我的一号店" required><div class="row2"><div><label>连接方式</label><select name="kind"><option value="demo">模拟店铺</option><option value="maozi">毛子 ERP + Ozon</option><option value="ozon">Ozon 官方直连（无需 ERP）</option><option value="http">自定义上架 API</option></select></div><div><label>排序 · 0 为第一家</label><input name="position" type="number" min="0" value="${stores.length}"></div></div>${[
           ["shop_id", "毛子店铺 ID"],
           ["warehouse_id", "目标仓库 ID"],
           ["watermark_id", "水印 ID"],
@@ -527,6 +528,13 @@ async function render() {
           .join(
             "",
           )}<button class="primary" style="margin-top:22px">保存连接</button><p class="muted tiny" style="margin-top:15px">密钥加密保存，不会回显。真实店铺需核验后才能使用。</p></form></div>`;
+      $("#storeform [name=kind]").onchange = (e) => {
+        for (const name of ["shop_id", "watermark_id", "erp_token"]) {
+          const input = $("#storeform [name=" + name + "]");
+          input.hidden = e.target.value === "ozon";
+          input.previousElementSibling.hidden = input.hidden;
+        }
+      };
       $("#storeform").onsubmit = async (e) => {
         e.preventDefault();
         let p = Object.fromEntries(new FormData(e.target));

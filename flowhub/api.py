@@ -189,6 +189,39 @@ def create_app(database=None):
         r["config"] = json.loads(r["config"])
         return r
 
+    class DossierCheck(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        source_key: str = Field(min_length=1, max_length=150)
+        price: float = Field(gt=0, allow_inf_nan=False)
+        dossier: dict
+
+    @app.post("/api/stores/{sid}/dossier-check")
+    async def dossier_check(sid: str, p: DossierCheck, owner=Depends(scope)):
+        from .ozon_direct import OzonDirectPublisher
+
+        with db.connect() as connection:
+            row = connection.execute("SELECT * FROM stores WHERE id=? AND owner=?", (sid, owner)).fetchone()
+        if not row:
+            raise HTTPException(404, "店铺不存在")
+        if row["kind"] not in ("maozi", "ozon"):
+            raise HTTPException(400, "需要 Ozon 店铺连接")
+        context = {
+            "owner": owner,
+            "idempotency_key": "preflight-" + secrets.token_hex(12),
+            "candidate": {
+                "source_key": p.source_key,
+                "price": p.price,
+                "origin": {"ozon_dossier": p.dossier},
+            },
+            "store": {"id": sid, "config": json.loads(row["config"]), "credentials": db.open(row["secret"])},
+        }
+        try:
+            result = await OzonDirectPublisher(context, db).invoke("prepare")
+        except Exception:
+            raise HTTPException(400, "官方资料校验未完成，请检查店铺连接和商品字段") from None
+        # This route cannot create jobs, submit products or adjust inventory.
+        return {"ready": result["ready"], "missing": result.get("missing", []), "submitted": False}
+
     @app.get("/api/stores")
     def stores(owner=Depends(scope)):
         with db.connect() as c:
@@ -199,7 +232,7 @@ def create_app(database=None):
 
     @app.post("/api/stores")
     def store_create(p: Store, owner=Depends(scope)):
-        if p.kind not in ("demo", "maozi", "http"):
+        if p.kind not in ("demo", "maozi", "ozon", "http"):
             raise HTTPException(400, "店铺类型无效")
         if p.kind == "maozi" and (
             not all(
@@ -209,6 +242,12 @@ def create_app(database=None):
             or not p.api_key
         ):
             raise HTTPException(400, "请填写完整店铺、仓库和连接凭据")
+        if p.kind == "ozon":
+            if not p.client_id.isdigit() or not p.warehouse_id.isdigit() or not p.api_key:
+                raise HTTPException(400, "请填写 Ozon Client ID、API Key 和目标仓库 ID")
+            p.shop_id = p.client_id
+            p.watermark_id = "0"
+            p.erp_token = ""
         sid = secrets.token_hex(12)
         with db.connect() as c:
             c.execute(
@@ -262,7 +301,11 @@ def create_app(database=None):
             if r["kind"] == "demo":
                 result = {"verified": True}
             else:
-                definition = dict(module) if r["kind"] == "http" else {"driver": "maozi"}
+                definition = (
+                    dict(module)
+                    if r["kind"] == "http"
+                    else {"driver": "ozon-direct" if r["kind"] == "ozon" else "maozi"}
+                )
                 result = await ModuleHost(db).invoke(
                     definition,
                     "identity",
@@ -370,6 +413,7 @@ def create_app(database=None):
     @app.get("/api/profit/categories")
     def profit_categories(q: str = "", user=Depends(auth)):
         from .commissions import search
+
         if len(q) > 100:
             raise HTTPException(400, "查询过长")
         return {"items": search(q)}
@@ -455,6 +499,7 @@ def create_app(database=None):
                     "profit": profit.get("cost_return"),
                     "stock": data["rules"]["stock"],
                     "live": data["rules"]["live"],
+                    "dossier_missing": data.get("dossier_missing", []),
                     "note": r["note"],
                     "updated": r["updated"],
                     "created": r["created"],
@@ -468,10 +513,13 @@ def create_app(database=None):
         request_id: str = Field(min_length=12, max_length=80, pattern=r"^[a-zA-Z0-9_-]+$")
 
     @app.post("/api/production/{offer}/action")
-    async def production_action(offer: str, payload: ProductAction, owner=Depends(scope), user=Depends(admin)):
+    async def production_action(
+        offer: str, payload: ProductAction, owner=Depends(scope), user=Depends(admin)
+    ):
         if owner != user["id"]:
             raise HTTPException(403, "不能操作其他工作区的正式商品")
         from .production_actions import validate
+
         try:
             validate(payload.action, payload.value)
         except ValueError as e:
@@ -479,14 +527,23 @@ def create_app(database=None):
         if not re.fullmatch(r"flowef-live99-[a-f0-9]{20}", offer):
             raise HTTPException(404, "正式商品不存在")
         import asyncio
+
         runner = ROOT.parent / "FlowEF-production/.venv/bin/python"
         if not runner.exists():
             raise HTTPException(409, "本机未连接正式上架服务")
-        proc = await asyncio.create_subprocess_exec(str(runner), str(ROOT / "flowhub/production_actions.py"),
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            cwd=ROOT.parent / "FlowEF-production", start_new_session=True)
+        proc = await asyncio.create_subprocess_exec(
+            str(runner),
+            str(ROOT / "flowhub/production_actions.py"),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=ROOT.parent / "FlowEF-production",
+            start_new_session=True,
+        )
         try:
-            out, _ = await asyncio.wait_for(proc.communicate(json.dumps(dict(offer=offer, **payload.model_dump())).encode()), 180)
+            out, _ = await asyncio.wait_for(
+                proc.communicate(json.dumps(dict(offer=offer, **payload.model_dump())).encode()), 180
+            )
         except BaseException:
             if proc.returncode is None:
                 proc.kill()
@@ -499,13 +556,17 @@ def create_app(database=None):
         if not result.get("ok"):
             raise HTTPException(409, result.get("message", "操作未完成"))
         r = result["result"]
-        return {k: r.get(k) for k in ("status", "message", "action", "observed_stock", "observed_price", "updated")}
+        return {
+            k: r.get(k)
+            for k in ("status", "message", "action", "observed_stock", "observed_price", "updated")
+        }
 
     @app.get("/api/production")
     def production(owner=Depends(scope), user=Depends(admin), phase: str = ""):
         if owner != user["id"]:
             return {"available": False}
         from .production_view import snapshot
+
         return snapshot(ROOT.parent / "FlowEF-production/state/production", phase)
 
     @app.get("/api/acceptance")

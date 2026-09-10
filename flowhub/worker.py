@@ -34,7 +34,7 @@ class Worker:
         token = self.db.open(wf["secrets"]).get(json.loads(job["modules"])[kind]["id"], "")
         return await asyncio.wait_for(
             self.host.invoke(json.loads(job["modules"])[kind], operation, context, token),
-            130 if json.loads(job["modules"])[kind]["driver"] in ("flowb", "maozi") else 35,
+            130 if json.loads(job["modules"])[kind]["driver"] in ("flowb", "maozi", "ozon-direct") else 35,
         )
 
     def move(self, job, phase, note="", data=None, delay=0, plan=None, store=None):
@@ -100,6 +100,10 @@ class Worker:
             return None
         for row in stores:
             if c["rules"]["live"] == (row["kind"] == "demo"):
+                continue
+            if module["driver"] == "maozi" and row["kind"] != "maozi":
+                continue
+            if module["driver"] == "ozon-direct" and row["kind"] not in ("ozon", "maozi"):
                 continue
             store = {
                 "id": row["id"],
@@ -223,6 +227,14 @@ class Worker:
                 self.move(job, "rejected", "同款证据已过期，请重新获取候选")
                 return
             r = await self.call(job, "publisher", "prepare")
+            if r.get("needs_input"):
+                self.move(
+                    job,
+                    "attention",
+                    "商品资料需要补齐",
+                    data=data | {"dossier_missing": r.get("missing", [])},
+                )
+                return
             if not r.get("ready"):
                 self.move(job, phase, "等待收藏或平台准备", delay=15)
                 return
@@ -287,6 +299,10 @@ class Worker:
             await self.advance(job)
         except Exception as error:
             count = job["attempts"] + 1
+            # advance() may already have committed a write marker before raising.
+            with self.db.connect() as db:
+                persisted = db.execute("SELECT phase FROM jobs WHERE id=?", (job["id"],)).fetchone()
+            job = job | {"phase": persisted["phase"]}
             unknown = job["phase"] in ("publishing", "reconciling", "stock_pending", "checking")
             phase = job["phase"] if unknown or count < 8 else "attention"
             self.move(

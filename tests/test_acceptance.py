@@ -298,3 +298,36 @@ async def test_http_provider_contract_can_replace_matching_module(setup, monkeyp
         "per-user-key",
     )
     assert result["supplier_id"] == "new-provider" and len(calls) == 1
+
+
+def test_direct_store_needs_no_erp_and_preflight_is_tenant_scoped(setup):
+    db, admin, user, app = setup
+    a = logged(app)
+    r = a.post(
+        "/api/stores",
+        json={
+            "name": "direct",
+            "kind": "ozon",
+            "client_id": "12",
+            "warehouse_id": "88",
+            "api_key": "PRIVATE",
+        },
+    )
+    assert r.status_code == 200
+    sid = r.json()["id"]
+    response = a.post(
+        f"/api/stores/{sid}/dossier-check", json={"source_key": "123", "price": 10, "dossier": {}}
+    )
+    assert response.status_code == 200
+    assert response.json()["submitted"] is False and response.json()["missing"]
+    u = logged(app, "alice", "Alice-Test-Password-2026")
+    assert (
+        u.post(
+            f"/api/stores/{sid}/dossier-check", json={"source_key": "123", "price": 10, "dossier": {}}
+        ).status_code
+        == 404
+    )
+    with db.connect() as c:
+        assert c.execute("SELECT COUNT(*) FROM ozon_direct_writes").fetchone()[0] == 0
+        keys = db.open(c.execute("SELECT secret FROM stores WHERE id=?", (sid,)).fetchone()[0])
+        assert keys["erp_token"] == ""
