@@ -19,6 +19,12 @@ def assemble(context):
     raw = dict(context.get("prepared", {}).get("source_dossier", {}))
     raw.update(candidate.get("origin", {}).get("ozon_dossier", {}))
     provenance = dict(raw.get("provenance", {}))
+    store = context.get("store", {})
+    configuration = store.get("config", {})
+    if configuration.get("vat_client_id") == str(store.get("credentials", {}).get("client_id")):
+        if "vat" in configuration:
+            raw["vat"] = configuration["vat"]
+            provenance["vat"] = configuration.get("vat_source", "store configuration")
     raw.setdefault("source_key", candidate["source_key"])
     evidence = context.get("match", {}).get("evidence", {})
     inputs = evidence.get("profit", {}).get("input", {})
@@ -129,6 +135,22 @@ def dossier(context):
 
 class OzonDirectPublisher(MaoziPublisher):
     def __init__(self, context, database):
+        from .store_vat import configured_vat
+
+        profile = configured_vat(database, context["store"]["credentials"]["client_id"])
+        if profile:
+            store = context["store"]
+            context = context | {
+                "store": store
+                | {
+                    "config": store["config"]
+                    | {
+                        "vat": profile["vat"],
+                        "vat_client_id": profile["client_id"],
+                        "vat_source": profile["source"],
+                    }
+                }
+            }
         super().__init__(context)
         self.db = database
 

@@ -189,3 +189,35 @@ async def test_collected_dossier_survives_worker_phase_boundary(port, monkeypatc
     restarted = OzonDirectPublisher(original_context | {"prepared": prepared}, port.db)
     restarted.seller = port.seller
     assert (await restarted.invoke("publish"))["accepted"]
+
+
+async def test_account_vat_overrides_source_and_freezes_with_payload(port):
+    import json
+
+    path = port.db.directory / "store-vat.json"
+    path.write_text(json.dumps({"12": {"client_id": "12", "vat": "0", "source": "own ERP products"}}))
+    port.c["candidate"]["origin"]["ozon_dossier"]["vat"] = "0.2"
+    direct = OzonDirectPublisher(port.c, port.db)
+    direct.seller = port.seller
+    prepared = await direct.prepare()
+    assert prepared["ready"] and prepared["frozen"]["item"]["vat"] == "0"
+    path.write_text(
+        json.dumps({"12": {"client_id": "12", "vat": "0.1", "source": "changed own configuration"}})
+    )
+    changed = OzonDirectPublisher(port.c | {"prepared": prepared}, port.db)
+    changed.seller = port.seller
+    with pytest.raises(ModuleError, match="changed"):
+        await changed.invoke("publish")
+
+
+def test_vat_is_not_shared_with_other_accounts(port):
+    import json
+
+    from flowhub.store_vat import configured_vat
+
+    path = port.db.directory / "store-vat.json"
+    path.write_text(json.dumps({"12": {"client_id": "12", "vat": "0", "source": "own ERP products"}}))
+    assert configured_vat(port.db, "other") is None
+    path.write_text(json.dumps({"12": {"client_id": "wrong", "vat": "0", "source": "own ERP products"}}))
+    with pytest.raises(ModuleError):
+        configured_vat(port.db, "12")
