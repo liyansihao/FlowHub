@@ -52,3 +52,27 @@ https://docs.ozon.ru/global/zh-hans/commissions/ozon-fees/commissions/?country=C
 ## 验证
 
 全套 44 项测试通过，含样例纠错、重量/价格边界、材积重端点、无效尺寸、缺失佣金/费用、登录/CSRF、模块当前商品事实覆盖。隔离数据库网页实际提交验证邮政和 GUOO：邮政样例 65.68 元利润；GUOO 100g 运费经济 6.18、标准 7.30、快递 8.425（显示 8.43）元。不产生真实商品写入。
+
+## 13:30 更新：官方佣金已接入，FBS 自动生产接通
+
+以上“官方页面不可用/佣金手工填写/未接生产”为此前阶段状态，已由以下结果替代。
+
+旧文档通过浏览器最终跳转至新版官方知识库：
+https://global-help.ozon.com/zh/commissions/ozon-fees/commissions/?region=CHN
+
+中国区域当前普通跨境表仍为 2025-12-01 起生效，另一份 2026-05-06 表针对 WHD，不适用于本次 FBS 自发货。实际下载官方页面“下载类目表”链接：
+https://cdn.ozone.ru/s3/ozon-disk-api/global-education/ru/commissions/ozon-fees/comissions/Tarifs_CN_01_12_2025_1761720496.xlsx
+
+`Full ChinaHK` 包含 10,795 条类型费率，10,741 条 All 品牌规则及 54 条品牌专属规则。佣金档位明确为 ≤1500 / >1500 且 ≤5000 / >5000 RUB，不能套用 GUOO 运费 7000 RUB 档位。运行数据在 `flowhub/tariffs/commissions.json`，包含文件 SHA256、行号、来源、生效日和核验时间；不是实时轮询官方服务。
+
+通过既有已授权一号店凭据，只读获取官方 `/v1/description-category/tree` 俄文类型表，共 7,343 个 type_id，其中 6,301 个名称在当前费率表精确匹配。未匹配、停用、同名歧义、品牌不明且有专属费率等情况不得猜费率。凭据未写入费率文件。
+
+网页默认官方自动匹配：搜索具体类型、选择记录，输入售价/汇率后计算，佣金不必手填。手动费率仍可选。自动生产按用户确认固定 realFBS，FBP 仅手动测算可选。
+
+生产接入 `FlowEF-production/bridges/local-profit.mjs` → 本项目 `flowhub.commission_cli`，不请求 ERP 佣金表、运费配置或利润计算接口。传入当前商品 type_id、品牌和规范成交价，使用同一 Python 官方匹配和邮政计算实现。保留原国内运费 0、广告 0、其他预留 1%，增加用户邮政表明确的收单/提现费用，利润门槛仍成本利润率 >30%、库存 99；保留原邮政三边和 ≤90 cm、最长边 ≤60 cm 条件。邮政只有 1–500 g / 1–1500 RUB 档。
+
+生产仍需 ERP 提供商品重量/尺寸/类型、1688 同款及现有汇率等；本次不是整条上架链脱离 ERP。旧在途任务的冻结价格和证据未重算或重发。
+
+生产切换标志 `FlowEF-production/state/production/local-profit.enabled`，下一次新建桥接子进程读取，无须中断在途发布器。撤销该标志恢复旧利润路径。未知类型/字段缺失由现有重试逻辑保留，未自动放行。
+
+验证：FlowHub 全部 49 项测试通过；网页未填写佣金，按摩枕 1000 RUB 自动匹配 realFBS 12%，按输入算出利润 68.64 元（此网页样例未预留额外 1%，不是生产收益承诺）；生产策略 12 项测试通过。

@@ -367,6 +367,13 @@ def create_app(database=None):
             )
         return {"ok": True}
 
+    @app.get("/api/profit/categories")
+    def profit_categories(q: str = "", user=Depends(auth)):
+        from .commissions import search
+        if len(q) > 100:
+            raise HTTPException(400, "查询过长")
+        return {"items": search(q)}
+
     @app.get("/api/profit/catalog")
     def profit_catalog(user=Depends(auth)):
         return catalog()

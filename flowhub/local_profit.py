@@ -8,6 +8,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from . import commissions
+
 D = Decimal
 OFFICIAL_COMMISSION_URL = "https://docs.ozon.ru/global/zh-hans/commissions/ozon-fees/commissions/?country=CN"
 TARIFFS = json.loads((Path(__file__).parent / "tariffs/shipping.json").read_text())
@@ -23,9 +25,12 @@ class ProfitInput(BaseModel):
     purchase_cny: Decimal = Field(ge=0, le=1000000)
     weight_g: Decimal = Field(gt=0, le=1000000)
     dimensions_cm: tuple[Decimal, Decimal, Decimal]
-    category: str = Field(min_length=1, max_length=200)
-    commission_pct: Decimal = Field(ge=0, le=100)
-    commission_source: str = Field(min_length=1, max_length=500)
+    category: str = Field(default="", max_length=200)
+    commission_row_id: str = Field(default="", max_length=100)
+    type_id: str = Field(default="", max_length=30)
+    brand: str = Field(default="", max_length=150)
+    commission_pct: Decimal | None = Field(default=None, ge=0, le=100)
+    commission_source: str = Field(default="", max_length=500)
     domestic_cny: Decimal = Field(ge=0, le=1000000)
     packing_cny: Decimal = Field(ge=0, le=1000000)
     other_cny: Decimal = Field(ge=0, le=1000000)
@@ -62,9 +67,10 @@ def catalog():
         ]
         + TARIFFS["routes"],
         commission=dict(
-            status="manual_required",
-            official_url=OFFICIAL_COMMISSION_URL,
-            message="官方页面访问失败，暂未导入已核实的最新类目表。请填写店铺对应类目佣金及来源；不默认 15%。",
+            status="official_ready",
+            **commissions.metadata(),
+            official_url=commissions.DATA["source_url"],
+            message="已导入官方中国卖家 10,795 条类型记录，按 FBS（realFBS）、品牌与卢布价格档自动匹配。",
         ),
     )
 
@@ -73,8 +79,25 @@ def calculate(p: ProfitInput):
     dims = sorted(p.dimensions_cm, reverse=True)
     if any(not x.is_finite() or x <= 0 or x > 1000 for x in dims):
         raise ValueError("三边尺寸须为大于 0、不超过 1000 的厘米数")
-    if not p.category.strip() or not p.commission_source.strip():
-        raise ValueError("请填写具体类目和佣金来源")
+    matched = None
+    if p.commission_row_id or p.type_id or p.commission_pct is None:
+        matched = commissions.resolve(
+            sell_rub=p.sell_cny * p.rub_per_cny,
+            mode=p.mode,
+            row_id=p.commission_row_id,
+            type_id=p.type_id,
+            type_name=p.category,
+            brand=p.brand,
+        )
+        p = p.model_copy(
+            update={
+                "commission_pct": D(str(matched["rate_pct"])),
+                "commission_source": matched["source_url"],
+                "category": matched["name"],
+            }
+        )
+    elif not p.category.strip() or not p.commission_source.strip():
+        raise ValueError("手动佣金须填写具体类目和来源")
     if p.provider == "GUOO" and any(x is None for x in (p.acquiring_pct, p.last_mile_cny, p.withdrawal_pct)):
         raise ValueError("GUOO 表仅提供运费，请填写收单费率、另计尾程费及提现费率（已包含可明确填 0）")
     kg = ceil_gram(p.weight_g / 1000)
@@ -187,7 +210,8 @@ def calculate(p: ProfitInput):
         category=p.category,
         commission_pct=float(p.commission_pct),
         commission_source=p.commission_source,
-        commission_status="user_supplied",
+        commission_status="official" if matched else "user_supplied",
+        commission_match=matched,
         quotes=quotes,
         unavailable=unavailable,
         warnings=warnings,

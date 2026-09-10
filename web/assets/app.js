@@ -301,11 +301,14 @@ async function renderProfitCalculator(container) {
   const catalog = await api('/profit/catalog');
   const field = (name, label, value = '', step = '0.01') => `<div><label>${label}</label><input aria-label="${label}" name="${name}" type="number" min="0" step="${step}" value="${value}" required></div>`;
   container.innerHTML = head('利润计算器', '邮政与 GUOO · 本地核算，不消耗毛子 ERP 请求额度') +
-    `<div class="notice"><strong>类目佣金需确认</strong><p>${esc(catalog.commission.message)}</p><a href="${esc(catalog.commission.official_url)}" target="_blank" rel="noopener">查看 Ozon 官方佣金说明 ↗</a></div>
+    `<div class="notice"><strong>官方佣金已接入 · FBS 自发货</strong><p>${esc(catalog.commission.message)}</p><a href="${esc(catalog.commission.official_url)}" target="_blank" rel="noopener">查看 Ozon 官方佣金说明 ↗</a></div>
     <form id="profitform" class="formarea" style="max-width:none">
     <div class="grid2"><div><label>物流商</label><select name="provider"><option value="ChinaPost">邮政陆运</option><option value="GUOO">GUOO</option></select></div>
-    <div><label>配送模式</label><select name="mode"><option value="realFBS">realFBS</option><option value="FBP">FBP</option></select></div>
-    <div><label>测算线路</label><select name="route_id"></select></div><div><label>具体商品类目</label><input name="category" required placeholder="请填商品的具体类目"></div>
+    <div><label>配送模式</label><select name="mode"><option value="realFBS">FBS 自发货（官方 realFBS）</option><option value="FBP">FBP</option></select></div>
+    <div><label>测算线路</label><select name="route_id"></select></div><div><label>佣金方式</label><select name="commission_method" aria-label="佣金方式"><option value="official">官方类目自动匹配</option><option value="manual">手动费率</option></select></div>
+    <div><label>搜索具体商品类型</label><input name="category" placeholder="例如：按摩枕、收纳盒、手机"><button type="button" id="searchcommission">搜索官方类目</button></div>
+    <div><label>选择官方商品类型</label><select name="commission_row_id" aria-label="选择官方商品类型"><option value="">先搜索并选择商品类型</option></select></div>
+    <div><label>实际品牌</label><input name="brand" placeholder="例如 Apple；无品牌填无品牌"></div>
     ${field('sell_cny','预计成交价 · 人民币')}${field('rub_per_cny','结算汇率 · 1 人民币 = 多少卢布','','0.0001')}
     ${field('purchase_cny','采购成本 · 元')}${field('weight_g','包装后重量 · 克','','1')}
     ${field('length','长 · 厘米')}${field('width','宽 · 厘米')}${field('height','高 · 厘米')}
@@ -330,6 +333,25 @@ async function renderProfitCalculator(container) {
     for (const key of ['acquiring_pct','last_mile_cny','withdrawal_pct']) form.elements[key].disabled = postal;
     $('#feehelp').textContent = postal ? '邮政按原表：26 元/公斤 + 1.9 元/票；收单 1.9%；尾程为售价的 2%（最低 1.3 元，最高 18 元）；结算余额提现 1.2%。已修正原表漏扣收单费的错误。' : 'GUOO 表只提供运费。请填写实际收单费、另计尾程费和提现费；已经包含的费用明确填 0，避免重复扣费。';
   }
+  function commissionMode() {
+    const automatic = form.elements.commission_method.value === 'official';
+    form.elements.commission_pct.disabled = automatic;
+    form.elements.commission_source.disabled = automatic;
+    form.elements.commission_row_id.disabled = !automatic;
+    form.elements.commission_row_id.required = automatic;
+    form.elements.commission_pct.placeholder = automatic ? '按类目、品牌和价格自动计算' : '';
+    form.elements.commission_source.placeholder = automatic ? 'Ozon 官方中国卖家费率表' : '费率来源和日期';
+    $('#profitresult').innerHTML = '';
+  }
+  form.elements.commission_method.onchange = commissionMode;
+  commissionMode();
+  $('#searchcommission').onclick = async () => {
+    try {
+      const r = await api('/profit/categories?q=' + encodeURIComponent(form.elements.category.value));
+      form.elements.commission_row_id.innerHTML = '<option value="">请选择商品类型（最多显示 60 条，可缩小关键词）</option>' + r.items.map(x => `<option value="${esc(x.id)}">${esc(x.name)} / ${esc(x.category)} / ${esc(x.brand === 'All' ? '通用品牌' : x.brand)}</option>`).join('');
+      if (!r.items.length) toast('没有匹配类型，请尝试更具体的名称');
+    } catch (error) { toast(error.message); }
+  };
   form.oninput = form.onchange = () => { $("#profitresult").innerHTML = ""; };
   form.elements.provider.onchange = routes;
   form.elements.mode.onchange = routes;
@@ -338,6 +360,7 @@ async function renderProfitCalculator(container) {
     e.preventDefault();
     const payload = Object.fromEntries(new FormData(form));
     payload.mode = form.elements.mode.value;
+    delete payload.commission_method;
     payload.dimensions_cm = [payload.length, payload.width, payload.height];
     for (const key of ['length','width','height']) delete payload[key];
     const button = form.querySelector('button[type=submit]');
@@ -349,7 +372,7 @@ async function renderProfitCalculator(container) {
       ${r.quotes.length ? `<div class="table-wrap"><table><thead><tr><th>适用线路</th><th>计费重</th><th>国际运费</th><th>总成本</th><th>利润</th><th>成本利润率</th><th>净利率</th></tr></thead><tbody>${r.quotes.map(q => `<tr><td>${esc(q.name)}</td><td>${q.billed_kg} kg</td><td>¥${q.fees_cny.freight.toFixed(2)}</td><td>¥${q.total_cost.toFixed(2)}</td><td>¥${q.profit_cny.toFixed(2)}</td><td><span class="badge ${q.profit_pass ? 'success' : 'gray'}">${q.cost_return.toFixed(2)}% · ${q.profit_pass ? '达标' : '未达标'}</span></td><td>${q.net_margin.toFixed(2)}%</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty">没有适用线路，请查看重量、货值和尺寸限制。</div>'}
       ${r.quotes.map(q => `<details style="margin-top:16px"><summary>${esc(q.name)} · 费用明细与承运备注</summary><p>${Object.entries(q.fees_cny).map(([k,v]) => `${feeNames[k]} ¥${v.toFixed(2)}`).join(' · ')}</p><p>${esc(q.battery_note)}</p><p class="muted tiny">来源：${esc(q.source_cell)}</p></details>`).join('')}
       <details style="margin-top:16px"><summary>不适用线路（${r.unavailable.length}）</summary>${r.unavailable.map(q => `<p>${esc(q.name)}：${q.reasons.map(esc).join('、')}</p>`).join('')}</details>
-      <p class="muted tiny">${r.warnings.map(esc).join('<br>')}</p><p class="muted tiny">费率版本 ${esc(r.version)} · 佣金由用户填写：${esc(r.commission_source)}</p></div>`;
+      <p class="muted tiny">${r.warnings.map(esc).join('<br>')}</p><p class="muted tiny">费率版本 ${esc(r.version)} · ${r.commission_status === "official" ? "官方自动匹配：" + esc(r.commission_match.name) + " · " + esc(r.commission_match.tier_label) : "手动佣金"} · ${esc(r.commission_source)}</p></div>`;
     } catch (error) { toast(error.message); } finally { button.disabled = false; }
   };
 }

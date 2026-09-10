@@ -97,8 +97,8 @@ def test_dimensions_sort_and_reject_oversize():
 def test_missing_commission_or_guoo_fees_never_zero_default():
     p = inputs()
     del p["commission_pct"]
-    with pytest.raises(ValidationError):
-        ProfitInput(**p)
+    with pytest.raises(ValueError):
+        calculate(ProfitInput(**p))
     with pytest.raises(ValueError):
         result(provider="GUOO")
     with pytest.raises(ValidationError):
