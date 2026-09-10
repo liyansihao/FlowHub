@@ -173,3 +173,23 @@ async def test_obsolete_brand_id_resolves_only_exact_official_text(context):
     result = await map_detail(snapshot, context, seller)
     assert not result["issues"] and not result["required_missing"]
     assert result["dossier"]["attributes"][0]["values"][0]["dictionary_value_id"] == 66
+
+
+async def test_original_russian_title_wins_over_english_draft_label(context):
+    snapshot = {
+        "source_key": "123",
+        "draft_id": 44,
+        "observed_at": 1,
+        "detail": {
+            "category_id": [1, 2, 3],
+            "title": "Folder A3",
+            "common_attributes": [{"id": 4180, "values": "Папка для документов А3"}],
+            "skus": [{"name": "SKU 123 Folder A3", "attributes": []}],
+        },
+    }
+
+    async def seller(path, body):
+        return {"result": [{"id": 4180, "dictionary_id": 0}]}
+
+    result = await map_detail(snapshot, context, seller)
+    assert result["dossier"]["name"] == "Папка для документов А3"

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -281,6 +282,26 @@ async def map_detail(snapshot, context, seller):
                 normalized.append({"value": value["value"]})
         if normalized:
             attributes.append({"id": aid, "complex_id": 0, "values": normalized})
+    # ERP's editable heading may be an English collector label while attribute 4180
+    # retains the original Russian title. Prefer the actual source title.
+    title_attribute = next((a for a in attributes if a["id"] == 4180), None)
+    source_title = title_attribute["values"][0].get("value", "") if title_attribute else ""
+    if re.search(r"[А-Яа-яЁё]", source_title):
+        put("name", source_title)
+    elif not re.search(r"[А-Яа-яЁё]", str(raw.get("name", ""))):
+        type_attribute = next((a for a in attributes if a["id"] == 8229), None)
+        type_name = type_attribute["values"][0].get("value", "") if type_attribute else ""
+        if re.search(r"[А-Яа-яЁё]", type_name):
+            original = str(raw.get("name", ""))
+            paper = re.search(r"\b[AА][0-9]\b", original)
+            count = re.search(r"\b([1-9][0-9]*)\s*(?:pcs|pieces)\b", original, re.I)
+            title = type_name + (" " + paper.group() if paper else "")
+            if count:
+                title += ", " + count.group(1) + " шт."
+            put("name", title)
+            provenance["name"] += "; official Russian type plus source format/count"
+            if title_attribute:
+                title_attribute["values"] = [{"value": title}]
     put("attributes", attributes)
     raw["provenance"] = provenance
     required = [a["id"] for a in schema if a.get("is_required")]
@@ -291,6 +312,6 @@ async def map_detail(snapshot, context, seller):
         "required_missing": missing,
         "mapped_attributes": len(attributes),
         "source": "maozi-source-draft",
-        "mapping_version": 2,
+        "mapping_version": 3,
         "identity_review_required": [a["id"] for a in attributes if a["id"] in (85, 4389, 23487, 9048)],
     }

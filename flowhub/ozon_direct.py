@@ -3,7 +3,9 @@
 import hashlib
 import json
 import math
+import re
 import time
+import uuid
 
 from .maozi import MaoziPublisher
 from .modules import ModuleError
@@ -110,6 +112,8 @@ def dossier(context):
         errors.append("尺寸必须为 mm，重量必须为 g")
     if item.get("currency_code") != "CNY":
         errors.append("当前利润流程仅支持 CNY 定价")
+    if not isinstance(item.get("name"), str) or not re.search(r"[А-Яа-яЁё]", item.get("name", "")):
+        errors.append("name：需要俄文商品标题，不能直接使用英文采集标签")
     if not isinstance(item.get("vat"), str):
         errors.append("vat：必须提供账户适用的税率字符串")
     if not isinstance(item.get("images"), list) or not all(
@@ -154,6 +158,36 @@ class OzonDirectPublisher(MaoziPublisher):
         super().__init__(context)
         self.db = database
 
+    async def seller(self, path, body):
+        if path != "/v2/products/stocks":
+            return await super().seller(path, body)
+        # Preserve the acknowledgement so a definitive rejection can be distinguished
+        # from an unknown network outcome. Receipts are private and encrypted.
+        receipt = uuid.uuid4().hex
+        with self.db.connect() as db:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS direct_stock_receipts(id TEXT PRIMARY KEY,offer_id TEXT NOT NULL,at REAL NOT NULL,state TEXT NOT NULL,body TEXT NOT NULL)"
+            )
+            db.execute(
+                "INSERT INTO direct_stock_receipts VALUES(?,?,?,?,?)",
+                (receipt, self.c["idempotency_key"], time.time(), "started", self.db.seal({"request": body})),
+            )
+        try:
+            result = await super().seller(path, body)
+        except BaseException as error:
+            with self.db.connect() as db:
+                db.execute(
+                    "UPDATE direct_stock_receipts SET state='unknown',body=? WHERE id=?",
+                    (self.db.seal({"request": body, "error_type": type(error).__name__}), receipt),
+                )
+            raise
+        with self.db.connect() as db:
+            db.execute(
+                "UPDATE direct_stock_receipts SET state='responded',body=? WHERE id=?",
+                (self.db.seal({"request": body, "response": result}), receipt),
+            )
+        return result
+
     async def erp(self, *args, **kwargs):
         raise ModuleError("direct publisher must not call ERP")
 
@@ -190,7 +224,7 @@ class OzonDirectPublisher(MaoziPublisher):
             cached = snapshot.get("mapping")
             if (
                 cached
-                and cached.get("mapping_version") == 2
+                and cached.get("mapping_version") == 3
                 and snapshot.get("mapping_client") == str(self.keys["client_id"])
             ):
                 source_result = cached

@@ -221,3 +221,38 @@ def test_vat_is_not_shared_with_other_accounts(port):
     path.write_text(json.dumps({"12": {"client_id": "wrong", "vat": "0", "source": "own ERP products"}}))
     with pytest.raises(ModuleError):
         configured_vat(port.db, "12")
+
+
+async def test_english_collector_label_is_blocked_before_publication(port):
+    port.c["candidate"]["origin"]["ozon_dossier"]["name"] = "Folder A3"
+    result = await port.prepare()
+    assert not result["ready"] and any("俄文" in x for x in result["missing"])
+    assert all(path != "/v3/product/import" for path, _ in port.calls)
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+async def test_stock_receipt_preserves_rejection_vs_unknown_without_retry(port, monkeypatch, timeout):
+    from flowhub.maozi import MaoziPublisher
+
+    calls = 0
+
+    async def seller(self, path, body):
+        nonlocal calls
+        calls += 1
+        if timeout:
+            raise TimeoutError()
+        return {"result": [{"updated": False, "errors": [{"code": "SKU_NOT_READY"}]}]}
+
+    monkeypatch.setattr(MaoziPublisher, "seller", seller)
+    if timeout:
+        with pytest.raises(TimeoutError):
+            await OzonDirectPublisher.seller(port, "/v2/products/stocks", {"stocks": []})
+    else:
+        await OzonDirectPublisher.seller(port, "/v2/products/stocks", {"stocks": []})
+    with port.db.connect() as db:
+        row = db.execute("SELECT state,body FROM direct_stock_receipts").fetchone()
+    assert row["state"] == ("unknown" if timeout else "responded")
+    record = port.db.open(row["body"])
+    assert ("error_type" in record) == timeout and calls == 1
+    if not timeout:
+        assert record["response"]["result"][0]["updated"] is False
