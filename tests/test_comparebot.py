@@ -52,7 +52,7 @@ def test_manifest_keeps_unknown_size(candidate):
     assert comparebot.manifest(candidate)["specifications"] == {"color": "red"}
 
 
-@pytest.mark.parametrize("outcome", ["manual_review", "rejected"])
+@pytest.mark.parametrize("outcome", ["rejected"])
 async def test_nonapproval_never_calls_erp(monkeypatch, candidate, result, outcome):
     result["decision"]["outcome"] = outcome
     monkeypatch.setattr(comparebot, "screen", AsyncMock(return_value=result))
@@ -65,13 +65,15 @@ async def test_nonapproval_never_calls_erp(monkeypatch, candidate, result, outco
 
 async def test_approved_passes_exact_selected_source(monkeypatch, candidate, result):
     screen = AsyncMock(return_value=result)
-    erp = AsyncMock(return_value={"ok": True})
+    erp = AsyncMock(return_value={"evidence": {"source": {}, "profit": {"assessment": {"erp_profit_rate_pct": 25}, "input": {"package_weight": 499}, "sell_price_cny": 134}}})
     monkeypatch.setattr(comparebot, "screen", screen)
     monkeypatch.setattr(comparebot.compat, "invoke", erp)
     await comparebot.invoke(
         "match", {"candidate": candidate}, '{"erp_token":"erp","dashscope_api_key":"qwen"}'
     )
-    screen.assert_awaited_once_with(candidate, "qwen")
+    assert screen.await_count == 2
+    assert screen.call_args.args[0]["weight_g"] == 499
+    assert screen.call_args.args[0]["sell_price_cny"] == 134
     source = erp.call_args.kwargs["source"]
     assert source["selected_cost_cny"] == 10.5
     assert source["selected_offer_image"] == {"available": True, "score": 0.82}
@@ -213,7 +215,7 @@ async def test_cli_reads_result_and_keeps_keys_off_arguments(monkeypatch, candid
         return Process()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
-    assert await comparebot.screen(candidate, "private-key") == result
+    assert await comparebot.screen(candidate, "private-key", ranking=result["search_and_rank"]) == result
 
 
 async def test_real_node_bridge_uses_selected_price_without_legacy_search(
@@ -264,6 +266,7 @@ export async function maoziProfit({purchasePrice}){return {
     (.9, "small", "mismatch", True, False),
 ])
 def test_approved_evidence_obeys_new_policy(candidate, result, score, size, verdict, conflict, valid):
+    candidate.update(weight_g=100 if size == "small" else 500, sell_price_cny=100)
     result["search_and_rank"]["query"]["size"] = size
     result["search_and_rank"]["candidates"][0]["dinov2_similarity"] = score
     result["decision"]["qwen_review"] = {"verdict": verdict, "brand_or_model_conflict": conflict}
@@ -272,3 +275,20 @@ def test_approved_evidence_obeys_new_policy(candidate, result, score, size, verd
     else:
         with pytest.raises(ModuleError):
             comparebot.source_from_result(result, candidate)
+
+
+@pytest.mark.parametrize("weight,price,expected", [(499,134.99,"small"),(500,134,"large"),(499,135,"large"),(500,135,"large"),(None,100,"unknown"),(100,None,"unknown"),(None,135,"large"),(0,100,"unknown"),(float("nan"),100,"unknown")])
+def test_size_uses_weight_and_cny_price(candidate, weight, price, expected):
+    candidate.update(weight_g=weight,sell_price_cny=price)
+    candidate["origin"]["size"]="small"
+    assert comparebot.manifest(candidate)["size"] == expected
+
+@pytest.mark.parametrize("profit,expected", [(24.999,"rejected"),(25,"manual_review"),(25.001,"manual_review")])
+async def test_profit_precedes_manual_review(monkeypatch,candidate,result,profit,expected):
+    result["decision"]["outcome"]="manual_review"
+    screen=AsyncMock(return_value=result)
+    monkeypatch.setattr(comparebot,"screen",screen)
+    monkeypatch.setattr(comparebot.compat,"invoke",AsyncMock(return_value={"evidence":{"source":{},"profit":{"assessment":{"erp_profit_rate_pct":profit},"input":{"package_weight":501},"sell_price_cny":100}}}))
+    response=await comparebot.invoke("match",{"candidate":candidate},"token")
+    assert response[expected] is True
+    assert screen.await_count == (1 if profit < 25 else 2)

@@ -230,7 +230,7 @@ class Worker:
             if (
                 not result["route_available"]
                 or result["logistics"] != c["rules"]["logistics"]
-                or result["cost_return"] <= c["rules"]["profit_min"]
+                or (result["cost_return"] < 25 if json.loads(job["modules"])["matcher"]["driver"] == "comparebot" else result["cost_return"] <= c["rules"]["profit_min"])
             ):
                 self.move(job, "rejected", "利润门槛或物流条件未通过", data | {"profit": result})
                 return

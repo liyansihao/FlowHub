@@ -17,12 +17,13 @@ from comparebot.adapters.http_images import HttpImageLoader
 from comparebot.adapters.qwen.vision_reviewer import QwenVisionReviewer
 from comparebot.application.services.screen_product import ProductScreeningService
 from comparebot.application.services.search_and_rank import SearchAndRankService
-from comparebot.domain.models import ProductQuery, ProductSize
+from comparebot.domain.models import ProductQuery, ProductSize, SearchCandidate, RankedCandidate, SearchAndRankResult
 from comparebot.domain.screening import ScreeningPolicy
 
 
 def _args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the complete compareBot screening flow")
+    parser.add_argument("--ranking-input", type=Path, default=None)
     parser.add_argument("--manifest", type=Path, default=Path("fixtures/ozon_samples.json"))
     parser.add_argument("--product-id", required=True)
     parser.add_argument("--size", choices=tuple(ProductSize), default=None)
@@ -80,13 +81,25 @@ async def _run(args: argparse.Namespace) -> None:
         qwen_mismatch_max_similarity=args.qwen_mismatch_max_similarity,
     )
     api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
-    ranker = DinoV2Ranker(device=args.device)
+    ranker = DinoV2Ranker(device=args.device) if args.ranking_input is None else None
     async with httpx.AsyncClient(timeout=60, follow_redirects=True, trust_env=False) as client:
         search_and_rank = SearchAndRankService(
             Alibaba1688ImageSearchAdapter(),
             HttpImageLoader(client),
             ranker,
         )
+        if args.ranking_input is not None:
+            raw = json.loads(args.ranking_input.read_text(encoding="utf-8"))
+            if str(raw["query"]["product_id"]) != query.product_id:
+                raise ValueError("cached ranking product mismatch")
+            ranked = SearchAndRankResult(**(raw | {
+                "query": query,
+                "candidates": tuple(RankedCandidate(**(row | {"candidate": SearchCandidate(**row["candidate"])})) for row in raw["candidates"]),
+            }))
+            class CachedRanking:
+                async def run(self, query, *, top_k):
+                    return ranked
+            search_and_rank = CachedRanking()
         reviewer = (
             QwenVisionReviewer(
                 client,
