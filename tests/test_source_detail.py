@@ -1,0 +1,175 @@
+import pytest
+
+from flowhub.db import Database
+from flowhub.modules import ModuleError, Pending
+from flowhub.source_detail import SourceCollector, map_detail
+
+
+@pytest.fixture
+def context():
+    return {
+        "owner": "a",
+        "candidate": {"source_key": "123", "title": "title", "image": "https://example.com/a", "price": 10},
+        "store": {"credentials": {"erp_token": "test"}},
+    }
+
+
+async def test_collection_cache_and_exact_source_no_publishing(tmp_path, context):
+    db = Database(tmp_path)
+    calls = []
+
+    async def call(path, method="GET", query=None, body=None):
+        calls.append((path, method, query, body))
+        if path.endswith("/lists"):
+            return [{"id": 9, "sku": "wrong"}, {"id": 7, "sku": "123"}]
+        if path.endswith("/edit_import"):
+            assert body == {"id": 7}
+            return {"jump_id": 88}
+        return {"title": "source", "skus": [{}]}
+
+    first = SourceCollector(db, context)
+    first.call = call
+    result = await first.collect()
+    second = SourceCollector(db, context)
+    second.call = call
+    assert await second.collect() == result
+    assert len(calls) == 3
+    assert all("/import_ozon" not in c[0] and "/stocks" not in c[0] for c in calls)
+    assert b"test" not in db.path.read_bytes()
+
+
+async def test_lost_draft_response_not_replayed(tmp_path, context):
+    db = Database(tmp_path)
+    writes = 0
+
+    async def call(path, method="GET", query=None, body=None):
+        nonlocal writes
+        if path.endswith("/lists"):
+            return [{"id": 7, "sku": "123"}]
+        writes += 1
+        raise TimeoutError()
+
+    one = SourceCollector(db, context)
+    one.call = call
+    with pytest.raises(TimeoutError):
+        await one.collect()
+    two = SourceCollector(db, context)
+    two.call = call
+    with pytest.raises(Pending):
+        await two.collect()
+    assert writes == 1
+
+
+async def test_acknowledged_draft_retries_only_detail(tmp_path, context):
+    db = Database(tmp_path)
+    one = SourceCollector(db, context)
+    one.save("draft_ready", {"source_key": "123", "draft_id": 44})
+
+    async def call(path, method="GET", query=None, body=None):
+        assert path == "/api.product.collect/detail" and query["id"] == 44
+        return {"title": "source"}
+
+    one.call = call
+    assert (await one.collect())["detail"]["title"] == "source"
+
+
+async def test_mapping_validates_dictionary_and_does_not_copy_seller_terms(context):
+    snapshot = {
+        "source_key": "123",
+        "draft_id": 44,
+        "observed_at": 1,
+        "detail": {
+            "category_id": [1, 2, 3],
+            "title": "source",
+            "vat": "20",
+            "shop_id": 99,
+            "description": "description",
+            "common_attributes": [{"id": 85, "values": [5]}, {"id": 9048, "values": "model"}],
+            "skus": [
+                {
+                    "name": "variant",
+                    "price": 999,
+                    "offer_id": "old",
+                    "images": ["https://example.com/image"],
+                    "attributes": [],
+                }
+            ],
+        },
+    }
+
+    async def seller(path, body):
+        if path.endswith("/attribute"):
+            return {
+                "result": [
+                    {"id": 85, "dictionary_id": 1, "is_required": True},
+                    {"id": 9048, "dictionary_id": 0, "is_required": True},
+                    {"id": 4191, "dictionary_id": 0},
+                ]
+            }
+        return {"result": [{"id": 5, "value": "brand"}]}
+
+    mapped = await map_detail(snapshot, context, seller)
+    assert mapped["mapped_attributes"] == 3 and not mapped["required_missing"]
+    raw = mapped["dossier"]
+    assert raw["name"] == "variant"
+    assert not any(k in raw for k in ("vat", "shop_id", "price", "offer_id", "weight"))
+    assert raw["attributes"][0]["values"] == [{"dictionary_value_id": 5, "value": "brand"}]
+    snapshot["source_key"] = "wrong"
+    with pytest.raises(ModuleError):
+        await map_detail(snapshot, context, seller)
+
+
+async def test_multiple_variants_and_conflicts_never_silently_pick(context):
+    snapshot = {
+        "source_key": "123",
+        "draft_id": 1,
+        "observed_at": 1,
+        "detail": {"category_id": [1, 2, 3], "skus": [{}, {}]},
+    }
+    with pytest.raises(ModuleError):
+        await map_detail(snapshot, context, None)
+    snapshot["detail"]["skus"] = [{"attributes": [{"id": 9, "values": "blue"}]}]
+    snapshot["detail"]["common_attributes"] = [{"id": 9, "values": "red"}]
+
+    async def seller(path, body):
+        return {"result": [{"id": 9, "dictionary_id": 0}]}
+
+    assert (await map_detail(snapshot, context, seller))["issues"]
+
+
+async def test_failed_read_can_retry_without_replaying_writes(tmp_path, context):
+    db = Database(tmp_path)
+    one = SourceCollector(db, context)
+
+    async def failed(path, method="GET", query=None, body=None):
+        raise TimeoutError()
+
+    one.call = failed
+    with pytest.raises(TimeoutError):
+        await one.collect()
+    assert one.load()[0] == "new"
+
+
+async def test_obsolete_brand_id_resolves_only_exact_official_text(context):
+    snapshot = {
+        "source_key": "123",
+        "draft_id": 44,
+        "observed_at": 1,
+        "detail": {
+            "category_id": [1, 2, 3],
+            "brand_id": 5,
+            "brand_select": {"id": 5, "value": "QIACHIP"},
+            "skus": [{}],
+        },
+    }
+
+    async def seller(path, body):
+        if path.endswith("/attribute"):
+            return {"result": [{"id": 85, "dictionary_id": 1, "is_required": True}]}
+        if path.endswith("/search"):
+            return {"result": [{"id": 66, "value": "QIACHIP"}, {"id": 67, "value": "QIACHIP Other"}]}
+        return {"result": []}
+
+    result = await map_detail(snapshot, context, seller)
+    assert not result["issues"] and not result["required_missing"]
+    assert result["dossier"]["attributes"][0]["values"][0]["dictionary_value_id"] == 66

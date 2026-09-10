@@ -16,7 +16,8 @@ def digest(value):
 def assemble(context):
     """Copy traceable fields; never infer manufacturer, origin country, brand or tax."""
     candidate = context["candidate"]
-    raw = dict(candidate.get("origin", {}).get("ozon_dossier", {}))
+    raw = dict(context.get("prepared", {}).get("source_dossier", {}))
+    raw.update(candidate.get("origin", {}).get("ozon_dossier", {}))
     provenance = dict(raw.get("provenance", {}))
     raw.setdefault("source_key", candidate["source_key"])
     evidence = context.get("match", {}).get("evidence", {})
@@ -157,7 +158,30 @@ class OzonDirectPublisher(MaoziPublisher):
         }
 
     async def prepare(self):
+        source_result = None
+        supplied = self.c["candidate"].get("origin", {}).get("ozon_dossier", {})
+        if not supplied.get("attributes") and self.keys.get("erp_token"):
+            from .source_detail import SourceCollector, map_detail
+
+            collector = SourceCollector(self.db, self.c)
+            snapshot = await collector.collect()
+            cached = snapshot.get("mapping")
+            if (
+                cached
+                and cached.get("mapping_version") == 2
+                and snapshot.get("mapping_client") == str(self.keys["client_id"])
+            ):
+                source_result = cached
+            else:
+                source_result = await map_detail(snapshot, self.c, self.seller)
+                collector.save(
+                    "ready",
+                    snapshot | {"mapping": source_result, "mapping_client": str(self.keys["client_id"])},
+                )
+            self.c = self.c | {"prepared": {"source_dossier": source_result["dossier"]}}
         item, errors = dossier(self.c)
+        if source_result:
+            errors.extend(source_result["issues"])
         if any(type(item.get(k)) is not int or item[k] <= 0 for k in ("description_category_id", "type_id")):
             return {"ready": False, "needs_input": True, "missing": errors}
         await self.identity()
@@ -221,7 +245,13 @@ class OzonDirectPublisher(MaoziPublisher):
         if errors:
             return {"ready": False, "needs_input": True, "missing": errors}
         frozen = {"binding": self.binding(), "item": item, "checked_at": time.time()}
-        return {"ready": True, "frozen": frozen, "digest": digest(frozen)}
+        return {
+            "ready": True,
+            "frozen": frozen,
+            "digest": digest(frozen),
+            "source_dossier": assemble(self.c),
+            "source_mapping": {k: v for k, v in (source_result or {}).items() if k != "dossier"},
+        }
 
     async def invoke(self, op):
         if op == "prepare":

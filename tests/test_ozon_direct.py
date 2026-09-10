@@ -165,3 +165,27 @@ def test_assembler_reuses_evidence_without_inventing_identity(port):
     assert result["currency_code"] == "CNY"
     assert "vat" not in result and "attributes" not in result
     assert result["provenance"]["depth"].endswith("package_length")
+
+
+async def test_collected_dossier_survives_worker_phase_boundary(port, monkeypatch):
+    import flowhub.source_detail as source
+    from flowhub.source_detail import SourceCollector
+
+    raw = port.c["candidate"]["origin"]["ozon_dossier"]
+    port.c["candidate"]["origin"] = {}
+    port.keys["erp_token"] = "test-source-token"
+    original_context = copy.deepcopy(port.c)
+
+    async def collect(self):
+        return {"source_key": "123"}
+
+    async def map_detail(snapshot, context, seller):
+        return {"dossier": raw, "issues": [], "required_missing": [], "mapping_version": 2}
+
+    monkeypatch.setattr(SourceCollector, "collect", collect)
+    monkeypatch.setattr(source, "map_detail", map_detail)
+    prepared = await port.invoke("prepare")
+    assert prepared["ready"] and prepared["source_dossier"]["attributes"]
+    restarted = OzonDirectPublisher(original_context | {"prepared": prepared}, port.db)
+    restarted.seller = port.seller
+    assert (await restarted.invoke("publish"))["accepted"]
