@@ -364,8 +364,20 @@ class OzonDirectPublisher(MaoziPublisher):
                 if any(p.get("offer_id") != self.c["idempotency_key"] for p in items):
                     raise ModuleError("import task identity mismatch")
                 if any(p.get("errors") or p.get("status") == "failed" for p in items):
-                    return {"found": False, "issue": True, "store_id": self.store["id"]}
-            return await super().invoke(op)
+                    from .title_recovery import recover_title
+
+                    return await recover_title(self, row, [e for p in items for e in p.get("errors", [])])
+            product = await self.product()
+            if row and product and product.get("errors"):
+                from .title_recovery import recover_title
+
+                return await recover_title(self, row, product["errors"])
+            return {
+                "found": bool(product and product.get("sku")),
+                "product_id": str(product["id"]) if product else "",
+                "issue": bool(product and (product.get("errors") or product.get("is_archived"))),
+                "store_id": self.store["id"],
+            }
         if op not in ("identity", "quota", "stock", "check_stock"):
             raise ModuleError("unknown operation")
         return await super().invoke(op)

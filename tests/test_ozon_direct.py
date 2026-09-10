@@ -256,3 +256,107 @@ async def test_stock_receipt_preserves_rejection_vs_unknown_without_retry(port, 
     assert ("error_type" in record) == timeout and calls == 1
     if not timeout:
         assert record["response"]["result"][0]["updated"] is False
+
+
+async def title_rejected_port(port, monkeypatch):
+    import flowhub.compat
+    from flowhub.ozon_direct import digest
+
+    port.c["prepared"] = await port.prepare()
+    frozen = port.c["prepared"]["frozen"]
+    frozen["item"]["name"] = "Folder A3"
+    frozen["item"]["attributes"].append({"id": 4180, "values": [{"value": "Папка А3"}]})
+    port.c["prepared"]["digest"] = digest(frozen)
+    with port.db.connect() as db:
+        db.execute(
+            "INSERT INTO ozon_direct_writes VALUES(?,?,?,?,?,?)",
+            ("test-offer", "owner", digest(port.binding()), digest(frozen), "10", 1),
+        )
+    error = {
+        "code": "DESCRIPTION_DECLINE",
+        "attribute_id": 4180,
+        "description": "Название товара не может быть на латинице",
+    }
+    port.recovery_errors = [error]
+    port.guard_blocked = False
+    port.created = False
+    original = port.seller
+
+    async def guard(context):
+        if port.guard_blocked:
+            raise ModuleError("delist blocked")
+
+    monkeypatch.setattr(flowhub.compat, "guard", guard)
+
+    async def seller(path, body):
+        if path == "/v1/product/import/info":
+            return {"result": {"items": [{"offer_id": "test-offer", "errors": port.recovery_errors}]}}
+        if path == "/v3/product/info/list":
+            return {
+                "items": [
+                    {
+                        "id": 44,
+                        "offer_id": "test-offer",
+                        "sku": 55 if port.created else 0,
+                        "statuses": {"is_created": port.created, "moderate_status": "declined"},
+                        "errors": port.recovery_errors,
+                    }
+                ]
+            }
+        return await original(path, body)
+
+    port.seller = seller
+
+
+async def test_title_decline_repairs_exact_offer_once_and_persists_task(port, monkeypatch):
+    await title_rejected_port(port, monkeypatch)
+    result = await port.invoke("reconcile")
+    assert result["repair"] == "submitted"
+    payload = [b for p, b in port.calls if p == "/v3/product/import"][0]["items"][0]
+    old = port.c["prepared"]["frozen"]["item"]
+    assert payload == old | {"name": "Папка А3"}
+    with port.db.connect() as db:
+        assert db.execute("SELECT task_id FROM ozon_direct_writes").fetchone()[0] == "77"
+    assert (await port.invoke("reconcile"))["issue"]  # repeated rejection never loops
+    assert sum(p == "/v3/product/import" for p, _ in port.calls) == 1
+    port.recovery_errors = []
+    port.created = True
+    assert (await port.invoke("reconcile"))["found"]
+
+
+async def test_title_repair_unknown_write_is_never_replayed(port, monkeypatch):
+    await title_rejected_port(port, monkeypatch)
+    port.timeout = True
+    with pytest.raises(TimeoutError):
+        await port.invoke("reconcile")
+    restarted = OzonDirectPublisher(copy.deepcopy(port.c), port.db)
+    restarted.seller = port.seller
+    assert (await restarted.invoke("reconcile"))["repair"] == "started"
+    assert sum(p == "/v3/product/import" for p, _ in port.calls) == 1
+
+
+@pytest.mark.parametrize("reason", ["delist", "created", "unrelated", "binding", "no_russian"])
+async def test_title_repair_never_overwrites_blocked_or_unrelated_product(port, monkeypatch, reason):
+    from flowhub.ozon_direct import digest
+
+    await title_rejected_port(port, monkeypatch)
+    if reason == "delist":
+        port.guard_blocked = True
+    elif reason == "created":
+        port.created = True
+    elif reason == "unrelated":
+        port.recovery_errors.append({"code": "INVALID_PRICE"})
+    elif reason == "binding":
+        port.c["store"]["id"] = "other"
+    else:
+        frozen = port.c["prepared"]["frozen"]
+        frozen["item"]["attributes"] = []
+        port.c["prepared"]["digest"] = digest(frozen)
+        with port.db.connect() as db:
+            db.execute("UPDATE ozon_direct_writes SET payload_hash=?", (digest(frozen),))
+    if reason in ("delist", "binding"):
+        with pytest.raises(ModuleError):
+            await port.invoke("reconcile")
+    else:
+        assert (await port.invoke("reconcile"))["issue"]
+    assert all(p != "/v3/product/import" for p, _ in port.calls)
