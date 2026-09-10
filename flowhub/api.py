@@ -366,7 +366,7 @@ def create_app(database=None):
                 ).fetchone()
                 if not module:
                     raise HTTPException(400, "模块不存在或已停用")
-                if module["driver"] == "flowb" and user["role"] != "admin":
+                if module["driver"] in ("flowb", "comparebot") and user["role"] != "admin":
                     raise HTTPException(403, "本机兼容模块仅供管理员验收")
             keys = db.open(row["secrets"])
             keys.update({k: v for k, v in p.credentials.items() if v})
@@ -435,7 +435,7 @@ def create_app(database=None):
             return [
                 dict(r)
                 for r in c.execute("SELECT * FROM modules WHERE enabled=1")
-                if user["role"] == "admin" or r["driver"] != "flowb"
+                if user["role"] == "admin" or r["driver"] not in ("flowb", "comparebot")
             ]
 
     class Module(BaseModel):

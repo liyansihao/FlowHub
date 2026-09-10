@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>compareBot 盲标校准</title>
+  <style>
+    :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#172033;background:#f5f7fb}
+    *{box-sizing:border-box}body{margin:0}.bar{position:sticky;top:0;z-index:2;background:#152f52;color:white;padding:18px 28px;display:flex;justify-content:space-between;align-items:center}.bar h1{font-size:22px;margin:0}.progress{font-size:16px}.page{max-width:1450px;margin:auto;padding:24px}.source,.candidate{background:white;border:1px solid #d9e0ec;border-radius:14px;padding:16px}.source{display:grid;grid-template-columns:330px 1fr;gap:22px;margin-bottom:18px}.source img{width:100%;height:330px;object-fit:contain;background:#fafafa}.meta h2{margin:0 0 12px}.muted{color:#66758d}.candidates{display:grid;grid-template-columns:repeat(5,1fr);gap:12px}.candidate{display:flex;flex-direction:column}.candidate img{width:100%;aspect-ratio:1;object-fit:contain;background:#fafafa}.candidate h3{font-size:14px;line-height:1.45;min-height:62px}.candidate button,.actions button{border:0;border-radius:9px;padding:12px;font-size:15px;cursor:pointer}.candidate button{background:#e8f2ff;color:#1059b7;margin-top:auto}.candidate button:hover{background:#cfe4ff}.actions{display:flex;gap:12px;justify-content:center;margin:22px}.actions button{background:white;border:1px solid #cbd5e4}.actions .bad{color:#b3261e}.actions .uncertain{color:#8a5a00}.hint{text-align:center;color:#718096}.empty{text-align:center;padding:100px;font-size:20px}@media(max-width:900px){.source{grid-template-columns:1fr}.candidates{grid-template-columns:repeat(2,1fr)}}
+  </style>
+</head>
+<body>
+  <header class="bar"><h1>compareBot 人工盲标</h1><div class="progress" id="progress">加载中…</div></header>
+  <main class="page" id="app"></main>
+  <script>
+    let cases=[],labels={},current=null;
+    const app=document.getElementById('app'),progress=document.getElementById('progress');
+    async function load(){[cases,labels]=await Promise.all([fetch('/api/cases').then(r=>r.json()),fetch('/api/labels').then(r=>r.json())]);render();}
+    function nextCase(){return cases.find(c=>!labels[c.source.product_id]);}
+    function render(){current=nextCase();progress.textContent=`已标 ${Object.keys(labels).length} / 已采集 ${cases.length}`;if(!current){app.innerHTML='<div class="empty">当前已采集样本全部标完，可以等待采集继续或生成报告。</div>';return;}const s=current.source,ranked=current.search_and_rank.candidates.slice(0,5);app.innerHTML=`<section class="source"><a href="${s.product_url}" target="_blank"><img src="${s.image_url}" alt="Ozon source"></a><div class="meta"><div class="muted">Ozon · ${s.category_label} (${s.category_id}) · ${s.size}</div><h2>${escapeHtml(s.title)}</h2><p>商品 ${s.product_id}</p><p class="muted">请选择前5名中真正的同款；页面不会显示DINO或千问的判断。</p></div></section><section class="candidates">${ranked.map((r,i)=>`<article class="candidate"><a href="${r.candidate.offer_url}" target="_blank"><img src="${r.candidate.image_url}" alt="1688 candidate ${i+1}"></a><h3>${escapeHtml(r.candidate.title)}</h3><button onclick="save('match',${i+1})">${i+1} · 这是同款</button></article>`).join('')}</section><div class="actions"><button class="bad" onclick="save('mismatch',null)">0 · 前5均非同款</button><button class="uncertain" onclick="save('uncertain',null)">U · 无法确定</button></div><div class="hint">快捷键：1–5 选择同款，0 前5均非同款，U 无法确定</div>`;}
+    async function save(verdict,matched_rank){const id=current.source.product_id;await fetch(`/api/labels/${encodeURIComponent(id)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({verdict,matched_rank})});labels[id]={verdict,matched_rank};render();}
+    function escapeHtml(v){const d=document.createElement('div');d.textContent=v;return d.innerHTML;}
+    document.addEventListener('keydown',e=>{if(!current)return;if(e.key>='1'&&e.key<='5')save('match',Number(e.key));else if(e.key==='0')save('mismatch',null);else if(e.key.toLowerCase()==='u')save('uncertain',null);});
+    setInterval(async()=>{const fresh=await fetch('/api/cases').then(r=>r.json());if(fresh.length!==cases.length){cases=fresh;render();}},5000);
+    load();
+  </script>
+</body>
+</html>

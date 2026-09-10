@@ -78,6 +78,12 @@ class Database:
             db.execute(
                 "INSERT OR IGNORE INTO modules(id,kind,name,driver) VALUES('ozon-direct-publisher','publisher','Ozon 官方直发（本地商品资料）','ozon-direct')"
             )
+            db.execute(
+                "INSERT OR IGNORE INTO modules(id,kind,name,driver) VALUES('flowb-matcher','matcher','compareBot 1688 同款','comparebot')"
+            )
+            db.execute(
+                "UPDATE modules SET name='compareBot 1688 同款',driver='comparebot' WHERE id='flowb-matcher' AND driver='flowb'"
+            )
             for provider, title in [("ChinaPost", "邮政本地利润"), ("GUOO", "GUOO 本地利润")]:
                 db.execute(
                     "INSERT OR IGNORE INTO modules(id,kind,name,driver,endpoint) VALUES(?,?,?,?,?)",

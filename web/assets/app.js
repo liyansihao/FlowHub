@@ -230,7 +230,7 @@ function detail(j) {
       "图片 / 结构分数",
       j.score === null
         ? "—"
-        : `${((j.score || 0) * 100).toFixed(1)} / ${((j.dhash || 0) * 100).toFixed(1)}`,
+        : `${((j.score || 0) * 100).toFixed(1)} / ${j.dhash == null ? "—" : (j.dhash * 100).toFixed(1)}`,
     ],
     ["成本利润率", j.profit == null ? "—" : j.profit.toFixed(2) + "%"],
     ["目标库存", j.stock],
@@ -598,7 +598,7 @@ async function render() {
           )
           .join(
             "",
-          )}</div><div class="formarea"><h2>商业规则</h2><div class="row2">${[
+          )}</div><div class="formarea"><h2>商业规则</h2><p class="muted tiny">compareBot 使用自身的 75 / 55 分匹配分流和千问复核；下方图片、结构阈值仅适用于旧匹配模块。商品大小未知或证据不足时进入人工审核。</p><div class="row2">${[
           ["profit_min", "成本利润率最低值 %"],
           ["stock", "目标库存"],
           ["image_min", "图片分数最低值 / 100"],

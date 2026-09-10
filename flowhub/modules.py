@@ -76,6 +76,10 @@ class ModuleHost:
         self.db = db
 
     async def invoke(self, module, operation, context, secret=""):
+        if module["driver"] == "comparebot":
+            from .comparebot import invoke
+
+            return await invoke(operation, context, secret)
         if module["driver"] == "local-profit":
             from .local_profit import invoke
 

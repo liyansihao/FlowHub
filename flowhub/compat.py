@@ -9,7 +9,7 @@ from pathlib import Path
 from .modules import ModuleError
 
 
-async def invoke(operation, context, token):
+async def invoke(operation, context, token, *, source=None):
     if not token:
         raise ModuleError("workspace ERP token required")
     root = Path(os.environ.get("FLOWHUB_LEGACY_ROOT", "/Users/mac/Desktop/ozon"))
@@ -30,6 +30,9 @@ async def invoke(operation, context, token):
         if operation == "candidates"
         else {"action": "evaluate", "product": context["candidate"]["origin"]}
     )
+    if source is not None:
+        bridge = Path(__file__).resolve().parents[1] / "bridges/comparebot.mjs"
+        args = {"action": "comparebot_evaluate", "product": context["candidate"]["origin"], "source": source}
     if operation == "feedback":
         args = {
             "action": "feedback",
@@ -107,7 +110,7 @@ async def invoke(operation, context, token):
         image=source.get("selected_image_url") or context["candidate"]["image"],
         purchase=source["selected_cost_cny"],
         score=img["score"],
-        dhash=img["dhash_score"],
+        dhash=img.get("dhash_score"),
         observed_at=__import__("time").time(),
         evidence=r,
     )
