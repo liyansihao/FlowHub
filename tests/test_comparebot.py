@@ -27,12 +27,12 @@ def candidate():
 @pytest.fixture
 def result():
     return dict(
-        decision=dict(outcome="approved", selected_offer_id="456", reason="qwen_match"),
+        decision=dict(outcome="approved", selected_offer_id="456", reason="qwen_match_in_safe_band", qwen_review={"verdict": "match"}),
         search_and_rank=dict(
             query={"product_id": "123"},
             candidates=[
                 dict(
-                    dinov2_similarity=0.62,
+                    dinov2_similarity=0.82,
                     candidate=dict(
                         offer_id="456",
                         title="Offer",
@@ -71,10 +71,10 @@ async def test_approved_passes_exact_selected_source(monkeypatch, candidate, res
     await comparebot.invoke(
         "match", {"candidate": candidate}, '{"erp_token":"erp","dashscope_api_key":"qwen"}'
     )
-    screen.assert_awaited_once_with(candidate)
+    screen.assert_awaited_once_with(candidate, "qwen")
     source = erp.call_args.kwargs["source"]
     assert source["selected_cost_cny"] == 10.5
-    assert source["selected_offer_image"] == {"available": True, "score": 0.62}
+    assert source["selected_offer_image"] == {"available": True, "score": 0.82}
 
 
 @pytest.mark.parametrize("price", [None, "NaN", "-1", "0"])
@@ -103,7 +103,7 @@ async def test_worker_accepts_dinov2_without_fabricated_dhash(tmp_path, candidat
         supplier_url="https://detail.1688.com/offer/456.html",
         image="https://example.com/b.jpg",
         purchase=10.5,
-        score=0.62,
+        score=0.82,
         dhash=None,
         observed_at=time.time(),
         evidence={
@@ -206,14 +206,14 @@ async def test_cli_reads_result_and_keeps_keys_off_arguments(monkeypatch, candid
 
     async def spawn(*args, **kwargs):
         assert "private-key" not in args
-        assert "DASHSCOPE_API_KEY" not in kwargs["env"]
-        assert "comparebot.interfaces.cli" in args
+        assert kwargs["env"]["DASHSCOPE_API_KEY"] == "private-key"
+        assert "comparebot.interfaces.screen_cli" in args
         assert json.loads(Path(args[args.index("--manifest") + 1]).read_text())[0]["product_id"] == "123"
-        Path(args[args.index("--output") + 1]).write_text(json.dumps(result["search_and_rank"]))
+        Path(args[args.index("--output") + 1]).write_text(json.dumps(result))
         return Process()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
-    assert await comparebot.screen(candidate, "private-key") == comparebot.decide(result["search_and_rank"])
+    assert await comparebot.screen(candidate, "private-key") == result
 
 
 async def test_real_node_bridge_uses_selected_price_without_legacy_search(
@@ -250,33 +250,25 @@ export async function maoziProfit({purchasePrice}){return {
     source = comparebot.source_from_result(result, candidate)
     response = await comparebot.compat.invoke("match", {"candidate": candidate}, "test-token", source=source)
     assert response["purchase"] == 10.5
-    assert response["score"] == 0.62
+    assert response["score"] == 0.82
     assert response["dhash"] is None
     assert response["evidence"]["profit"]["assessment"]["total_cost_cny"] == 20.5
 
 
-@pytest.mark.parametrize("score, approved", [(0.599999, False), (0.60, True), (0.600001, True), (1, True), (-0.1, False)])
-@pytest.mark.parametrize("size", ["small", "large", "unknown"])
-def test_dinov2_threshold_inclusive_and_size_independent(result, score, approved, size):
-    ranking = result["search_and_rank"]
-    ranking["query"]["size"] = size
-    ranking["candidates"][0]["dinov2_similarity"] = score
-    assert (comparebot.decide(ranking)["decision"]["outcome"] == "approved") is approved
-
-
-def test_empty_ranking_rejected(result):
-    result["search_and_rank"]["candidates"] = []
-    assert comparebot.decide(result["search_and_rank"])["decision"]["outcome"] == "rejected"
-
-
-def test_stale_approved_below_threshold_cannot_reach_erp(candidate, result):
-    result["search_and_rank"]["candidates"][0]["dinov2_similarity"] = 0.59
-    with pytest.raises(ModuleError):
-        comparebot.source_from_result(result, candidate)
-
-
-@pytest.mark.parametrize("score", [float("nan"), float("inf"), 1.1])
-def test_invalid_score_fails_closed(result, score):
+@pytest.mark.parametrize("score,size,verdict,conflict,valid", [
+    (.81, "unknown", "match", False, False),
+    (.82, "unknown", "match", False, True),
+    (.86, "small", None, False, True),
+    (.9, "large", None, False, False),
+    (.9, "large", "match", False, True),
+    (.9, "small", "mismatch", True, False),
+])
+def test_approved_evidence_obeys_new_policy(candidate, result, score, size, verdict, conflict, valid):
+    result["search_and_rank"]["query"]["size"] = size
     result["search_and_rank"]["candidates"][0]["dinov2_similarity"] = score
-    with pytest.raises(ModuleError):
-        comparebot.decide(result["search_and_rank"])
+    result["decision"]["qwen_review"] = {"verdict": verdict, "brand_or_model_conflict": conflict}
+    if valid:
+        assert comparebot.source_from_result(result, candidate)["selected_offer_id"] == "456"
+    else:
+        with pytest.raises(ModuleError):
+            comparebot.source_from_result(result, candidate)

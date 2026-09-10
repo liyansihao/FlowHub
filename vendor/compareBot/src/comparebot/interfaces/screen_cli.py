@@ -27,8 +27,10 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--product-id", required=True)
     parser.add_argument("--size", choices=tuple(ProductSize), default=None)
     parser.add_argument("--top-k", type=int, default=10)
-    parser.add_argument("--high-threshold", type=float, default=0.75)
-    parser.add_argument("--medium-threshold", type=float, default=0.55)
+    parser.add_argument("--high-threshold", type=float, default=0.86)
+    parser.add_argument("--medium-threshold", type=float, default=0.63)
+    parser.add_argument("--qwen-match-min-similarity", type=float, default=0.82)
+    parser.add_argument("--qwen-mismatch-max-similarity", type=float, default=0.64)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", choices=("cpu", "mps", "cuda"))
     parser.add_argument("--qwen-model", default=os.getenv("QWEN_VL_MODEL", "qwen3-vl-plus"))
@@ -74,6 +76,8 @@ async def _run(args: argparse.Namespace) -> None:
     policy = ScreeningPolicy(
         high_threshold=args.high_threshold,
         medium_threshold=args.medium_threshold,
+        qwen_match_min_similarity=args.qwen_match_min_similarity,
+        qwen_mismatch_max_similarity=args.qwen_mismatch_max_similarity,
     )
     api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
     ranker = DinoV2Ranker(device=args.device)

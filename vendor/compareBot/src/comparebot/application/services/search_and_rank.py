@@ -34,6 +34,8 @@ class SearchAndRankService:
         found = await self._search.search_by_image(reference)
         search_ms = _milliseconds(search_started)
         unique = {candidate.offer_id: candidate for candidate in found}
+        if not unique:
+            raise RuntimeError("1688 image search returned no candidates")
 
         download_started = time.perf_counter()
         semaphore = asyncio.Semaphore(self._download_concurrency)
@@ -87,4 +89,3 @@ class SearchAndRankService:
 
 def _milliseconds(started: float) -> int:
     return round((time.perf_counter() - started) * 1000)
-

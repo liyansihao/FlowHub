@@ -598,7 +598,7 @@ async function render() {
           )
           .join(
             "",
-          )}</div><div class="formarea"><h2>商业规则</h2><p class="muted tiny">compareBot 全部使用 DINOv2，相似度达到 60%（含）即判为同款，不调用千问，也不按大小分流。下方图片、结构阈值仅适用于旧匹配模块。利润与上架检查仍独立执行。</p><div class="row2">${[
+          )}</div><div class="formarea"><h2>商业规则</h2><p class="muted tiny">DINO＜63% 淘汰；≥86% 且小商品直接通过；其余交千问：同款且≥82% 通过，不同款且≤64% 淘汰，其他人工审核。明确品牌或型号冲突淘汰。颜色、包装、角度和销售件数不单独否决。下方图片、结构阈值仅适用于旧模块。</p><div class="row2">${[
           ["profit_min", "成本利润率最低值 %"],
           ["stock", "目标库存"],
           ["image_min", "图片分数最低值 / 100"],

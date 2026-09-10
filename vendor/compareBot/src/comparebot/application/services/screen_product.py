@@ -12,7 +12,6 @@ from comparebot.domain.screening import (
     ScreeningDecision,
     ScreeningOutcome,
     ScreeningPolicy,
-    SimilarityTier,
     decide_from_qwen,
     decide_without_qwen,
 )
@@ -58,7 +57,7 @@ class ProductScreeningService:
                 ranked,
                 ScreeningDecision(
                     ScreeningOutcome.MANUAL_REVIEW,
-                    SimilarityTier.MEDIUM,
+                    self._policy.tier(similarity),
                     "qwen_not_configured",
                     offer_id,
                 ),
@@ -81,7 +80,7 @@ class ProductScreeningService:
                 ranked,
                 ScreeningDecision(
                     ScreeningOutcome.MANUAL_REVIEW,
-                    SimilarityTier.MEDIUM,
+                    self._policy.tier(similarity),
                     "qwen_request_failed",
                     offer_id,
                 ),

@@ -6,9 +6,9 @@
 | --- | --- | --- | --- |
 | 高 | 小 | 不调用千问 | 通过 |
 | 高 | 大或未知 | 不调用千问 | 人工审核 |
-| 中 | 任意 | 千问判断同款 | 通过 |
-| 中 | 任意 | 千问判断不同款 | 淘汰 |
-| 中 | 任意 | 千问无法确定或调用失败 | 人工审核 |
+| 中且DINO >= 0.82 | 任意 | 千问判断同款且无明确品牌冲突 | 通过 |
+| 中且DINO <= 0.64 | 任意 | 千问判断不同款 | 淘汰 |
+| 其他中匹配 | 任意 | 千问结论不在安全区或调用失败 | 人工审核 |
 | 低 | 任意 | 不调用千问 | 淘汰 |
 
 ```text
@@ -19,9 +19,9 @@ Ozon输入
       ├─ 高匹配 + 小商品 → approved
       ├─ 高匹配 + 大/未知 → manual_review
       ├─ 中匹配 → Qwen
-      │   ├─ match → approved
-      │   ├─ mismatch → rejected
-      │   └─ uncertain/调用失败 → manual_review
+      │   ├─ match + DINO >= 0.82 → approved
+      │   ├─ mismatch + DINO <= 0.64 → rejected
+      │   └─ 其他结论/调用失败 → manual_review
       └─ 低匹配 → rejected
 ```
 

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 CATEGORY_LABELS = {
-    "200000933": "服装",
+    "200001517": "袜子与内衣",
     "17028991": "护肤",
     "17028992": "洗护发",
     "17029018": "本册与手账",
@@ -55,8 +55,7 @@ def build_manifest(
         candidates.sort(key=lambda row: _stable_key(seed, row["product_id"]))
         if len(candidates) < per_category:
             raise ValueError(
-                f"category {category_id} has {len(candidates)} usable products; "
-                f"need {per_category}"
+                f"category {category_id} has {len(candidates)} usable products; need {per_category}"
             )
         chosen = _prefer_size_mix(candidates, per_category)
         for row in chosen:

@@ -49,8 +49,9 @@ async function main(){
  if(input.action==='comparebot_evaluate'){
   const d=source.comparebot?.decision;
   const rows=source.comparebot?.search_and_rank?.candidates||[];
+  const review=d?.qwen_review||{};
   const row=rows.find(r=>String(r.candidate.offer_id)===String(d?.selected_offer_id));
-  if(d?.outcome!=='approved'||!row||!Number.isFinite(Number(row.dinov2_similarity))||Number(row.dinov2_similarity)<0.60||Number(row.dinov2_similarity)>1||String(source.selected_offer_id)!==String(d.selected_offer_id)
+  if(d?.outcome!=='approved'||!row||review.brand_or_model_conflict||!((Number(row.dinov2_similarity)>=0.86&&source.comparebot.search_and_rank.query.size==='small')||(Number(row.dinov2_similarity)>=0.82&&review.verdict==='match'))||!Number.isFinite(Number(row.dinov2_similarity))||Number(row.dinov2_similarity)<0.82||Number(row.dinov2_similarity)>1||String(source.selected_offer_id)!==String(d.selected_offer_id)
    ||!/^\d+$/.test(String(source.selected_offer_id))
    ||source.selected_offer_url!==`https://detail.1688.com/offer/${source.selected_offer_id}.html`
    ||!(Number(source.selected_cost_cny)>0)||!Number.isFinite(Number(source.selected_cost_cny))

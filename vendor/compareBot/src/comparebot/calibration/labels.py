@@ -38,3 +38,15 @@ def save_label(path: Path, product_id: str, label: dict[str, Any]) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def delete_label(path: Path, product_id: str) -> None:
+    labels = load_labels(path)
+    if product_id not in labels:
+        return
+    del labels[product_id]
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(labels, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary.replace(path)

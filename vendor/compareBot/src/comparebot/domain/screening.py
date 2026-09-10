@@ -26,12 +26,21 @@ class QwenVerdict(StrEnum):
 
 @dataclass(frozen=True)
 class ScreeningPolicy:
-    high_threshold: float = 0.75
-    medium_threshold: float = 0.55
+    high_threshold: float = 0.86
+    medium_threshold: float = 0.63
+    qwen_match_min_similarity: float = 0.82
+    qwen_mismatch_max_similarity: float = 0.64
 
     def __post_init__(self) -> None:
         if not -1 <= self.medium_threshold < self.high_threshold <= 1:
             raise ValueError("thresholds must satisfy -1 <= medium < high <= 1")
+        if not (
+            self.medium_threshold
+            <= self.qwen_mismatch_max_similarity
+            < self.qwen_match_min_similarity
+            < self.high_threshold
+        ):
+            raise ValueError("Qwen thresholds must stay inside the medium similarity band")
 
     def tier(self, similarity: float) -> SimilarityTier:
         if similarity >= self.high_threshold:
@@ -47,6 +56,11 @@ class QwenReview:
     confidence: float
     reason: str
     model: str
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    elapsed_ms: int | None = None
+    prompt_version: str | None = None
+    brand_or_model_conflict: bool = False
 
     def __post_init__(self) -> None:
         if not 0 <= self.confidence <= 1:
@@ -85,12 +99,7 @@ def decide_without_qwen(
                 "dinov2_high_small_product",
                 offer_id,
             )
-        return ScreeningDecision(
-            ScreeningOutcome.MANUAL_REVIEW,
-            tier,
-            "dinov2_high_large_or_unknown_size",
-            offer_id,
-        )
+        return None
     return None
 
 
@@ -102,17 +111,30 @@ def decide_from_qwen(
     review: QwenReview,
 ) -> ScreeningDecision:
     tier = policy.tier(similarity)
-    if tier is not SimilarityTier.MEDIUM:
-        raise ValueError("Qwen review is only valid for medium similarity")
-    outcomes = {
-        QwenVerdict.MATCH: ScreeningOutcome.APPROVED,
-        QwenVerdict.MISMATCH: ScreeningOutcome.REJECTED,
-        QwenVerdict.UNCERTAIN: ScreeningOutcome.MANUAL_REVIEW,
-    }
+    if tier is SimilarityTier.LOW:
+        raise ValueError("Qwen review requires similarity >= medium threshold")
+    if review.brand_or_model_conflict:
+        outcome = ScreeningOutcome.REJECTED
+        reason = "qwen_explicit_brand_or_model_conflict"
+    elif (
+        review.verdict is QwenVerdict.MATCH
+        and similarity >= policy.qwen_match_min_similarity
+    ):
+        outcome = ScreeningOutcome.APPROVED
+        reason = "qwen_match_in_safe_band"
+    elif (
+        review.verdict is QwenVerdict.MISMATCH
+        and similarity <= policy.qwen_mismatch_max_similarity
+    ):
+        outcome = ScreeningOutcome.REJECTED
+        reason = "qwen_mismatch_in_safe_band"
+    else:
+        outcome = ScreeningOutcome.MANUAL_REVIEW
+        reason = f"qwen_{review.verdict}_outside_safe_band"
     return ScreeningDecision(
-        outcomes[review.verdict],
+        outcome,
         tier,
-        f"qwen_{review.verdict}",
+        reason,
         offer_id,
         review,
     )

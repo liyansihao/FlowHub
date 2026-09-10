@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import asdict
@@ -23,7 +24,7 @@ async def collect_cases(
     top_k: int = 5,
     device: str | None = None,
     limit: int | None = None,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     products = manifest["products"][:limit]
     cases_dir.mkdir(parents=True, exist_ok=True)
@@ -49,13 +50,14 @@ async def collect_cases(
                 size=ProductSize(row["size"]),
             )
             try:
-                result = await service.run(query, top_k=top_k)
+                result = await _run_with_one_retry(service, query, top_k)
                 payload = {
                     "schema_version": 1,
                     "source": row,
                     "search_and_rank": asdict(result),
                 }
                 _write_json(destination, payload)
+                (cases_dir / f"{row['product_id']}.error.json").unlink(missing_ok=True)
                 completed += 1
                 score = result.candidates[0].dinov2_similarity
                 print(
@@ -76,7 +78,60 @@ async def collect_cases(
                     f"{type(error).__name__}: {error}",
                     flush=True,
                 )
-    return {"completed": completed, "skipped": skipped, "failed": failed}
+    summary = summarize_collection(products, cases_dir)
+    summary["this_run"] = {
+        "completed": completed,
+        "skipped": skipped,
+        "failed": failed,
+    }
+    return summary
+
+
+def summarize_collection(products: list[dict[str, Any]], cases_dir: Path) -> dict[str, Any]:
+    categories: dict[str, dict[str, int]] = {}
+    successful = 0
+    failures: dict[str, int] = {}
+    for row in products:
+        category_id = str(row["category_id"])
+        category = categories.setdefault(
+            category_id,
+            {"attempted": 0, "successful": 0, "failed": 0},
+        )
+        category["attempted"] += 1
+        product_id = str(row["product_id"])
+        if _is_complete(cases_dir / f"{product_id}.json"):
+            successful += 1
+            category["successful"] += 1
+            continue
+        category["failed"] += 1
+        error_path = cases_dir / f"{product_id}.error.json"
+        try:
+            error = json.loads(error_path.read_text(encoding="utf-8")).get("error")
+        except (OSError, json.JSONDecodeError):
+            error = "missing_error_record"
+        reason = str(error or "unknown_error")
+        failures[reason] = failures.get(reason, 0) + 1
+    attempted = len(products)
+    return {
+        "attempted": attempted,
+        "successful": successful,
+        "failed": attempted - successful,
+        "coverage_rate": round(successful / attempted, 4) if attempted else None,
+        "failure_reasons": failures,
+        "category_coverage": categories,
+    }
+
+
+async def _run_with_one_retry(
+    service: SearchAndRankService,
+    query: ProductQuery,
+    top_k: int,
+):
+    try:
+        return await service.run(query, top_k=top_k)
+    except Exception:
+        await asyncio.sleep(1)
+        return await service.run(query, top_k=top_k)
 
 
 def _is_complete(path: Path) -> bool:
