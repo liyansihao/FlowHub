@@ -1,0 +1,17 @@
+name: flowhub-windows
+services:
+  flowhub:
+    build: .
+    image: flowhub-windows:local
+    init: true
+    restart: unless-stopped
+    ports: ["127.0.0.1:38427:38427"]
+    volumes: ["flowhub_data:/data"]
+    stop_grace_period: 90s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:38427/healthz',timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+volumes:
+  flowhub_data:

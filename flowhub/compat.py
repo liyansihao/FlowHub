@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 
 from .modules import ModuleError
@@ -116,14 +117,17 @@ async def guard(context):
     """Current local migration must honor live Feishu delists and historical quarantine."""
     root = Path(os.environ.get("FLOWHUB_LEGACY_ROOT", "/Users/mac/Desktop/ozon"))
     code = """
-import asyncio,json,sys,tomllib
+import asyncio,json,sys,tomllib,os
 from pathlib import Path
 import httpx
 from flowef.adapters.feishu.delist_feedback import FeishuDelistFeedback
 from flowef.adapters.persistence.production_blocks import ProductionBlocks
 async def main():
  c=json.load(sys.stdin);root=Path(c['root'])
- args=tomllib.loads((Path.home()/'.codex/config.toml').read_text())['mcp_servers']['feishu_base']['args']
+ if os.environ.get('FLOWHUB_FEISHU_CONFIG'):
+  f=json.loads(Path(os.environ['FLOWHUB_FEISHU_CONFIG']).read_text());args=['-p',f['token'],'-a',f['app_token']]
+ else:
+  args=tomllib.loads((Path.home()/'.codex/config.toml').read_text())['mcp_servers']['feishu_base']['args']
  async with httpx.AsyncClient(base_url='https://base-api.feishu.cn/open-apis/bitable/v1/',headers={'Authorization':'Bearer '+args[args.index('-p')+1]},timeout=20) as client:
   blocks=await ProductionBlocks(FeishuDelistFeedback(client,args[args.index('-a')+1]),root/'flow_b_ef/state/quarantine.json').read()
   prohibited=c['sku'] in blocks.source_skus or (c['shop'],c['offer']) in blocks.store_offers
@@ -131,13 +135,16 @@ async def main():
 asyncio.run(main())
 """
     p = await asyncio.create_subprocess_exec(
-        str(root / "FlowEF-production/.venv/bin/python"),
+        sys.executable
+        if os.environ.get("FLOWHUB_PORTABLE") == "1"
+        else str(root / "FlowEF-production/.venv/bin/python"),
         "-c",
         code,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=root / "FlowEF-production",
+        env=os.environ | {"PYTHONPATH": str(root / "FlowEF-production/src")},
     )
     try:
         out, _ = await asyncio.wait_for(

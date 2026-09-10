@@ -27,9 +27,9 @@ def serve():
             "uvicorn",
             "flowhub.api:app",
             "--host",
-            "127.0.0.1",
+            os.environ.get("FLOWHUB_BIND_HOST", "127.0.0.1"),
             "--port",
-            "38427",
+            os.environ.get("FLOWHUB_PORT", "38427"),
             "--no-access-log",
             "--log-level",
             "error",
@@ -37,6 +37,8 @@ def serve():
         "worker": [sys.executable, "-m", "flowhub.worker"],
         "acceptance": [sys.executable, "-m", "flowhub.acceptance"],
     }
+    if os.environ.get("FLOWHUB_PORTABLE") == "1":
+        commands["discovery"] = [sys.executable, "-m", "flowhub.portable"]
     children = {}
     spawned = {}
     restart_at = {}
