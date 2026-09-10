@@ -20,7 +20,9 @@ let me = null,
   mods = [],
   overview = {},
   filter = "",
-  search = "";
+  search = "",
+  production = null,
+  rendering = false;
 const phase = {
   queued: "待识别",
   matched: "利润核算",
@@ -179,7 +181,9 @@ async function shell() {
       (b.onclick = async () => {
         page = b.dataset.page;
         filter = "";
-        search = "";
+        search = "",
+  production = null,
+  rendering = false;
         await render();
         window.scrollTo(0, 0);
       }),
@@ -193,7 +197,9 @@ async function shell() {
   if ($("#owner"))
     $("#owner").onchange = (e) => {
       owner = e.target.value;
-      search = "";
+      search = "",
+  production = null,
+  rendering = false;
       render();
     };
   await render();
@@ -202,7 +208,7 @@ function head(title, desc, actions = "") {
   return `<div class="pagehead"><div><h1>${title}</h1><p>${desc}</p></div><div class="actions">${actions}</div></div>`;
 }
 function table(list) {
-  return `<div class="table-wrap"><table class="jobs-table"><thead><tr><th>商品 / 来源</th><th>1688 同款</th><th>相似度 / 结构分数</th><th>成本利润率</th><th>店铺 / 进度</th><th></th></tr></thead><tbody>${list.map((j) => `<tr class="row" data-job="${esc(j.id)}" tabindex="0" aria-label="查看商品 ${esc(j.source_key)}"><td><div class="product"><img src="${esc(j.image)}" alt="候选商品" loading="lazy"><div><strong>${esc(j.title)}</strong><span class="muted tiny">${j.live ? "OZON" : "模拟"} · ${esc(j.source_key)}</span></div></div></td><td>${j.supplier_image ? `<img class="supplier-thumb" src="${esc(j.supplier_image)}" alt="1688同款" loading="lazy">` : '<span class="muted tiny">待识别</span>'}</td><td>${j.score == null ? '<span class="muted">—</span>' : `<span class="score">${(j.score * 100).toFixed(1)}<small> / 100</small></span><div class="score-track"><span style="width:${Math.max(0, Math.min(100, j.score * 100))}%"></span></div><small class="muted">结构 ${j.dhash == null ? "—" : (j.dhash * 100).toFixed(1)}</small>`}</td><td><strong class="profit ${j.profit != null && j.profit < 0 ? "negative" : ""}">${j.profit == null ? "—" : j.profit.toFixed(1) + "%"}</strong></td><td><div class="store-label">${esc(stores.find((s) => s.id === j.store_id)?.name || "待分配店铺")}</div>${stateBadge(j)}</td><td><span class="row-arrow">↗</span></td></tr>`).join("") || '<tr><td colspan="6"><div class="empty">没有匹配的商品<p>调整筛选条件，或连接店铺后启动工作流。</p></div></td></tr>'}</tbody></table></div>`;
+  return `<div class="table-wrap"><table class="jobs-table"><thead><tr><th>商品 / 来源</th><th>1688 同款</th><th>相似度 / 结构分数</th><th>成本利润率</th><th>店铺 / 进度</th><th></th></tr></thead><tbody>${list.map((j) => `<tr class="row" data-job="${esc(j.id)}" tabindex="0" aria-label="查看商品 ${esc(j.source_key)}"><td><div class="product"><img src="${esc(j.image)}" alt="候选商品" loading="lazy"><div><strong>${esc(j.title)}</strong><span class="muted tiny">${j.live ? "OZON" : "模拟"} · ${esc(j.source_key)}</span></div></div></td><td>${j.supplier_image ? `<img class="supplier-thumb" src="${esc(j.supplier_image)}" alt="1688同款" loading="lazy">` : '<span class="muted tiny">待识别</span>'}</td><td>${j.score == null ? '<span class="muted">—</span>' : `<span class="score">${(j.score * 100).toFixed(1)}<small> / 100</small></span><div class="score-track"><span style="width:${Math.max(0, Math.min(100, j.score * 100))}%"></span></div><small class="muted">结构 ${j.dhash == null ? "—" : (j.dhash * 100).toFixed(1)}</small>`}</td><td><strong class="profit ${j.profit != null && j.profit < 0 ? "negative" : ""}">${j.profit == null ? "—" : j.profit.toFixed(1) + "%"}</strong></td><td><div class="store-label">${esc(j.store_name || stores.find((s) => s.id === j.store_id)?.name || "待分配店铺")}</div>${stateBadge(j)}</td><td><span class="row-arrow">↗</span></td></tr>`).join("") || '<tr><td colspan="6"><div class="empty">没有匹配的商品<p>调整筛选条件，或连接店铺后启动工作流。</p></div></td></tr>'}</tbody></table></div>`;
 }
 function bindJobs() {
   document.querySelectorAll("[data-job]").forEach((e) => {
@@ -217,7 +223,7 @@ function detail(j) {
   el.className = "drawer-bg";
   el.innerHTML = `<div class="drawer"><button class="close" aria-label="关闭商品详情">✕</button><p class="muted tiny">商品详情 / ${j.live ? "真实上架" : "模拟验收"}</p><h2>${esc(j.title)}</h2>${stateBadge(j)}<div class="compare"><div><img src="${esc(j.image)}" alt="候选商品原图"><small>候选商品图片</small></div><div>${j.supplier_image ? `<img src="${esc(j.supplier_image)}" alt="1688同款原图">` : "尚未识别"}<small>1688 同款图片</small></div></div>${[
     ["源商品 SKU", j.source_key],
-    ["所属店铺", stores.find((s) => s.id === j.store_id)?.name || "待分配"],
+    ["所属店铺", j.store_name || stores.find((s) => s.id === j.store_id)?.name || "待分配"],
     [
       "图片 / 结构分数",
       j.score === null
@@ -266,6 +272,10 @@ function detail(j) {
   };
 }
 async function render() {
+  if (rendering) return;
+  rendering = true;
+  const focusedSearch = document.activeElement?.id === "jobsearch";
+  const caret = focusedSearch ? [document.activeElement.selectionStart, document.activeElement.selectionEnd] : null;
   document
     .querySelectorAll("[data-page]")
     .forEach((b) => b.classList.toggle("active", b.dataset.page === page));
@@ -286,6 +296,13 @@ async function render() {
           "/jobs" + (filter ? "?phase=" + encodeURIComponent(filter) : ""),
         )
       ).sort((a, b) => b.updated - a.updated);
+      production = me.role === "admin" ? await api("/production" + (filter ? "?phase=" + encodeURIComponent(filter) : "")) : null;
+      if (production?.available) {
+        jobs = production.jobs;
+        overview = production.overview;
+        wf = {...wf, enabled: production.active, rules: {...wf.rules, live: true, stock: 99, logistics: "ChinaPost"},
+          notice: `数据来源：本地正式上架流程 · 当前店铺 ${production.shop_name} · 每 10 秒刷新 · 最近读取 ${new Date(production.fetched_at * 1000).toLocaleTimeString()}。此处展示已进入正式上架的任务。`};
+      }
       const processing = Object.entries(overview.phases)
         .filter(([k]) => !["selling", "rejected", "attention"].includes(k))
         .reduce((s, [, v]) => s + v, 0);
@@ -293,7 +310,7 @@ async function render() {
         head(
           page === "overview" ? "运行概览" : "上架商品",
           `${wf.rules.live ? "真实上架" : "模拟验收"} · ${wf.rules.logistics === "ChinaPost" ? "邮政物流" : esc(wf.rules.logistics)} · 目标库存 ${wf.rules.stock}`,
-          `<button id="refresh">刷新数据</button><button class="${wf.enabled ? "" : "primary"}" id="toggle">${wf.enabled ? "暂停新增" : "启动工作流"}</button>`,
+          `<button id="refresh">刷新数据</button><button ${production?.available ? "disabled title=正式流程由本地发布服务管理" : ""} class="${wf.enabled ? "" : "primary"}" id="toggle">${production?.available ? "正式流程监控" : wf.enabled ? "暂停新增" : "启动工作流"}</button>`,
         ) +
         (page === "overview"
           ? `<div class="metrics">${[
@@ -367,6 +384,7 @@ async function render() {
         search = e.target.value;
         drawJobs();
       };
+      if (focusedSearch) { $("#jobsearch").focus(); $("#jobsearch").setSelectionRange(...caret); }
       $("#refresh").onclick = render;
       $("#toggle").onclick = async () => {
         try {
@@ -597,6 +615,8 @@ async function render() {
     }
   } catch (e) {
     toast(e.message);
+  } finally {
+    rendering = false;
   }
 }
 boot();
@@ -605,8 +625,7 @@ setInterval(() => {
     me &&
     !me.must_change &&
     ["overview", "jobs"].includes(page) &&
-    !document.querySelector(".drawer-bg") &&
-    document.activeElement?.id !== "jobsearch"
+    !document.querySelector(".drawer-bg")
   )
     render();
 }, 10000);

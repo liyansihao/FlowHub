@@ -443,6 +443,13 @@ def create_app(database=None):
             )
         return result
 
+    @app.get("/api/production")
+    def production(owner=Depends(scope), user=Depends(admin), phase: str = ""):
+        if owner != user["id"]:
+            return {"available": False}
+        from .production_view import snapshot
+        return snapshot(ROOT.parent / "FlowEF-production/state/production", phase)
+
     @app.get("/api/acceptance")
     def acceptance(user=Depends(admin)):
         path = db.directory / "live-acceptance.json"
