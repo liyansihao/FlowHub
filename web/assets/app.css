@@ -1217,3 +1217,16 @@ td > small.muted {
     transition: none !important;
   }
 }
+/* Keep login fields inside narrow embedded browser panels. */
+.login-form {
+  min-width: 0;
+}
+.login-inner {
+  min-width: 0;
+  max-width: 100%;
+}
+@media (max-width: 700px) {
+  .login {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
