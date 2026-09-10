@@ -24,6 +24,8 @@ let me = null,
   production = null,
   rendering = false;
 const phase = {
+  archived: "已归档",
+  offline: "已下架",
   queued: "待识别",
   matched: "利润核算",
   qualified: "等待店铺",
@@ -208,7 +210,7 @@ function head(title, desc, actions = "") {
   return `<div class="pagehead"><div><h1>${title}</h1><p>${desc}</p></div><div class="actions">${actions}</div></div>`;
 }
 function table(list) {
-  return `<div class="table-wrap"><table class="jobs-table"><thead><tr><th>商品 / 来源</th><th>1688 同款</th><th>相似度 / 结构分数</th><th>成本利润率</th><th>店铺 / 进度</th><th></th></tr></thead><tbody>${list.map((j) => `<tr class="row" data-job="${esc(j.id)}" tabindex="0" aria-label="查看商品 ${esc(j.source_key)}"><td><div class="product"><img src="${esc(j.image)}" alt="候选商品" loading="lazy"><div><strong>${esc(j.title)}</strong><span class="muted tiny">${j.live ? "OZON" : "模拟"} · ${esc(j.source_key)}</span></div></div></td><td>${j.supplier_image ? `<img class="supplier-thumb" src="${esc(j.supplier_image)}" alt="1688同款" loading="lazy">` : '<span class="muted tiny">待识别</span>'}</td><td>${j.score == null ? '<span class="muted">—</span>' : `<span class="score">${(j.score * 100).toFixed(1)}<small> / 100</small></span><div class="score-track"><span style="width:${Math.max(0, Math.min(100, j.score * 100))}%"></span></div><small class="muted">结构 ${j.dhash == null ? "—" : (j.dhash * 100).toFixed(1)}</small>`}</td><td><strong class="profit ${j.profit != null && j.profit < 0 ? "negative" : ""}">${j.profit == null ? "—" : j.profit.toFixed(1) + "%"}</strong></td><td><div class="store-label">${esc(j.store_name || stores.find((s) => s.id === j.store_id)?.name || "待分配店铺")}</div>${stateBadge(j)}</td><td><span class="row-arrow">↗</span></td></tr>`).join("") || '<tr><td colspan="6"><div class="empty">没有匹配的商品<p>调整筛选条件，或连接店铺后启动工作流。</p></div></td></tr>'}</tbody></table></div>`;
+  return `<div class="table-wrap"><table class="jobs-table"><thead><tr><th>商品 / 来源</th><th>1688 同款</th><th>相似度 / 结构分数</th><th>成本利润率</th><th>店铺 / 进度</th><th></th></tr></thead><tbody>${list.map((j) => `<tr class="row" data-job="${esc(j.id)}" tabindex="0" aria-label="查看商品 ${esc(j.source_key)}"><td><div class="product"><img src="${esc(j.image)}" alt="候选商品" loading="lazy"><div><strong>${esc(j.title)}</strong><span class="muted tiny">${j.live ? "OZON" : "模拟"} · ${esc(j.source_key)}</span></div></div></td><td>${j.supplier_image ? `<img class="supplier-thumb" src="${esc(j.supplier_image)}" alt="1688同款" loading="lazy">` : '<span class="muted tiny">待识别</span>'}</td><td>${j.score == null ? '<span class="muted">—</span>' : `<span class="score">${(j.score * 100).toFixed(1)}<small> / 100</small></span><div class="score-track"><span style="width:${Math.max(0, Math.min(100, j.score * 100))}%"></span></div><small class="muted">结构 ${j.dhash == null ? "—" : (j.dhash * 100).toFixed(1)}</small>`}</td><td><strong class="profit ${j.profit != null && j.profit < 0 ? "negative" : ""}">${j.profit == null ? "—" : j.profit.toFixed(1) + "%"}</strong></td><td><div class="store-label">${esc(j.store_name || stores.find((s) => s.id === j.store_id)?.name || "待分配店铺")}</div>${stateBadge(j)}</td><td><span class="row-arrow">${j.can_manage ? "管理" : "↗"}</span></td></tr>`).join("") || '<tr><td colspan="6"><div class="empty">没有匹配的商品<p>调整筛选条件，或连接店铺后启动工作流。</p></div></td></tr>'}</tbody></table></div>`;
 }
 function bindJobs() {
   document.querySelectorAll("[data-job]").forEach((e) => {
@@ -232,6 +234,8 @@ function detail(j) {
     ],
     ["成本利润率", j.profit == null ? "—" : j.profit.toFixed(2) + "%"],
     ["目标库存", j.stock],
+    ...(j.price != null ? [["价格参考（CNY）", j.price.toFixed(2)]] : []),
+    ...(j.observed_stock != null ? [["最近操作确认库存", j.observed_stock]] : []),
     ["当前说明", j.note],
   ]
     .map(
@@ -240,7 +244,7 @@ function detail(j) {
     )
     .join(
       "",
-    )}<p class="tiny muted" style="margin-top:20px">任务编号 ${esc(j.id)}</p>${j.supplier_url?.startsWith("https://") ? `<a target="_blank" rel="noreferrer" href="${esc(j.supplier_url)}">查看货源页面 ↗</a>` : ""}</div>`;
+    )}<p class="tiny muted" style="margin-top:20px">任务编号 ${esc(j.id)}</p>${j.can_manage ? `<section class="product-actions"><h3>商品操作</h3><p class="tiny muted">库存调整作用于嘉兴邮政仓；下架会清零全部已查询到的仓库。改价单位为人民币（CNY）。</p><div class="row2"><button data-operation="activate">继续上架 · 库存99</button><button data-operation="delist">下架 · 库存清零</button><button data-operation="archive">下架并归档</button><button data-operation="verify">重新回查操作</button></div><label>嘉兴邮政仓库存</label><div class="row2"><input aria-label="新的库存" id="manage-stock" type="number" min="0" max="10000" step="1" value="${j.observed_stock ?? j.stock}"><button data-operation="stock">调整库存</button></div><label>新价格（CNY）</label><div class="row2"><input aria-label="新的价格" id="manage-price" type="number" min="0.01" step="0.01" value="${j.price || ""}"><button data-operation="price">调整价格</button></div><div id="action-review"></div><p id="action-result" role="status" class="tiny muted"></p></section>` : ""}${j.supplier_url?.startsWith("https://") ? `<a target="_blank" rel="noreferrer" href="${esc(j.supplier_url)}">查看货源页面 ↗</a>` : ""}</div>`;
   document.body.append(el);
   const previousFocus = document.activeElement;
   const drawer = el.querySelector(".drawer");
@@ -251,6 +255,28 @@ function detail(j) {
     el.remove();
     previousFocus?.focus();
   };
+  el.querySelectorAll("[data-operation]").forEach(button => {
+    button.onclick = () => {
+      const action = button.dataset.operation;
+      const value = action === "stock" ? Number(el.querySelector("#manage-stock").value) : action === "price" ? Number(el.querySelector("#manage-price").value) : null;
+      const labels = {activate:"继续上架，嘉兴邮政仓库存设为99", delist:"下架，所有已查询仓库库存清零", archive:"清零库存后归档", stock:`嘉兴邮政仓库存设为 ${value}`, price:`售价调整为 ${value} CNY`, verify:"重新回查上次操作"};
+      const review = el.querySelector("#action-review");
+      review.innerHTML = `<p>${esc(j.store_name)} · ${esc(j.source_key)}<br>${esc(labels[action])}</p><button id="confirm-action" class="primary">${action === "verify" ? "开始回查" : "确认执行"}</button>`;
+      review.querySelector("button").onclick = async () => {
+        el.querySelectorAll("[data-operation],#confirm-action").forEach(b => b.disabled = true);
+        const output = el.querySelector("#action-result");
+        output.textContent = "正在核验并执行，请勿重复提交…";
+        try {
+          const result = await api(`/production/${encodeURIComponent(j.id)}/action`, "POST", {action, value, request_id:crypto.randomUUID()});
+          output.textContent = result.message;
+          j.note = result.message;
+          if(result.observed_stock != null) j.observed_stock = result.observed_stock;
+          if(result.observed_price != null) j.price = result.observed_price;
+        } catch(e) { output.textContent = e.message; }
+        finally { review.innerHTML = ""; el.querySelectorAll("[data-operation]").forEach(b => b.disabled = false); }
+      };
+    };
+  });
   el.querySelector(".close").focus();
   el.onclick = (e) => {
     if (e.target === el || e.target.closest(".close")) close();
@@ -258,7 +284,7 @@ function detail(j) {
   el.onkeydown = (e) => {
     if (e.key === "Escape") close();
     if (e.key === "Tab") {
-      const targets = [...el.querySelectorAll("button,a[href]")];
+      const targets = [...el.querySelectorAll("button:not(:disabled),a[href],input,select")];
       const first = targets[0],
         last = targets[targets.length - 1];
       if (e.shiftKey && document.activeElement === first) {
@@ -304,7 +330,7 @@ async function render() {
           notice: `数据来源：本地正式上架流程 · 当前店铺 ${production.shop_name} · 每 10 秒刷新 · 最近读取 ${new Date(production.fetched_at * 1000).toLocaleTimeString()}。此处展示已进入正式上架的任务。`};
       }
       const processing = Object.entries(overview.phases)
-        .filter(([k]) => !["selling", "rejected", "attention"].includes(k))
+        .filter(([k]) => !["selling", "rejected", "attention", "archived", "offline"].includes(k))
         .reduce((s, [, v]) => s + v, 0);
       c.innerHTML =
         head(
@@ -371,6 +397,8 @@ async function render() {
           ["selling", "已可售"],
           ["rejected", "未通过"],
           ["attention", "需处理"],
+          ["offline", "已下架"],
+          ["archived", "已归档"],
         ]
           .map(
             ([k, t]) =>

@@ -1230,3 +1230,8 @@ td > small.muted {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+.product-actions { margin-top:24px; padding-top:18px; border-top:1px solid #e8e1da; }
+.product-actions .row2 { margin:10px 0 16px; gap:10px; }
+.product-actions label { display:block; margin-top:12px; }
+#action-review:not(:empty) { padding:14px; margin-top:16px; background:#fff3e8; border-radius:10px; }

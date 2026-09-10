@@ -16,9 +16,9 @@ def test_read_only_fresh_updates_and_no_raw_evidence(tmp_path):
     (tmp_path / 'status.json').write_text(json.dumps(dict(active=True, shop_id='1')))
     p = tmp_path / 'production.sqlite3'
     c = sqlite3.connect(p)
-    c.execute('CREATE TABLE zero_stock_tests(offer_id,shop_id,sku,plan,phase,updated_at)')
+    c.execute('CREATE TABLE zero_stock_tests(offer_id,shop_id,sku,plan,phase,updated_at,details)')
     now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-    c.execute('INSERT INTO zero_stock_tests VALUES(?,?,?,?,?,?)', ('offer', '1', 'sku', json.dumps(dict(title='test', secret='HIDDEN')), 'stock_pending', now))
+    c.execute('INSERT INTO zero_stock_tests VALUES(?,?,?,?,?,?,?)', ('offer', '1', 'sku', json.dumps(dict(title='test', secret='HIDDEN')), 'stock_pending', now, '{}'))
     c.commit()
     assert snapshot(tmp_path)['overview']['phases'] == {'stock_pending': 1}
     c.execute("UPDATE zero_stock_tests SET phase='stock_verified'")

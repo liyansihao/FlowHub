@@ -443,6 +443,45 @@ def create_app(database=None):
             )
         return result
 
+    class ProductAction(BaseModel):
+        action: str
+        value: int | float | None = None
+        request_id: str = Field(min_length=12, max_length=80, pattern=r"^[a-zA-Z0-9_-]+$")
+
+    @app.post("/api/production/{offer}/action")
+    async def production_action(offer: str, payload: ProductAction, owner=Depends(scope), user=Depends(admin)):
+        if owner != user["id"]:
+            raise HTTPException(403, "不能操作其他工作区的正式商品")
+        from .production_actions import validate
+        try:
+            validate(payload.action, payload.value)
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+        if not re.fullmatch(r"flowef-live99-[a-f0-9]{20}", offer):
+            raise HTTPException(404, "正式商品不存在")
+        import asyncio
+        runner = ROOT.parent / "FlowEF-production/.venv/bin/python"
+        if not runner.exists():
+            raise HTTPException(409, "本机未连接正式上架服务")
+        proc = await asyncio.create_subprocess_exec(str(runner), str(ROOT / "flowhub/production_actions.py"),
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            cwd=ROOT.parent / "FlowEF-production", start_new_session=True)
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(json.dumps(dict(offer=offer, **payload.model_dump())).encode()), 180)
+        except BaseException:
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+            raise HTTPException(409, "操作结果暂未确认，请使用重新回查")
+        try:
+            result = json.loads(out)
+        except ValueError:
+            raise HTTPException(409, "操作结果暂未确认，请重新回查")
+        if not result.get("ok"):
+            raise HTTPException(409, result.get("message", "操作未完成"))
+        r = result["result"]
+        return {k: r.get(k) for k in ("status", "message", "action", "observed_stock", "observed_price", "updated")}
+
     @app.get("/api/production")
     def production(owner=Depends(scope), user=Depends(admin), phase: str = ""):
         if owner != user["id"]:
