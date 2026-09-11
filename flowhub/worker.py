@@ -34,7 +34,11 @@ class Worker:
         token = self.db.open(wf["secrets"]).get(json.loads(job["modules"])[kind]["id"], "")
         return await asyncio.wait_for(
             self.host.invoke(json.loads(job["modules"])[kind], operation, context, token),
-            130 if json.loads(job["modules"])[kind]["driver"] in ("flowb", "maozi", "ozon-direct") else 35,
+            280
+            if json.loads(job["modules"])[kind]["driver"] == "comparebot"
+            else 130
+            if json.loads(job["modules"])[kind]["driver"] in ("flowb", "maozi", "ozon-direct")
+            else 35,
         )
 
     def move(self, job, phase, note="", data=None, delay=0, plan=None, store=None):
@@ -163,9 +167,28 @@ class Worker:
             await guard(c)
         if phase == "queued":
             result = await self.call(job, "matcher", "match")
-            if result.get("rejected"):
-                self.move(job, "rejected", "同款识别或来源核验未通过")
+            is_comparebot = json.loads(job["modules"])["matcher"]["driver"] == "comparebot"
+            if result.get("manual_review"):
+                self.move(
+                    job,
+                    "attention",
+                    "compareBot 需要人工审核：" + str(result.get("reason", ""))[:150],
+                    data | {"match": result},
+                )
                 return
+            if result.get("rejected"):
+                self.move(job, "rejected", "同款识别或来源核验未通过", data | {"match": result})
+                return
+            if (
+                is_comparebot
+                and result.get("evidence", {})
+                .get("source", {})
+                .get("comparebot", {})
+                .get("decision", {})
+                .get("outcome")
+                != "approved"
+            ):
+                raise ModuleError("compareBot approval evidence missing")
             raw_evidence = result.get("evidence")
             result = dict(
                 supplier_id=str(result["supplier_id"])[:150],
@@ -173,7 +196,7 @@ class Worker:
                 image=image_url(result["image"]),
                 purchase=number(result["purchase"], 0.01),
                 score=number(result["score"], 0, 1),
-                dhash=number(result["dhash"], 0, 1),
+                dhash=None if is_comparebot else number(result["dhash"], 0, 1),
                 observed_at=number(result["observed_at"], time.time() - 21600, time.time() + 60),
             )
             if raw_evidence:
@@ -185,7 +208,7 @@ class Worker:
                 ]
             if not result["supplier_url"].startswith("https://"):
                 raise ModuleError("invalid supplier URL")
-            if (
+            if not is_comparebot and (
                 result["score"] * 100 < c["rules"]["image_min"]
                 or result["dhash"] * 100 < c["rules"]["dhash_min"]
             ):
@@ -207,7 +230,7 @@ class Worker:
             if (
                 not result["route_available"]
                 or result["logistics"] != c["rules"]["logistics"]
-                or result["cost_return"] <= c["rules"]["profit_min"]
+                or (result["cost_return"] < 25 if json.loads(job["modules"])["matcher"]["driver"] == "comparebot" else result["cost_return"] <= c["rules"]["profit_min"])
             ):
                 self.move(job, "rejected", "利润门槛或物流条件未通过", data | {"profit": result})
                 return

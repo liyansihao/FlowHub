@@ -12,7 +12,7 @@ dev = ["pytest", "pytest-asyncio", "ruff"]
 include = ["flowhub*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-pythonpath = ["."]
+pythonpath = [".", "vendor/compareBot/src"]
 [tool.ruff]
 line-length = 110
 [tool.ruff.lint]

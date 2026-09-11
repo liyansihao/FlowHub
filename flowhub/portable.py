@@ -29,12 +29,12 @@ def prepare(seed, target):
     with Database().connect() as c:
         for kind, name in [
             ("candidates", "FlowB 持续发现"),
-            ("matcher", "FlowB 1688 同款"),
+            ("matcher", "compareBot 1688 同款"),
             ("profit", "毛子邮政利润"),
         ]:
             c.execute(
                 "INSERT OR IGNORE INTO modules VALUES(?,?,?,?,?,?)",
-                ("flowb-" + kind, kind, name, "flowb", "", 1),
+                ("flowb-" + kind, kind, name, "comparebot" if kind == "matcher" else "flowb", "", 1),
             )
 
 

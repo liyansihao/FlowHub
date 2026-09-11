@@ -20,7 +20,8 @@ def test_portable_bootstrap_preserves_runtime_and_registers_modules(tmp_path, mo
     assert (target / "x/state/config.json").read_text() == '{"stock":7}'
     assert (target / "x/main.mjs").read_text() == "new code"
     with db.connect() as c:
-        assert c.execute("select count(*) from modules where driver='flowb'").fetchone()[0] == 3
+        assert c.execute("select count(*) from modules where driver='flowb'").fetchone()[0] == 2
+        assert c.execute("select driver from modules where id='flowb-matcher'").fetchone()[0] == "comparebot"
         assert c.execute("select count(*) from stores").fetchone()[0] == 0
         assert c.execute("select count(*) from workflows where enabled=1").fetchone()[0] == 0
 
