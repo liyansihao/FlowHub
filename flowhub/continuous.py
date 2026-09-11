@@ -100,12 +100,13 @@ class ContinuousHost(ModuleHost):
                 if product:
                     return {
                         "found": True,
+                        "store_id": store["id"],
                         "product_id": product.product_id,
                         "issue": bool(product.issue_codes),
                     }
                 status = await port.import_status(plan, offer)
                 if status == "failed":
-                    return {"issue": True}
+                    return {"issue": True, "store_id": store["id"]}
                 # Sync is best-effort; rate limiting must never interrupt reconciliation.
                 if time.time() >= self.sync_after.get(plan.shop_id, 0):
                     self.sync_after[plan.shop_id] = time.time() + 190
@@ -113,7 +114,7 @@ class ContinuousHost(ModuleHost):
                         await port.sync_products(plan.shop_id)
                     except Exception:
                         pass
-                return {"found": False}
+                return {"found": False, "store_id": store["id"]}
             if not product or product.issue_codes:
                 raise ModuleError("product not available or has platform errors")
             if operation == "stock":

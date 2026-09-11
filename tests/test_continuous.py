@@ -21,11 +21,16 @@ def test_offer_identity_stable_after_restart(tmp_path):
     assert worker.context(job)["idempotency_key"] == "flowef-live1-old"
 
 
-async def test_sync_failure_does_not_end_reconciliation(tmp_path):
+@pytest.mark.parametrize("status", ["pending", "found", "failed"])
+async def test_reconciliation_keeps_store_binding_and_never_republishes(tmp_path, status):
+    from types import SimpleNamespace
+
     host = ContinuousHost(Database(tmp_path))
     port = AsyncMock()
-    port.find_product.return_value = None
-    port.import_status.return_value = "pending"
+    port.find_product.return_value = (
+        SimpleNamespace(product_id="7", issue_codes=[]) if status == "found" else None
+    )
+    port.import_status.return_value = status
     port.sync_products.side_effect = RuntimeError("sync too frequent")
     client = AsyncMock()
     host.erp = lambda _: (client, port)
@@ -46,8 +51,11 @@ async def test_sync_failure_does_not_end_reconciliation(tmp_path):
         "idempotency_key": "flowef-live1-test",
     }
     for _ in range(2):
-        assert await host.invoke({"driver": "maozi"}, "reconcile", context) == {"found": False}
-    port.sync_products.assert_awaited_once()
+        result = await host.invoke({"driver": "maozi"}, "reconcile", context)
+        assert result["store_id"] == context["store"]["id"]
+        assert result.get("found", False) == (status == "found")
+        assert result.get("issue", False) == (status == "failed")
+    assert port.sync_products.await_count == (1 if status == "pending" else 0)
     port.publish_zero.assert_not_called()
     port.set_stocks.assert_not_called()
 
