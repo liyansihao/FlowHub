@@ -170,7 +170,7 @@ async def invoke(operation, context, secret=""):
     if source.get("manual_review") or source.get("rejected"):
         return source
     evaluated = await compat.invoke("match", context, credentials["erp_token"], source=source)
-    if evaluated.get("rejected"):
+    if evaluated.get("rejected") or evaluated.get("manual_review"):
         return evaluated
     evidence = evaluated["evidence"]
     profit = evidence["profit"]

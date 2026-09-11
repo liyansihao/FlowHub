@@ -185,3 +185,48 @@ def test_missing_stock_backs_off_without_replaying_write(tmp_path, monkeypatch):
     worker.move(job, "selling")
     assert moves[1][1] == "selling"
     assert moves[1][4] == 0
+
+
+@pytest.mark.parametrize("operation", ["prepare", "reconcile", "stock", "check_stock", "publish"])
+async def test_official_route_preserves_context_without_erp(tmp_path, monkeypatch, operation):
+    import flowhub.continuous as module
+
+    seen = []
+
+    class Official:
+        def __init__(self, context, db):
+            seen.append(context)
+
+        async def invoke(self, op):
+            return {"operation": op}
+
+    monkeypatch.setattr(module, "OzonDirectPublisher", Official)
+    host = ContinuousHost(Database(tmp_path))
+    host.erp = lambda _: pytest.fail("ERP must not be called")
+    context = {
+        "store": {"credentials": {"api_key": "test"}},
+        "idempotency_key": "old-offer",
+        "prepared": {"frozen": {"binding": "original"}},
+    }
+    assert await host.invoke({"driver": "maozi"}, operation, context) == {"operation": operation}
+    assert seen == [context]
+
+
+async def test_failed_call_has_private_diagnostic_and_public_timing(tmp_path, monkeypatch):
+    from flowhub.worker import Worker
+
+    worker = ContinuousWorker(Database(tmp_path))
+
+    async def fail(*args):
+        raise RuntimeError("secret-response-marker")
+
+    monkeypatch.setattr(Worker, "call", fail)
+    with pytest.raises(RuntimeError):
+        await worker.call({"id": "j", "owner": "o"}, "matcher", "match")
+    with worker.db.connect() as db:
+        event = db.execute("select message from events where code='operation_error'").fetchone()[0]
+        body = db.execute("select body from continuous_errors").fetchone()[0]
+    assert "secret-response-marker" not in event
+    assert "secret-response-marker" not in body
+    assert worker.db.open(body)["detail"] == "secret-response-marker"
+    assert json.loads(event)["operation"] == "match"

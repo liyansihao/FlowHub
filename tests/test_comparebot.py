@@ -292,3 +292,21 @@ async def test_profit_precedes_manual_review(monkeypatch,candidate,result,profit
     response=await comparebot.invoke("match",{"candidate":candidate},"token")
     assert response[expected] is True
     assert screen.await_count == (1 if profit < 25 else 2)
+
+async def test_missing_cost_facts_stop_before_qwen(monkeypatch, candidate, result):
+    screen = AsyncMock(return_value=result)
+    monkeypatch.setattr(comparebot, 'screen', screen)
+    monkeypatch.setattr(comparebot.compat, 'invoke', AsyncMock(return_value={
+        'manual_review': True, 'reason': 'commission_or_cost_inputs_missing'}))
+    response = await comparebot.invoke('match', {'candidate': candidate}, 'token')
+    assert response['manual_review'] is True
+    assert screen.await_count == 1
+
+async def test_missing_cost_adapter_is_not_transient(monkeypatch, candidate):
+    process = AsyncMock()
+    process.returncode = 0
+    process.communicate.return_value = (json.dumps({'ok': False, 'error': {
+        'message': 'Local official commission or cost inputs unavailable'}}).encode(), b'')
+    monkeypatch.setattr(comparebot.compat.asyncio, 'create_subprocess_exec', AsyncMock(return_value=process))
+    result = await comparebot.compat.invoke('match', {'candidate': candidate}, 'token')
+    assert result == {'manual_review': True, 'reason': 'commission_or_cost_inputs_missing'}

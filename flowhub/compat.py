@@ -67,7 +67,11 @@ async def invoke(operation, context, token, *, source=None):
         message = str(d.get("error", {}).get("message", ""))
         if operation == "match" and "No eligible logistics route" in message:
             return {"rejected": True}
-        raise ModuleError("legacy adapter unavailable")
+        if operation == "match" and message == "Local official commission or cost inputs unavailable":
+            return {"manual_review": True, "reason": "commission_or_cost_inputs_missing"}
+        error = ModuleError("legacy adapter unavailable")
+        error.private_detail = message
+        raise error
     r = d["result"]
     if operation == "feedback":
         if r.get("blocked") or r.get("rejected"):

@@ -11,6 +11,7 @@ import re
 import secrets
 import sys
 import time
+import traceback
 from pathlib import Path
 
 import httpx
@@ -20,6 +21,7 @@ from .comparebot_runtime import WarmScreening
 from .db import Database
 from .maozi import MaoziPublisher
 from .modules import ModuleError, ModuleHost
+from .ozon_direct import OzonDirectPublisher
 from .worker import Worker
 
 ROOT = Path(os.environ.get("FLOWHUB_LEGACY_ROOT", "/Users/mac/Desktop/ozon"))
@@ -91,6 +93,19 @@ class ContinuousHost(ModuleHost):
                     return {"rejected": True, "reason": "already_imported"}
         if module["driver"] != "maozi":
             return await super().invoke(module, operation, context, secret)
+        official = bool(context["store"]["credentials"].get("api_key"))
+        # Old prepared ERP tasks retain their original submission protocol. Readback
+        # and stock use the same account/offer through Seller API for both protocols.
+        if official and (
+            operation in ("prepare", "reconcile", "stock", "check_stock")
+            or (operation == "publish" and context.get("prepared", {}).get("frozen"))
+        ):
+            if operation == "prepare" and context["store"]["credentials"].get("erp_token"):
+                client, port = self.erp(context["store"]["credentials"]["erp_token"])
+                async with client:
+                    if await port.source_has_imports(context["candidate"]["source_key"]):
+                        return {"needs_input": True, "missing": ["source_already_imported"]}
+            return await OzonDirectPublisher(context, self.db).invoke(operation)
         if operation == "quota":
             key = (context.get("owner"), context["store"]["id"])
             cached = self.quota_cache.get(key)
@@ -215,11 +230,42 @@ class ContinuousWorker(Worker):
 
     async def call(self, job, kind, operation):
         started = time.monotonic()
-        result = await super().call(job, kind, operation)
+        try:
+            result = await super().call(job, kind, operation)
+        except Exception as error:
+            frames = traceback.extract_tb(error.__traceback__)
+            diagnostic = {
+                "operation": operation,
+                "seconds": round(time.monotonic() - started, 3),
+                "error_type": type(error).__name__,
+                "location": [f"{Path(f.filename).name}:{f.lineno}:{f.name}" for f in frames[-5:]],
+            }
+            with self.db.connect() as db:
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS continuous_errors(id INTEGER PRIMARY KEY,job_id TEXT,created REAL,body TEXT)"
+                )
+                db.execute(
+                    "INSERT INTO continuous_errors(job_id,created,body) VALUES(?,?,?)",
+                    (
+                        job["id"],
+                        time.time(),
+                        self.db.seal(
+                            diagnostic
+                            | {
+                                "detail": str(error)[:4000],
+                                "adapter_detail": getattr(error, "private_detail", "")[:4000],
+                            }
+                        ),
+                    ),
+                )
+                self.db.event(db, job["owner"], "operation_error", json.dumps(diagnostic), job["id"])
+            raise
         if operation == "check_stock":
             data = json.loads(job["data"])
             data["stock_unconfirmed_checks"] = (
-                data.get("stock_unconfirmed_checks", 0) + 1 if result.get("stock") is None else 0
+                data.get("stock_unconfirmed_checks", 0) + 1
+                if result.get("stock") != self.context(job)["rules"]["stock"]
+                else 0
             )
             self.move(job, job["phase"], "库存回查结果已保存", data=data)
         if result.get("issue_codes"):
@@ -288,7 +334,9 @@ class ContinuousWorker(Worker):
         return context
 
     async def advance(self, job):
-        if job["phase"] == "ready":
+        if job["phase"] == "ready" and not self.context(job).get("store", {}).get("credentials", {}).get(
+            "api_key"
+        ):
             data = json.loads(job["data"])
             if not data.get("russian_title"):
                 with self.db.connect() as c:

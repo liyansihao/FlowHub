@@ -376,6 +376,7 @@ class OzonDirectPublisher(MaoziPublisher):
                 "found": bool(product and product.get("sku")),
                 "product_id": str(product["id"]) if product else "",
                 "issue": bool(product and (product.get("errors") or product.get("is_archived"))),
+                "issue_codes": [str(e.get("code", "unknown")) for e in (product or {}).get("errors", [])],
                 "store_id": self.store["id"],
             }
         if op not in ("identity", "quota", "stock", "check_stock"):
