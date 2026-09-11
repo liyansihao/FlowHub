@@ -36,3 +36,7 @@ macOS LaunchAgent 的 Python 初始化在读取环境路径时阻塞，因此已
 失败调用增加 operation_error 耗时、异常类型及代码位置；原始错误仅加密保存在 continuous_errors，避免公开日志泄漏凭据。compat 保留加密诊断需要的上游错误，不再只剩笼统的 adapter unavailable。
 
 首轮加密诊断定位到两次重复失败均为 `Local official commission or cost inputs unavailable`，现将该明确缺资料错误转为人工待补资料，跳过后续千问和自动重试；不把未知利润当成达标。其他网络/服务异常保留有上限的自动重试及加密诊断。
+
+## 用户批准的佣金价格兜底
+
+2026-09-11：生产本地计算器先查准确类目佣金；匹配失败时 realFBS 售价≤1500 RUB 使用12%，>1500 RUB使用24%。使用佣金估算时 commission.estimated=true，保存fallback_reason，calculation_source/commission_status明确标记估算，不伪造官方类目或俄文类型名。金额由实际CNY售价和汇率换算。重量、尺寸、品牌同款审核、物流线路和25%成本利润率门槛不变；当前邮政线路自身≤1500 RUB限制不因佣金兜底放宽。

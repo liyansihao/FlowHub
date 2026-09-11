@@ -106,3 +106,26 @@ def resolve(*, sell_rub, mode="realFBS", row_id="", type_id="", type_name="", ca
         effective_from=DATA["effective_from"],
         verified_at=DATA["verified_at"],
     )
+
+
+def resolve_production(*, sell_rub, type_id, brand="", mode="realFBS"):
+    """User-authorized price fallback for production; never invent a product type."""
+    price = Decimal(str(sell_rub))
+    if not price.is_finite() or price <= 0 or mode != "realFBS":
+        raise ValueError("价格兜底需要正数卢布售价和 realFBS 模式")
+    try:
+        return resolve(sell_rub=price, type_id=type_id, brand=brand, mode=mode) | {"estimated": False}
+    except ValueError as error:
+        return dict(
+            rate_pct=12.0 if price <= 1500 else 24.0,
+            estimated=True,
+            fallback_reason=str(error),
+            name="价格档佣金估算（类目未匹配）",
+            type_name_ru="",
+            type_id=str(type_id),
+            mode=mode,
+            tier=1 if price <= 1500 else 2 if price <= 5000 else 3,
+            tier_label="≤1500 ₽" if price <= 1500 else ">1500 ₽",
+            source_url="user-authorized-price-fallback-20260911",
+            version="price-fallback-12-24-v1",
+        )

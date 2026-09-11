@@ -4,7 +4,7 @@ import json
 import sys
 from decimal import Decimal
 
-from .commissions import resolve
+from .commissions import resolve, resolve_production
 from .local_profit import ProfitInput, calculate
 
 
@@ -19,7 +19,7 @@ def production_profit(c):
     # Existing postal warehouse's size limits, retained from verified production carrier rules.
     if sum(dims) > 90 or max(dims) > 60:
         return {"rejected": "no_logistics_route"}
-    commission = resolve(
+    commission = resolve_production(
         sell_rub=sell / fx, type_id=str(category["cate"][2]), brand=product.get("brand", ""), mode="realFBS"
     )
     inputs = ProfitInput(
@@ -31,7 +31,10 @@ def production_profit(c):
         purchase_cny=source["selected_cost_cny"],
         weight_g=facts["weight"],
         dimensions_cm=dims,
-        type_id=str(category["cate"][2]),
+        type_id="" if commission["estimated"] else str(category["cate"][2]),
+        commission_pct=commission["rate_pct"] if commission["estimated"] else None,
+        commission_source=commission["source_url"],
+        category=commission["name"],
         brand=product.get("brand", ""),
         domestic_cny=0,
         packing_cny=0,
@@ -42,6 +45,9 @@ def production_profit(c):
         eligibility_confirmed=True,
     )
     result = calculate(inputs)
+    if commission["estimated"]:
+        result["commission_status"] = "estimated"
+        result["commission_match"] = commission
     if not result["quotes"]:
         return {"rejected": "no_logistics_route"}
     q = result["quotes"][0]
@@ -107,7 +113,7 @@ def production_profit(c):
         sell_price_cny=float(sell),
         cnyrub_rate=float(1 / fx),
         config_version=result["version"],
-        calculation_source="flowhub-local-postal-official-commission",
+        calculation_source="flowhub-local-postal-estimated-commission" if commission["estimated"] else "flowhub-local-postal-official-commission",
         commission=commission,
         calculation=result,
     )
