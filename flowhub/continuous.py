@@ -2,9 +2,13 @@
 
 import argparse
 import asyncio
+import contextvars
+import fcntl
+import hashlib
 import json
 import os
 import re
+import secrets
 import sys
 import time
 from pathlib import Path
@@ -25,18 +29,58 @@ from flowef.adapters.erp.maozi_test_listing import MaoziZeroStockAdapter
 from flowef.application.ports.test_listing import ZeroStockListingPlan
 
 
+class BoundBridge(FlowBBridge):
+    # The legacy bridge reads process environment; serialize that small boundary
+    # so concurrent lanes never exchange owner credentials.
+    lock = asyncio.Lock()
+
+    def __init__(self, token):
+        super().__init__(ROOT, execute=True)
+        self.token = token
+
+    async def call(self, action, **args):
+        async with self.lock:
+            previous = os.environ.get("MAOZI_ACCESS_TOKEN")
+            os.environ["MAOZI_ACCESS_TOKEN"] = self.token
+            try:
+                return await super().call(action, **args)
+            finally:
+                if previous is None:
+                    os.environ.pop("MAOZI_ACCESS_TOKEN", None)
+                else:
+                    os.environ["MAOZI_ACCESS_TOKEN"] = previous
+
+
+class CachedTargetAdapter(MaoziZeroStockAdapter):
+    def __init__(self, client, cache, namespace):
+        super().__init__(client)
+        self.cache, self.namespace = cache, namespace
+
+    async def target(self, shop_id, *, fresh=False):
+        key = (self.namespace, shop_id)
+        cached = self.cache.get(key)
+        if not fresh and cached and cached[0] > time.monotonic():
+            return cached[1]
+        value = await super().target(shop_id)
+        self.cache[key] = (time.monotonic() + 60, value)
+        return value
+
+
 class ContinuousHost(ModuleHost):
     def __init__(self, db):
         super().__init__(db)
         self.db = db
         self.sync_after = {}
+        self.target_cache = {}
+        self.quota_cache = {}
 
     def erp(self, token):
-        os.environ["MAOZI_ACCESS_TOKEN"] = token
         client = httpx.AsyncClient(
-            base_url="https://api.maozierp.com", transport=FlowBHttpTransport(FlowBBridge(ROOT, execute=True))
+            base_url="https://api.maozierp.com", transport=FlowBHttpTransport(BoundBridge(token))
         )
-        return client, MaoziZeroStockAdapter(client)
+        return client, CachedTargetAdapter(
+            client, self.target_cache, hashlib.sha256(token.encode()).hexdigest()
+        )
 
     async def invoke(self, module, operation, context, secret=""):
         if module["driver"] == "comparebot" and operation == "match":
@@ -48,7 +92,13 @@ class ContinuousHost(ModuleHost):
         if module["driver"] != "maozi":
             return await super().invoke(module, operation, context, secret)
         if operation == "quota":
-            return await MaoziPublisher(context).invoke("quota")
+            key = (context.get("owner"), context["store"]["id"])
+            cached = self.quota_cache.get(key)
+            if cached and cached[0] > time.monotonic():
+                return cached[1]
+            quota = await MaoziPublisher(context).invoke("quota")
+            self.quota_cache[key] = (time.monotonic() + 30, quota)
+            return quota
         store = context["store"]
         config = store["config"]
         client, port = self.erp(store["credentials"]["erp_token"])
@@ -72,7 +122,7 @@ class ContinuousHost(ModuleHost):
         )
         async with client:
             if operation in ("prepare", "publish", "stock"):
-                target = await port.target(plan.shop_id)
+                target = await port.target(plan.shop_id, fresh=True)
                 if (
                     not target.shop.active
                     or target.currency != "CNY"
@@ -103,10 +153,11 @@ class ContinuousHost(ModuleHost):
                         "store_id": store["id"],
                         "product_id": product.product_id,
                         "issue": bool(product.issue_codes),
+                        "issue_codes": list(product.issue_codes),
                     }
                 status = await port.import_status(plan, offer)
                 if status == "failed":
-                    return {"issue": True, "store_id": store["id"]}
+                    return {"issue": True, "issue_codes": ["erp_import_failed"], "store_id": store["id"]}
                 # Sync is best-effort; rate limiting must never interrupt reconciliation.
                 if time.time() >= self.sync_after.get(plan.shop_id, 0):
                     self.sync_after[plan.shop_id] = time.time() + 190
@@ -135,9 +186,100 @@ class ContinuousHost(ModuleHost):
 class ContinuousWorker(Worker):
     def __init__(self, db):
         super().__init__(db)
+        self.lane = contextvars.ContextVar("continuous_lane", default="all")
         self.host = ContinuousHost(db)
         self.screening = WarmScreening()
         comparebot.screen = self.screening.screen
+
+    def claim(self):
+        lane = self.lane.get()
+        if lane == "all":
+            return super().claim()
+        clause = "j.phase='queued'" if lane == "screening" else "j.phase!='queued'"
+        now = time.time()
+        lease = secrets.token_hex(16)
+        with self.db.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT j.* FROM jobs j JOIN users u ON u.id=j.owner JOIN workflows w ON w.owner=j.owner "
+                "WHERE u.active=1 AND (w.enabled=1 OR j.phase IN ('publishing','reconciling','stock_ready','stock_pending','checking')) "
+                "AND j.phase NOT IN ('selling','rejected','attention') AND "
+                + clause
+                + " AND j.next_at<=? AND j.lease_until<=? ORDER BY CASE WHEN j.phase IN ('publishing','reconciling','stock_ready','stock_pending','checking') THEN 0 ELSE 1 END,j.next_at,j.created LIMIT 1",
+                (now, now),
+            ).fetchone()
+            if row is None:
+                return None
+            db.execute("UPDATE jobs SET lease=?,lease_until=? WHERE id=?", (lease, now + 300, row["id"]))
+            return dict(row) | {"lease": lease}
+
+    async def call(self, job, kind, operation):
+        started = time.monotonic()
+        result = await super().call(job, kind, operation)
+        if operation == "check_stock":
+            data = json.loads(job["data"])
+            data["stock_unconfirmed_checks"] = (
+                data.get("stock_unconfirmed_checks", 0) + 1 if result.get("stock") is None else 0
+            )
+            self.move(job, job["phase"], "库存回查结果已保存", data=data)
+        if result.get("issue_codes"):
+            data = json.loads(job["data"])
+            data["platform_issue_codes"] = result["issue_codes"]
+            self.move(job, job["phase"], "平台审核：" + ", ".join(result["issue_codes"]), data=data)
+        with self.db.connect() as db:
+            self.db.event(
+                db,
+                job["owner"],
+                "timing",
+                json.dumps({"operation": operation, "seconds": round(time.monotonic() - started, 3)}),
+                job["id"],
+            )
+        return result
+
+    def move(self, job, phase, note="", data=None, delay=0, plan=None, store=None):
+        saved = data if data is not None else json.loads(job["data"])
+        missing = saved.get("stock_unconfirmed_checks", 0)
+        if phase == "checking" and missing:
+            delay = max(delay, min(300, 15 * (2 ** min(missing, 5))))
+            note = "目标仓库存尚未确认，延迟回查；不重复补库存"
+        return super().move(job, phase, note, data, delay, plan, store)
+
+    async def run(self):
+        lock = (self.db.directory / "worker.lock").open("w")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        async def process(lane):
+            self.lane.set(lane)
+            while True:
+                if not await self.step():
+                    await asyncio.sleep(0.5)
+
+        async def refill():
+            while True:
+                try:
+                    await self.replenish()
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+
+        async def heartbeat():
+            while True:
+                self.db.health("worker")
+                await asyncio.sleep(5)
+
+        tasks = [
+            asyncio.create_task(process("screening")),
+            asyncio.create_task(process("fulfillment")),
+            asyncio.create_task(refill()),
+            asyncio.create_task(heartbeat()),
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            lock.close()
 
     def context(self, job):
         context = super().context(job)

@@ -101,3 +101,87 @@ async def test_model_reused_across_products_and_decimal_serializable(monkeypatch
         assert result["search_and_rank"]["candidates"][0]["candidate"]["price_cny"] == "1.25"
         json.dumps(result)
     assert len(created) == 1
+
+
+async def test_shop_cache_reuses_reads_but_write_prechecks_are_fresh(tmp_path, monkeypatch):
+    from flowhub.continuous import CachedTargetAdapter, MaoziZeroStockAdapter
+
+    lookup = AsyncMock(side_effect=["first", "fresh", "other-owner"])
+    monkeypatch.setattr(MaoziZeroStockAdapter, "target", lookup)
+    cache = {}
+    adapter = CachedTargetAdapter(None, cache, "owner-a")
+    assert await adapter.target("shop") == "first"
+    assert await adapter.target("shop") == "first"
+    assert await adapter.target("shop", fresh=True) == "fresh"
+    other = CachedTargetAdapter(None, cache, "owner-b")
+    assert await other.target("shop") == "other-owner"
+    assert lookup.await_count == 3
+
+
+def test_claim_lanes_do_not_block_or_double_claim(tmp_path):
+    import time
+
+    db = Database(tmp_path)
+    with db.connect() as c:
+        c.execute(
+            "insert into users(id,username,password,role,active,created) values(?,?,?,?,?,?)",
+            ("test", "test", "unused", "admin", 1, time.time()),
+        )
+        c.execute(
+            "insert into workflows(owner,enabled,rules,modules,secrets,updated) values(?,?,?,?,?,?)",
+            ("test", 1, "{}", "{}", db.seal({}), time.time()),
+        )
+        for name, phase in [("screen", "queued"), ("publish", "reconciling")]:
+            c.execute(
+                "insert into jobs(id,owner,source_key,phase,data,modules,next_at,created,updated) values(?,?,?,?,?,?,?,?,?)",
+                (name, "test", name, phase, "{}", "{}", 0, time.time(), time.time()),
+            )
+    worker = ContinuousWorker(db)
+    worker.lane.set("fulfillment")
+    assert worker.claim()["id"] == "publish"
+    worker.lane.set("screening")
+    assert worker.claim()["id"] == "screen"
+    assert worker.claim() is None
+    worker.lane.set("fulfillment")
+    assert worker.claim() is None
+
+
+async def test_slow_screening_does_not_block_fulfillment(tmp_path):
+    import asyncio
+
+    worker = ContinuousWorker(Database(tmp_path))
+    fulfilled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def step():
+        if worker.lane.get() == "screening":
+            await release.wait()
+        else:
+            fulfilled.set()
+        return False
+
+    worker.step = step
+    worker.replenish = AsyncMock()
+    running = asyncio.create_task(worker.run())
+    try:
+        await asyncio.wait_for(fulfilled.wait(), 1)
+        assert not release.is_set()
+    finally:
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+
+
+def test_missing_stock_backs_off_without_replaying_write(tmp_path, monkeypatch):
+    from flowhub.worker import Worker
+
+    worker = ContinuousWorker(Database(tmp_path))
+    moves = []
+    monkeypatch.setattr(Worker, "move", lambda self, *args: moves.append(args))
+    job = {"data": json.dumps({"stock_unconfirmed_checks": 5})}
+    worker.move(job, "checking", delay=15)
+    assert moves[0][1] == "checking"
+    assert moves[0][4] == 300
+    worker.move(job, "selling")
+    assert moves[1][1] == "selling"
+    assert moves[1][4] == 0
