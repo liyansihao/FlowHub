@@ -22,6 +22,8 @@ let me = null,
   filter = "",
   search = "",
   production = null,
+  sourceMode = "account",
+  selectionDrafts = new Map(),
   rendering = false;
 const phase = {
   archived: "已归档",
@@ -49,7 +51,7 @@ const kinds = {
 
 const navGroups = [
   ["上架工作", ["overview", "运行概览"], ["jobs", "上架商品"]],
-  ["自动化", ["calculator", "利润计算器"], ["workflow", "工作流配置"], ["modules", "模块中心"]],
+  ["自动化", ["sources", "商品来源与筛选"], ["calculator", "利润计算器"], ["workflow", "工作流配置"], ["modules", "模块中心"]],
   ["店铺资产", ["stores", "店铺连接"], ["blocks", "禁止上架清单"]],
 ];
 const paths = {
@@ -126,7 +128,7 @@ async function api(path, method = "GET", body, scoped = true) {
 }
 function login(change = false) {
   $("#root").innerHTML =
-    `<div class="login"><section class="login-art"><div class="brand"><span class="mark">f</span>FlowHub</div><div class="orbit"></div><h1>从候选商品<br>到确认可售。</h1><p>模块可替换 · 工作区独立 · 任务可恢复</p></section><section class="login-form"><form class="login-inner" id="login"><h2>${change ? "设置你的新密码" : "登录工作台"}</h2><p class="muted">${change ? "首次登录需要更改初始密码。" : "使用管理员分配的账号登录。"}</p><label>${change ? "当前临时密码" : "账号"}</label><input id="username" ${change ? 'type="password"' : 'autocomplete="username"'} required><label>${change ? "新密码 · 至少 12 位" : "密码"}</label><input id="password" type="password" autocomplete="${change ? "new-password" : "current-password"}" required ${change ? 'minlength="12"' : ""}><button class="primary">${change ? "保存并重新登录" : "登录"}</button><p class="footnote">FlowHub Local / 0.1<br>店铺凭据仅保存在服务端，不向其他用户公开。</p></form></section></div>`;
+    `<div class="login"><section class="login-art"><div class="brand"><span class="mark">f</span>FlowHub</div><div class="orbit"></div><h1>从候选商品<br>到确认可售。</h1><p>模块可替换 · 工作区独立 · 任务可恢复</p></section><section class="login-form"><form class="login-inner" id="login"><h2>${change ? "设置你的新密码" : "登录工作台"}</h2><p class="muted">${change ? "首次登录需要更改初始密码。" : "使用管理员分配的账号登录。"}</p><label>${change ? "当前临时密码" : "账号"}</label><input id="username" ${change ? 'type="password"' : 'autocomplete="username"'} required><label>${change ? "新密码 · 至少 12 位" : "密码"}</label><input id="password" type="password" autocomplete="${change ? "new-password" : "current-password"}" required ${change ? 'minlength="12"' : ""}><button class="primary">${change ? "保存并重新登录" : "登录"}</button><p class="footnote">FlowHub / 0.3<br>店铺凭据仅保存在服务端，不向其他用户公开。</p></form></section></div>`;
   $("#login").onsubmit = async (e) => {
     e.preventDefault();
     try {
@@ -183,9 +185,8 @@ async function shell() {
       (b.onclick = async () => {
         page = b.dataset.page;
         filter = "";
-        search = "",
-  production = null,
-  rendering = false;
+        search = "";
+        production = null;
         await render();
         window.scrollTo(0, 0);
       }),
@@ -194,14 +195,16 @@ async function shell() {
     await api("/logout", "POST");
     me = null;
     owner = "";
+    sourceMode = "account";
+    selectionDrafts.clear();
     login();
   };
   if ($("#owner"))
     $("#owner").onchange = (e) => {
       owner = e.target.value;
-      search = "",
-  production = null,
-  rendering = false;
+      search = "";
+      sourceMode = "account";
+      production = null;
       render();
     };
   await render();
@@ -379,7 +382,7 @@ async function renderProfitCalculator(container) {
 }
 
 async function render() {
-  if (rendering) return;
+  if (rendering || (page === "sources" && document.activeElement?.closest("#source-library-form"))) return;
   rendering = true;
   const focusedSearch = document.activeElement?.id === "jobsearch";
   const caret = focusedSearch ? [document.activeElement.selectionStart, document.activeElement.selectionEnd] : null;
@@ -394,22 +397,30 @@ async function render() {
       api("/overview"),
     ]);
     const c = $("#content");
+    c.classList.toggle("source-library-view", page === "sources");
     const activeNav = document.querySelector("[data-page].active");
     if ($("#currentpage") && activeNav)
       $("#currentpage").textContent = activeNav.textContent;
-    if (page === "overview" || page === "jobs") {
+    if (page === "sources") {
+      await renderSourceLibrary(c);
+    } else if (page === "overview" || page === "jobs") {
       jobs = (
         await api(
           "/jobs" + (filter ? "?phase=" + encodeURIComponent(filter) : ""),
         )
       ).sort((a, b) => b.updated - a.updated);
       production = me.role === "admin" ? await api("/production" + (filter ? "?phase=" + encodeURIComponent(filter) : "")) : null;
+      const hasProduction = production?.available;
+      if (sourceMode !== "production") production = null;
       if (production?.available) {
         jobs = production.jobs;
         overview = production.overview;
         wf = {...wf, enabled: production.active, rules: {...wf.rules, live: true, stock: 99, logistics: "ChinaPost"},
-          notice: `数据来源：本地正式上架流程 · 当前店铺 ${production.shop_name} · 每 10 秒刷新 · 最近读取 ${new Date(production.fetched_at * 1000).toLocaleTimeString()}。此处展示已进入正式上架的任务。`};
+          notice: `${production.notice ? production.notice + " " : ""}数据来源：本地正式上架流程 · 当前店铺 ${production.shop_name} · 每 10 秒刷新 · 最近读取 ${new Date(production.fetched_at * 1000).toLocaleTimeString()}。此处展示已进入正式上架的任务。`};
       }
+      const selectionKey = `${owner || me.id}:${wf.rules.live}`;
+      const eligibleStores = stores.filter(s => s.enabled && s.verified && (wf.rules.live ? s.kind !== "demo" : s.kind === "demo"));
+      const selectedIds = wf.enabled ? (wf.selected_store_ids || eligibleStores.map(s => s.id)) : (selectionDrafts.get(selectionKey) || wf.selected_store_ids || eligibleStores.map(s => s.id));
       const processing = Object.entries(overview.phases)
         .filter(([k]) => !["selling", "rejected", "attention", "archived", "offline"].includes(k))
         .reduce((s, [, v]) => s + v, 0);
@@ -417,8 +428,9 @@ async function render() {
         head(
           page === "overview" ? "运行概览" : "上架商品",
           `${wf.rules.live ? "真实上架" : "模拟验收"} · ${wf.rules.logistics === "ChinaPost" ? "邮政物流" : esc(wf.rules.logistics)} · 目标库存 ${wf.rules.stock}`,
-          `<button id="refresh">刷新数据</button><button ${production?.available ? "disabled title=正式流程由本地发布服务管理" : ""} class="${wf.enabled ? "" : "primary"}" id="toggle">${production?.available ? "正式流程监控" : wf.enabled ? "暂停新增" : "启动工作流"}</button>`,
+          `${hasProduction ? `<select id="sourceview" aria-label="进度来源"><option value="account" ${sourceMode === "account" ? "selected" : ""}>本账号上架任务</option><option value="production" ${sourceMode === "production" ? "selected" : ""}>已有正式流程记录</option></select>` : ""}<button id="refresh">刷新数据</button>${production?.available ? "" : `<button class="${wf.enabled ? "" : "primary"}" id="toggle">${wf.enabled ? "暂停新增" : "启动上架"}</button>`}`,
         ) +
+        (!production?.available ? `<section class="panel store-selection"><div class="panel-title"><h2>上架店铺</h2><span class="muted tiny">${wf.enabled ? "运行中 · 暂停新增后可更改店铺" : "勾选店铺后启动 · 同账号共享任务与店铺"}</span></div><div class="store-options">${eligibleStores.map(s => `<label class="store-option"><input type="checkbox" data-target-store="${esc(s.id)}" ${selectedIds.includes(s.id) ? "checked" : ""} ${wf.enabled ? "disabled" : ""}><span><strong>${esc(s.name)}</strong><small>${s.kind === "demo" ? "模拟店铺" : esc(s.config.shop_id)}</small></span></label>`).join("") || '<p class="muted">尚无可用店铺，请先在「店铺连接」中添加并核验与当前模式对应的店铺。</p>'}</div><p class="muted tiny">只向勾选店铺分配新任务；已提交商品继续在原店回查。换电脑登录同一账号后可查看相同店铺和运行进度。</p></section>` : "") +
         (page === "overview"
           ? `<div class="metrics">${[
               [
@@ -447,7 +459,7 @@ async function render() {
               )
               .join(
                 "",
-              )}</div><section class="flow-panel"><div class="flow-heading"><div><span class="dot ${overview.worker_alive ? "" : "off"}"></span><strong>自动上架流程</strong><span class="badge ${wf.enabled ? "success" : "gray"}">${wf.enabled ? "正在运行" : "新增已暂停"}</span></div><small class="muted">${overview.heartbeat ? "心跳 " + new Date(overview.heartbeat * 1000).toLocaleTimeString() : ""}</small></div><div class="flow-stages">${[
+              )}</div><section class="flow-panel"><div class="flow-heading"><div><span class="dot ${overview.worker_alive ? "" : "off"}"></span><strong>自动上架流程</strong><span class="badge ${wf.enabled && !production?.waiting ? "success" : "gray"}">${production?.available ? esc(production.status_label) : wf.enabled ? "正在运行" : "新增已暂停"}</span></div><small class="muted">${overview.heartbeat ? "心跳 " + new Date(overview.heartbeat * 1000).toLocaleTimeString() : ""}</small></div><div class="flow-stages">${[
               ["candidates", "候选商品", overview.phases.queued || 0],
               ["matcher", "同款识别", overview.phases.matched || 0],
               ["profit", "利润审核", overview.phases.qualified || 0],
@@ -495,12 +507,21 @@ async function render() {
       };
       if (focusedSearch) { $("#jobsearch").focus(); $("#jobsearch").setSelectionRange(...caret); }
       $("#refresh").onclick = render;
-      $("#toggle").onclick = async () => {
+      if ($("#sourceview")) $("#sourceview").onchange = (e) => { sourceMode = e.target.value; filter = ""; render(); };
+      document.querySelectorAll("[data-target-store]").forEach(input => input.onchange = () => {
+        selectionDrafts.set(selectionKey, [...document.querySelectorAll("[data-target-store]:checked")].map(el => el.dataset.targetStore));
+      });
+      if ($("#toggle")) $("#toggle").onclick = async () => {
         try {
-          await api("/workflow/" + (wf.enabled ? "pause" : "start"), "POST");
+          const ids = [...document.querySelectorAll("[data-target-store]:checked")].map(el => el.dataset.targetStore);
+          if (!wf.enabled && !ids.length) { toast("请至少勾选一家上架店铺"); return; }
+          $("#toggle").disabled = true;
+          await api("/workflow/" + (wf.enabled ? "pause" : "start"), "POST", wf.enabled ? undefined : {store_ids: ids});
+          selectionDrafts.delete(selectionKey);
           await render();
         } catch (e) {
           toast(e.message);
+          if ($("#toggle")) $("#toggle").disabled = false;
         }
       };
       document.querySelectorAll("[data-filter]").forEach(
@@ -512,7 +533,7 @@ async function render() {
       );
     } else if (page === "stores") {
       c.innerHTML =
-        head("店铺连接", "各店铺使用自己的账号与仓库；额度不足时按顺序切换。") +
+        head("店铺连接", "店铺绑定在当前 FlowHub 账号下；其他电脑登录同一服务和账号后自动显示。") +
         `<div class="grid2"><div class="panel"><div class="panel-title"><h2>已连接店铺</h2></div><table><thead><tr><th>顺序 / 店铺</th><th>连接</th><th>操作</th></tr></thead><tbody>${stores.map((s) => `<tr><td>${s.position + 1} · ${esc(s.name)}<br><small class="muted">${s.kind === "demo" ? "模拟店铺" : esc(s.config.shop_id)}</small></td><td>${s.verified ? "已核验" : "待核验"}<br><small class="muted">${overview.quotas.find((q) => q.store_id === s.id) ? "余 " + overview.quotas.find((q) => q.store_id === s.id).remaining + " 个额度" : ""}</small></td><td><button class="linkbutton" data-verify="${s.id}">核验</button><button class="linkbutton" data-enable="${s.id}">${s.enabled ? "停用" : "启用"}</button></td></tr>`).join("") || '<tr><td colspan="3" class="empty">还没有连接店铺</td></tr>'}</tbody></table></div><form id="storeform" class="formarea"><h2>连接新店铺</h2><label>店铺名称</label><input name="name" placeholder="例如：我的一号店" required><div class="row2"><div><label>连接方式</label><select name="kind"><option value="demo">模拟店铺</option><option value="maozi">毛子 ERP + Ozon</option><option value="ozon">Ozon 官方直连（无需 ERP）</option><option value="http">自定义上架 API</option></select></div><div><label>排序 · 0 为第一家</label><input name="position" type="number" min="0" value="${stores.length}"></div></div>${[
           ["shop_id", "毛子店铺 ID"],
           ["warehouse_id", "目标仓库 ID"],
@@ -742,8 +763,109 @@ setInterval(() => {
   if (
     me &&
     !me.must_change &&
-    ["overview", "jobs"].includes(page) &&
-    !document.querySelector(".drawer-bg")
+    ["overview", "jobs", "sources"].includes(page) &&
+    !document.querySelector(".drawer-bg") &&
+    !document.querySelector("[data-browser-seller]")?.value
   )
     render();
 }, 10000);
+
+
+let sourceLibraryDraft = null;
+let sourceLibraryOwner = null;
+let sourceLibraryCursor = 0;
+let sourceLibraryState = "";
+async function renderSourceLibrary(container) {
+  if(sourceLibraryOwner !== owner){sourceLibraryOwner=owner;sourceLibraryDraft=null;sourceLibraryCursor=0;}
+  const result = await api(`/sources?cursor=${sourceLibraryCursor}${sourceLibraryState ? "&state=" + sourceLibraryState : ""}`);
+  const status = result.status;
+  const storefrontTasks = await api("/sources/storefront");
+  sourceLibraryDraft ||= {...status.filters};
+  const labels = {qualified:"初筛通过", needs_review:"资料待补", rejected:"条件不符"};
+  const fieldLabels = {sku:"SKU",seller_id:"来源店铺",title:"标题",image:"图片",category_id:"类目",price_min:"最低统计均价", price_max:"最高统计均价", weight_max_g:"最大重量", sales_min:"最低榜单销量", category:"类目", pure_fbs:"配送模式", follow_allowed:"可跟卖状态",same_seller:"种子同店来源证据", freshness:"数据新鲜度"};
+  const stamp = value => value ? new Date(value*1000).toLocaleString() : "尚未核查";
+  container.innerHTML = `<div class="page-head"><div><h1>商品来源与筛选</h1><p class="muted">历史未归档商品作为种子，有本店成交证据的优先；入库与选品独立运行。</p></div><span class="badge">${status.enabled ? "采集已启用" : "采集已暂停"}</span></div>
+  <div class="panel" style="padding:20px;margin-bottom:20px"><strong>已积累 ${status.products} 个商品 · ${status.seeds} 个历史绑定 · ${status.current_seeds ?? 0} 个当前可用种子 · ${status.tasks} 个采集任务</strong><p class="muted tiny">支持毛子 ERP 榜单与 Safari / Chrome 店铺分页导入。店铺读取使用独立的暂停和续跑控制，页面商品需补齐 ERP 资料后才能通过筛选。统计均价为 RUB，不能直接用于最终利润计算。</p>
+  <form id="source-library-form"><div class="form-grid">${[["price_min","最低统计均价 / RUB"],["price_max","最高统计均价 / RUB"],["weight_max_g","最大重量 / g"],["sales_min","最低 28 天榜单销量"],["max_age_hours","数据最长保存有效期 / 小时"]].map(([key,label])=>`<label>${label}<input type="number" min="0" step="any" name="${key}" value="${esc(sourceLibraryDraft[key] ?? (key==='max_age_hours'?168:''))}"></label>`).join("")}<label>类目 ID（逗号分隔）<input name="categories" value="${esc((sourceLibraryDraft.categories||[]).join(','))}"></label><label>商品来源 ERP 密钥<input type="password" name="erp_token" autocomplete="new-password" placeholder="留空保留原连接"></label></div><label class="checkline"><input type="checkbox" name="pure_fbs" ${sourceLibraryDraft.pure_fbs!==false?'checked':''}>仅纯 FBS</label><label class="checkline"><input type="checkbox" name="require_follow_allowed" ${sourceLibraryDraft.require_follow_allowed?'checked':''}>仅保留明确可跟卖的商品</label><label class="checkline"><input type="checkbox" name="same_seller_only" ${sourceLibraryDraft.same_seller_only?'checked':''}>只看种子同店扩品</label><div class="actions"><button class="primary" type="submit">保存筛选条件</button><button type="button" id="source-library-toggle">${status.enabled?'暂停采集':'启用采集'}</button>${me.role==='admin'?'<button type="button" id="source-library-import">导入本地历史上架记录</button>':''}<button type="button" id="source-library-export">导出本页初筛候选</button></div></form><p id="source-library-notice" class="muted tiny">缺失数据保留为空，资料不足不会默认合格。</p></div>
+  <div class="actions"><select id="source-library-state"><option value="">全部判断</option>${Object.entries(labels).map(([key,label])=>`<option value="${key}" ${sourceLibraryState===key?'selected':''}>${label}</option>`).join('')}</select><button id="source-library-first">回到第一页</button><button id="source-library-next" ${!result.has_more?'disabled':''}>下一页</button></div>
+  <div class="table-wrap"><table><thead><tr><th>商品 / 来源</th><th>统计均价 / RUB</th><th>重量 / g</th><th>28 天榜单销量</th><th>判断与缺失</th><th>采集 / 实时核查</th></tr></thead><tbody>${result.items.map((p,i)=>`<tr><td><strong>${esc(p.title)}</strong><div class="muted tiny">SKU ${esc(p.sku)} · 来源店铺 ${esc(p.seller_id||'未知')} · 类目 ${esc(p.category_id||'未知')}</div></td><td>${esc(p.average_price_rub??'未知')}</td><td>${esc(p.weight_g??'未知')}</td><td>${esc(p.sold_count_28d??'未知')}</td><td>${labels[p.assessment.state]}<div class="muted tiny">${p.assessment.missing.concat(p.assessment.failed).map(x=>fieldLabels[x]||esc(x)).join('、')}</div>${p.listing_review?`<div class="muted tiny">上架核查：${esc(p.listing_review.label)} · ${stamp(p.listing_review.observed_at)}</div>`:''}</td><td><small>${stamp(p.collected_at)}<br>${stamp(p.verified_at)}</small><br><button data-source-check="${i}">实时核查</button><button data-source-proof="${i}">查看证据</button>${p.assessment.state==='qualified'?`<button data-source-handoff="${i}">送入主软件待核查</button>`:''}</td></tr>`).join('')||'<tr><td colspan="6"><div class="empty">暂无商品。导入历史种子并启用采集后，这里会持续积累候选。</div></td></tr>'}</tbody></table></div>`;
+  const browserPanel = document.createElement('div');
+  browserPanel.className='panel';
+  browserPanel.style='padding:20px;margin-bottom:20px';
+  browserPanel.innerHTML=`<strong>店铺分页采集 · Safari / Chrome</strong><p class="muted tiny">打开当前分页地址，在 Safari 中保存“页面源码”，或在 Chrome 中保存“网页，仅 HTML”后导入。每次只提交一页，暂停和重启保留下一页地址。尚未读到明确末页的任务不会显示完成。</p>
+    <div class="actions"><button data-browser-prepare>从来源种子建立任务</button>
+    <select data-browser-seller><option value="">选择来源店铺（${storefrontTasks.length} 个）</option>${storefrontTasks.map(t=>`<option value="${esc(t.seller)}">${esc(t.seller)} · 第 ${t.page} 页 · ${esc(t.state)}</option>`).join('')}</select>
+    <button data-browser-action="resume">继续</button><button data-browser-action="pause">暂停</button><button data-browser-action="retry">重试失败页</button>
+    <input data-browser-file type="file" accept=".html,text/html"><button data-browser-import>导入当前页</button></div>
+    <p data-browser-status class="muted tiny"></p><a data-browser-url target="_blank" rel="noopener noreferrer" hidden>打开当前分页地址</a>`;
+  container.querySelector('.table-wrap').before(browserPanel);
+  const browserSelect=browserPanel.querySelector('[data-browser-seller]');
+  const browserNotice=browserPanel.querySelector('[data-browser-status]');
+  const browserTask=()=>storefrontTasks.find(t=>t.seller===browserSelect.value);
+  browserSelect.onchange=()=>{
+    const t=browserTask();browserNotice.textContent=t?`第 ${t.page} 页 · ${t.state}${t.error?' · 上次失败：'+t.error:''}`:'请选择来源店铺';
+    const a=browserPanel.querySelector('[data-browser-url]');a.hidden=!t?.next_url;if(t?.next_url)a.href=t.next_url;
+  };
+  const browserRun=async fn=>{try{await fn();}catch(e){browserNotice.textContent=e.message;}};
+  browserPanel.querySelector('[data-browser-prepare]').onclick=()=>browserRun(async()=>{await api('/sources/storefront/prepare','POST',{});await render();});
+  browserPanel.querySelectorAll('[data-browser-action]').forEach(b=>b.onclick=()=>browserRun(async()=>{
+    const t=browserTask();if(!t)throw Error('请选择来源店铺');
+    Object.assign(t,await api('/sources/storefront/'+t.seller+'/'+b.dataset.browserAction,'POST',{}));browserSelect.onchange();
+  }));
+  browserPanel.querySelector('[data-browser-import]').onclick=()=>browserRun(async()=>{
+    const t=browserTask(),file=browserPanel.querySelector('[data-browser-file]').files[0];
+    if(!t||!file)throw Error('请选择店铺和该页 HTML 文件');
+    if(file.size>6000000)throw Error('页面文件超过 6 MB');
+    const r=await api('/sources/storefront/'+t.seller+'/import','POST',{html:await file.text(),requested_url:t.next_url});
+    browserNotice.textContent=r.state==='failed'?'导入失败，保留原分页：'+r.reason:`已处理，新增 ${r.added} 个商品；重复页面不会重复入库。`;
+    Object.assign(t,(await api('/sources/storefront')).find(x=>x.seller===t.seller));
+    const a=browserPanel.querySelector('[data-browser-url]');a.hidden=!t.next_url;if(t.next_url)a.href=t.next_url;
+  });
+  const form = container.querySelector('#source-library-form');
+  const read = () => {
+    const draft = {};
+    for (const key of ['price_min','price_max','weight_max_g','sales_min','max_age_hours'])
+      if (form.elements[key].value !== '') draft[key] = Number(form.elements[key].value);
+    draft.categories = form.elements.categories.value.split(',').map(x=>x.trim()).filter(Boolean);
+    draft.pure_fbs = form.elements.pure_fbs.checked;
+    draft.require_follow_allowed = form.elements.require_follow_allowed.checked;
+    draft.same_seller_only = form.elements.same_seller_only.checked;
+    sourceLibraryDraft = draft;
+    return draft;
+  };
+  form.oninput = read;
+  const save = async enabled => {
+    const payload = {enabled, filters:read()};
+    if (form.elements.erp_token.value) payload.erp_token = form.elements.erp_token.value;
+    await api('/sources/settings','PUT',payload);
+    sourceLibraryCursor=0;
+    document.activeElement?.blur();
+    await render();
+  };
+  const run = async fn => {try {await fn();} catch(e) {container.querySelector('#source-library-notice').textContent=e.message;}};
+  form.onsubmit=e=>{e.preventDefault();run(()=>save(status.enabled));};
+  container.querySelector('#source-library-toggle').onclick=()=>run(()=>save(!status.enabled));
+  const importer=container.querySelector('#source-library-import');
+  if(importer) importer.onclick=()=>run(async()=>{importer.disabled=true;const r=await api('/sources/import-history','POST',{});container.querySelector('#source-library-notice').textContent=`导入 ${r.bindings} 个历史绑定，冲突 ${r.conflicts} 个${r.blocked?'；需要处理：'+r.blocked:''}`;importer.disabled=false;});
+  container.querySelector('#source-library-state').onchange=e=>{sourceLibraryState=e.target.value;sourceLibraryCursor=0;render();};
+  container.querySelector('#source-library-first').onclick=()=>{sourceLibraryCursor=0;render();};
+  container.querySelector('#source-library-next').onclick=()=>{sourceLibraryCursor=result.cursor;render();};
+  container.querySelector('#source-library-export').onclick=()=>run(async()=>{
+    const data=await api('/sources/export?cursor='+sourceLibraryCursor);const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));
+    const a=document.createElement('a');a.href=url;a.download='flowhub-source-candidates.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+  });
+  container.querySelectorAll('[data-source-check]').forEach(button=>button.onclick=()=>run(async()=>{
+    button.disabled=true;const p=result.items[Number(button.dataset.sourceCheck)];
+    const r=await api('/sources/'+encodeURIComponent(p.sku)+'/recheck?seller='+encodeURIComponent(p.seller_id||''),'POST',{});
+    container.querySelector('#source-library-notice').textContent=`已回查 SKU ${p.sku}：配送模式 ${r.sales_schema||'未知'}；当前售价和具体规格仍需补充。`;
+    button.disabled=false;
+  }));
+  container.querySelectorAll('[data-source-handoff]').forEach(button=>button.onclick=()=>run(async()=>{
+    const p=result.items[Number(button.dataset.sourceHandoff)];
+    const r=await api('/sources/'+encodeURIComponent(p.sku)+'/handoff?seller='+encodeURIComponent(p.seller_id||''),'POST',{});
+    container.querySelector('#source-library-notice').textContent=r.created?'已进入主软件的需要处理列表，等待售价、规格和同款核查。':'主软件中已存在此商品，未重复创建。';
+  }));
+  container.querySelectorAll('[data-source-proof]').forEach(button=>button.onclick=()=>{
+    const p=result.items[Number(button.dataset.sourceProof)];const dialog=document.createElement('dialog');const pre=document.createElement('pre');pre.style.cssText='max-width:70vw;max-height:65vh;overflow:auto;white-space:pre-wrap';pre.textContent=JSON.stringify(p,null,2);const close=document.createElement('button');close.textContent='关闭';close.onclick=()=>dialog.close();dialog.append(close,pre);document.body.append(dialog);dialog.onclose=()=>dialog.remove();dialog.showModal();
+  });
+}

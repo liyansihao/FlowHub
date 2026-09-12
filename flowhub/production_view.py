@@ -71,6 +71,30 @@ def snapshot(directory, phase=''):
                          observed_stock=management.get('observed_stock'),
                          updated=max(updated, management.get('updated', 0)), created=updated))
     active = bool(status.get('active') and time.time() - heartbeat < 90)
+    quotas = []
+    for shop, row in status.get('store_quotas', {}).items():
+        available = row.get('available') is True
+        quotas.append(dict(store_id=shop, store_name=names.get(shop, shop),
+                           available=available, remaining=row.get('remaining', 0),
+                           limit=row.get('limit'), usage=row.get('usage'),
+                           reset_at=row.get('reset_at'),
+                           reason='' if available else ('缺少店铺 API 凭据' if row.get('error') == 'FileNotFoundError' else '店铺连接核验失败')))
+    waiting = active and status.get('admission_state') == 'waiting_for_store_capacity'
+    label = '等待店铺额度或连接' if waiting else '正在运行' if active else '流程未运行或心跳过期'
+    notice = ''
+    if waiting:
+        exhausted = [q for q in quotas if q['available'] and q['remaining'] == 0]
+        unavailable = [q for q in quotas if not q['available']]
+        details = [f"{q['store_name']} 今日创建额度 {q['usage']}/{q['limit']}" for q in exhausted]
+        if unavailable:
+            missing = sum(q['reason'] == '缺少店铺 API 凭据' for q in unavailable)
+            details.append(f"{len(unavailable)} 家店铺连接不可用（其中 {missing} 家缺少 API 凭据）")
+        resets = [q['reset_at'] for q in exhausted if q['reset_at'] and q['reset_at'] > time.time()]
+        if resets:
+            notice = '；'.join(details) + '。额度恢复后自动重试，已提交任务继续回查。'
+        else:
+            notice = '；'.join(details) + '。正在定期重试，已提交任务继续回查。'
     return dict(available=True, jobs=jobs, active=active, shop_id=status.get('shop_id'), shop_name=names.get(str(status.get('shop_id')), str(status.get('shop_id'))),
+                status_label=label, notice=notice, waiting=waiting,
                 fetched_at=time.time(), overview=dict(phases=dict(counts), last_hour=recent,
-                worker_alive=active, heartbeat=heartbeat, quotas=[], uptime=0))
+                worker_alive=active, heartbeat=heartbeat, quotas=quotas, uptime=0))

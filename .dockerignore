@@ -1,0 +1,13 @@
+*
+!pyproject.toml
+!requirements.lock.txt
+!flowhub/
+!flowhub/**
+!flowhub_plugins/
+!flowhub_plugins/**
+!plugins/
+!plugins/**
+!web/
+!web/**
+**/__pycache__/
+**/*.pyc

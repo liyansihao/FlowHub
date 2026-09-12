@@ -76,6 +76,12 @@ class ModuleHost:
         self.db = db
 
     async def invoke(self, module, operation, context, secret=""):
+        if module["driver"] == "source-library":
+            from .source_library import candidate_page
+
+            if operation != "candidates":
+                raise ModuleError("source library only supplies candidates")
+            return candidate_page(self.db, context)
         if module["driver"] == "comparebot":
             from .comparebot import invoke
 

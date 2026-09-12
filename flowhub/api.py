@@ -70,6 +70,10 @@ def create_app(database=None):
             raise HTTPException(403, "需要管理员权限")
         return user
 
+    from .source_api import register_source_api
+
+    register_source_api(app, db, scope, admin)
+
     class Login(BaseModel):
         username: str = Field(min_length=1, max_length=60)
         password: str = Field(min_length=1, max_length=200)
@@ -349,6 +353,7 @@ def create_app(database=None):
             r = dict(c.execute("SELECT * FROM workflows WHERE owner=?", (owner,)).fetchone())
         r["rules"] = json.loads(r["rules"])
         r["modules"] = json.loads(r["modules"])
+        r["selected_store_ids"] = json.loads(r["selected_store_ids"]) if r["selected_store_ids"] is not None else None
         r["configured_credentials"] = list(db.open(r.pop("secrets")))
         return r
 
@@ -376,14 +381,36 @@ def create_app(database=None):
             )
         return {"ok": True}
 
+    class StartSelection(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        store_ids: list[str] = Field(max_length=100)
+
     @app.post("/api/workflow/{action}")
-    def workflow_action(action: str, owner=Depends(scope)):
+    def workflow_action(action: str, p: StartSelection | None = None, owner=Depends(scope)):
         if action not in ("start", "pause"):
             raise HTTPException(404)
         with db.connect() as c:
+            c.execute("BEGIN IMMEDIATE")
             w = c.execute("SELECT * FROM workflows WHERE owner=?", (owner,)).fetchone()
             rules = json.loads(w["rules"])
             if action == "start":
+                saved = json.loads(w["selected_store_ids"]) if w["selected_store_ids"] is not None else None
+                selected = list(dict.fromkeys(p.store_ids)) if p is not None else saved
+                eligible = {r[0] for r in c.execute(
+                    "SELECT id FROM stores WHERE owner=? AND enabled=1 AND verified=1 AND ((?=0 AND kind='demo') OR (?=1 AND kind!='demo'))",
+                    (owner, bool(rules["live"]), bool(rules["live"])),
+                )}
+                if selected is None:
+                    selected = sorted(eligible)
+                if not selected or not set(selected) <= eligible:
+                    raise HTTPException(400, "请勾选本账号已启用、已核验且符合当前模式的店铺")
+                if w["enabled"] and saved is not None and set(selected) != set(saved):
+                    raise HTTPException(409, "请先暂停新增，再更改上架店铺")
+                if not w["enabled"] and saved != selected and c.execute(
+                    "SELECT 1 FROM jobs WHERE owner=? AND phase IN ('qualified','ready','prepared') AND lease_until>?",
+                    (owner, time.time()),
+                ).fetchone():
+                    raise HTTPException(409, "正在完成上一项操作，请稍后再更改店铺")
                 mods = [
                     dict(c.execute("SELECT * FROM modules WHERE id=? AND enabled=1", (mid,)).fetchone() or {})
                     for mid in json.loads(w["modules"]).values()
@@ -392,6 +419,17 @@ def create_app(database=None):
                     raise HTTPException(400, "模块配置不完整")
                 if rules["live"] and any(m["driver"] == "demo" for m in mods):
                     raise HTTPException(400, "真实模式不能使用模拟模块")
+                publisher = next((m for m in mods if m["kind"] == "publisher"), {})
+                compatible = {"maozi": {"maozi"}, "ozon-direct": {"maozi", "ozon"}, "demo": {"demo"}}.get(publisher.get("driver"))
+                if compatible is not None:
+                    selected_kinds = {r["id"]: r["kind"] for r in c.execute("SELECT id,kind FROM stores WHERE owner=?", (owner,))}
+                    if any(selected_kinds[sid] not in compatible for sid in selected):
+                        raise HTTPException(400, "勾选店铺的连接方式与当前上架模块不匹配")
+                if not w["enabled"] and rules.get("max_publications"):
+                    assigned = c.execute("SELECT COUNT(*) FROM jobs WHERE owner=? AND store_id IS NOT NULL", (owner,)).fetchone()[0]
+                    unsubmitted = c.execute("SELECT 1 FROM jobs WHERE owner=? AND store_id IS NOT NULL AND phase IN ('ready','prepared')", (owner,)).fetchone()
+                    if assigned >= rules["max_publications"] and not unsubmitted:
+                        raise HTTPException(409, "累计提交上限已达到，请在工作流配置中调整上限后启动")
                 kind = "demo" if not rules["live"] else "real"
                 available = c.execute(
                     "SELECT 1 FROM stores WHERE owner=? AND enabled=1 AND verified=1 AND ((?='demo' AND kind='demo') OR (?='real' AND kind!='demo'))",
@@ -399,6 +437,7 @@ def create_app(database=None):
                 ).fetchone()
                 if not available:
                     raise HTTPException(400, "请先添加并核验相应模式的店铺")
+                c.execute("UPDATE workflows SET selected_store_ids=? WHERE owner=?", (json.dumps(selected), owner))
             c.execute(
                 "UPDATE workflows SET enabled=?,notice=?,updated=? WHERE owner=?",
                 (

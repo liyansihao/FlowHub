@@ -1,0 +1,59 @@
+name: flowhub-shared
+services:
+  web:
+    build:
+      context: ..
+    image: flowhub-shared:0.3.0
+    restart: unless-stopped
+    init: true
+    environment:
+      FLOWHUB_HTTPS: "1"
+      FLOWHUB_DATA: /app/data
+    volumes:
+      - ${FLOWHUB_DATA_DIR:?Set the absolute migrated data directory}:/app/data
+    expose: ["8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5)"]
+      interval: 20s
+      timeout: 8s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+  proxy:
+    image: caddy:2
+    restart: unless-stopped
+    environment:
+      FLOWHUB_DOMAIN: ${FLOWHUB_DOMAIN:?Set the public hostname}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - certificates:/data
+      - proxy_config:/config
+    depends_on:
+      web:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+  worker:
+    image: flowhub-shared:0.3.0
+    profiles: ["execution"]
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 150s
+    command: ["python", "-m", "flowhub.worker"]
+    environment:
+      FLOWHUB_DATA: /app/data
+    volumes:
+      - ${FLOWHUB_DATA_DIR:?Set the absolute migrated data directory}:/app/data
+    depends_on:
+      web:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+volumes:
+  certificates:
+  proxy_config:

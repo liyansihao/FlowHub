@@ -5,3 +5,17 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 *.log
+
+# Local evidence, credentials and browser profiles are never published.
+reports/
+.env
+.env.*
+!.env.example
+*.sqlite3
+*.sqlite3-*
+*.db
+*.har
+*.pem
+*.key
+output/
+playwright-profile/

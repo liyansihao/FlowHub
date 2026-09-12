@@ -88,6 +88,9 @@ class Worker:
             active = db.execute(
                 "SELECT active_store FROM workflows WHERE owner=?", (job["owner"],)
             ).fetchone()[0]
+            selected = db.execute("SELECT selected_store_ids FROM workflows WHERE owner=?", (job["owner"],)).fetchone()[0]
+            if selected is not None:
+                stores = [s for s in stores if s["id"] in json.loads(selected)]
         if active in [s["id"] for s in stores]:
             i = next(i for i, s in enumerate(stores) if s["id"] == active)
             stores = stores[i:] + stores[:i]
@@ -146,6 +149,13 @@ class Worker:
         c = self.context(job)
         phase = job["phase"]
         data = json.loads(job["data"])
+        if phase in ("ready", "prepared"):
+            with self.db.connect() as db:
+                selected = db.execute("SELECT selected_store_ids FROM workflows WHERE owner=?", (job["owner"],)).fetchone()[0]
+                available = db.execute("SELECT 1 FROM stores WHERE id=? AND owner=? AND enabled=1 AND verified=1", (job["store_id"], job["owner"])).fetchone()
+            if not available or (selected is not None and job["store_id"] not in json.loads(selected)):
+                self.move(job, phase, "原绑定店铺未勾选或已停用；重新选择原店后继续", delay=30)
+                return
         if self.blocked(job):
             self.move(
                 job,
@@ -366,7 +376,7 @@ class Worker:
                 continue
             with self.db.connect() as db:
                 pending = db.execute(
-                    "SELECT COUNT(*) FROM jobs WHERE owner=? AND phase NOT IN ('selling','rejected','attention')",
+                    "SELECT COUNT(*) FROM jobs WHERE owner=? AND (phase NOT IN ('selling','rejected','attention') OR (phase='attention' AND json_extract(data,'$.candidate.source_contract')='flowhub-source-candidates-v1'))",
                     (w["owner"],),
                 ).fetchone()[0]
                 if pending >= 30:
@@ -387,18 +397,24 @@ class Worker:
                     r = await self.host.invoke(
                         definitions["candidates"],
                         "candidates",
-                        {"cursor": w["cursor"], "rules": rules},
+                        {"cursor": w["cursor"], "rules": rules} | ({"owner": w["owner"]} if definitions["candidates"]["driver"] == "source-library" else {}),
                         self.db.open(w["secrets"]).get(definitions["candidates"]["id"], ""),
                     )
                 if not isinstance(r["items"], list) or len(r["items"]) > 50:
                     raise ModuleError("candidate page invalid")
-                items = [candidate(p) for p in r["items"]]
-                if any(len(p["dimensions_cm"]) != 3 for p in items):
-                    raise ModuleError("dimensions missing")
+                library_source = definitions["candidates"]["driver"] == "source-library"
+                if library_source:
+                    from .source_library import refresh_delivery
+
+                    items = refresh_delivery(self.db, w["owner"], r["items"])
+                else:
+                    items = [candidate(p) for p in r["items"]]
+                    if any(len(p["dimensions_cm"]) != 3 for p in items):
+                        raise ModuleError("dimensions missing")
                 capacity = min(30 - pending, (rules["max_items"] - total) if rules.get("max_items") else 30)
                 with self.db.connect() as db:
                     for p in items[:capacity]:
-                        if not p["pure_fbs"]:
+                        if not p["pure_fbs"] and not library_source:
                             continue
                         now = time.time()
                         db.execute(
@@ -407,8 +423,8 @@ class Worker:
                                 "fh-" + secrets.token_hex(12),
                                 w["owner"],
                                 p["source_key"],
-                                "queued",
-                                json.dumps({"candidate": p, "rules": rules}),
+                                "attention" if library_source else "queued",
+                                json.dumps({"candidate": p, "rules": rules} | ({"dossier_missing": p["dossier_missing"]} if library_source else {})),
                                 json.dumps(definitions),
                                 now,
                                 now,
@@ -451,7 +467,25 @@ class Worker:
                     pass
                 await asyncio.sleep(2)
 
-        tasks = [asyncio.create_task(heartbeat()), asyncio.create_task(refill())]
+        async def collect_sources():
+            from .source_acquisition import SourceAcquirer
+            from .source_library import SourceLibrary
+
+            acquirer = SourceAcquirer(SourceLibrary(self.db))
+            while True:
+                with self.db.connect() as c:
+                    settings = [dict(r) for r in c.execute(
+                        "SELECT s.* FROM sourcing_settings s JOIN users u ON u.id=s.owner WHERE s.enabled=1 AND u.active=1"
+                    )]
+                for setting in settings:
+                    try:
+                        await acquirer.cycle(setting["owner"], self.db.open(setting["secret"])["erp_token"])
+                    except Exception:
+                        self.db.health("source-collector-error")
+                await asyncio.sleep(5)
+
+        tasks = [asyncio.create_task(heartbeat()), asyncio.create_task(refill()),
+                 asyncio.create_task(collect_sources())]
         try:
             while True:
                 if not await self.step():
