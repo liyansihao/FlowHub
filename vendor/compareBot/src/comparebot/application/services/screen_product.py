@@ -75,13 +75,14 @@ class ProductScreeningService:
         )
         try:
             review = await self._reviewer.review(request)
-        except Exception:
+        except Exception as error:
+            reason=qwen_failure_reason(error)
             return ProductScreeningResult(
                 ranked,
                 ScreeningDecision(
                     ScreeningOutcome.MANUAL_REVIEW,
                     self._policy.tier(similarity),
-                    "qwen_request_failed",
+                    reason,
                     offer_id,
                 ),
             )
@@ -98,3 +99,15 @@ class ProductScreeningService:
 
 def _images(primary: str, additional: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys((primary, *additional)))
+
+
+def qwen_failure_reason(error):
+    reason="qwen_request_failed"
+    response=getattr(error,"response",None)
+    if response is not None:
+        try:code=(response.json().get("error") or {}).get("code")
+        except Exception:code=None
+        if code=="Arrearage":reason="qwen_billing_blocked"
+        elif response.status_code in (401,403):reason="qwen_authentication_blocked"
+        elif response.status_code==429:reason="qwen_rate_limited"
+    return reason

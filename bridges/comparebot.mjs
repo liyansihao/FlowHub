@@ -37,7 +37,14 @@ async function main(){
  const cfg=await read('flow_b_ef/state/config.json');
  const {blockedImportBrand}=await load('flow_ef_category_fbs/lib/brand-import-conflict.mjs');
  const category=engine.categoryPolicyFor(product);
- if(!category.eligible||category.holdout||engine.prohibitedCategoryMatch(product,rules)||blockedImportBrand(product,cfg.flow_f.blocked_source_brands)||feedbackBlockForProduct(product,feedback).blocked)return {rejected:'protected_product'};
+ const plugin=product.plugin_detail, monthly=plugin?.monthly_sales;
+ const {verifiedPluginSource,verifiedPluginEvaluation}=await load('ozon-runtime/lib/plugin-source-policy.mjs');
+ const explicitPluginSource=verifiedPluginSource(product);
+ const evaluationOnly=verifiedPluginEvaluation(product);
+ // Priority lists select ranking discoveries; explicitly supplied, verified plugin
+ // candidates need not belong to a ranking-priority list. Hard exclusions remain.
+ if(category.holdout||engine.prohibitedCategoryMatch(product,rules)||blockedImportBrand(product,cfg.flow_f.blocked_source_brands)||feedbackBlockForProduct(product,feedback).blocked)return {rejected:'protected_product'};
+ if(!category.eligible&&!explicitPluginSource&&!evaluationOnly)return {rejected:'category_not_prioritized'};
  const {createMaoziClient}=await load('maozi_direct_new_method/lib/portable-support/maozi-client.mjs');
  const client=createMaoziClient({transport});
  stage('exchange_rate');
@@ -66,18 +73,22 @@ async function main(){
  const [commissions,categoryData]=await Promise.all([useLocalProfit?Promise.resolve(null):client.listCategoryCommissions(),client.getCategoryBySku(product.sku)]);
  if(engine.prohibitedLeafCategoryMatch(categoryData))return {rejected:'prohibited_leaf'};
  stage('fbs_verification');
- const fbs=await engine.observePureFbs(transport,product,'flowef-production-decision');
- if(!fbs.verified)return {rejected:'source_unverified'};
+ let fbs=evaluationOnly?{verified:false,source:'deferred_until_publication',raw_mode:monthly?.sales_schema??null}:await engine.observePureFbs(transport,product,'flowef-production-decision');
+ if(!fbs.verified&&(fbs.raw_mode===null||fbs.raw_mode===undefined||fbs.raw_mode==='')&&explicitPluginSource&&Date.now()/1000-monthly.observed_at<900){
+  fbs={...fbs,verified:true,modes:['FBS'],raw_mode:'FBS',source:'plugin-seller-sku-sales',observed_at:new Date(monthly.observed_at*1000).toISOString(),cache_observation:fbs};
+ }
+ if(!fbs.verified&&!evaluationOnly)return {rejected:'source_unverified'};
+ const evaluatedSell=evaluationOnly?Math.round(product.price_evidence.value*(product.price_evidence.currency==='CNY'?1:rubCny)*100)/100:undefined;
  stage('postal_profit');
  let profit;
  if(useLocalProfit){
   const {localProfit}=await load('FlowEF-production/bridges/local-profit.mjs');
-  profit=await localProfit(root,{product,category_data:categoryData,source,rub_cny:rubCny,sell_cny:engine.productSalePriceCny(product,rubCny)});
+  profit=await localProfit(root,{product,category_data:categoryData,source,rub_cny:rubCny,sell_cny:evaluatedSell??engine.productSalePriceCny(product,rubCny)});
   if(profit.rejected==='no_logistics_route')throw Error('No eligible logistics route for ChinaPost');
   if(profit.rejected)throw Error('Local official commission or cost inputs unavailable');
- }else profit=await engine.maoziProfit({client,commissions,rubCny,product,categoryData,purchasePrice:source.selected_cost_cny});
+ }else profit=await engine.maoziProfit({client,commissions,rubCny,product,categoryData,purchasePrice:source.selected_cost_cny,sellPriceCny:evaluatedSell});
  if(profit.input.logistics!=='ChinaPost')throw Error('postal route required');
- return {source,profit,fbs,product,exchange_rate_evidence:exchange,observed_at:new Date().toISOString()};
+ return {source,profit,fbs,product,evaluation_only_verified:evaluationOnly,exchange_rate_evidence:exchange,observed_at:new Date().toISOString()};
 }
 try{const result=await main();stage('finished');if(input.action==='comparebot_evaluate')await fs.appendFile(path.join(root,'FlowEF-production/state/production/request-diagnostics.jsonl'),JSON.stringify({at:new Date().toISOString(),action:input.action,sku:input.product?.sku,ok:true,rejected:result.rejected||null,stage_ms:stageDurations,requests:requestTrace})+'\n',{mode:0o600}).catch(()=>{});process.stdout.write(JSON.stringify({ok:true,result}));}
 catch(error){await fs.appendFile(path.join(root,'FlowEF-production/state/production/request-diagnostics.jsonl'),JSON.stringify({at:new Date().toISOString(),action:input.action,sku:input.product?.sku,diagnostic:error.networkDiagnostic||{stage:diagnosticStage,recent_requests:requestTrace}})+'\n',{mode:0o600}).catch(()=>{});process.stdout.write(JSON.stringify({ok:false,error:{code:error.code||error.name||'Error',message:String(error.message).replace(/Bearer\s+\S+/gi,'Bearer [redacted]').slice(0,700),diagnostic:error.networkDiagnostic||{stage:diagnosticStage,recent_requests:requestTrace},status:error.status,unknown:error.writeOutcomeUnknown===true,retry_after_ms:error.retryAfterMs}}));process.exitCode=1;}

@@ -12,6 +12,15 @@ import threading
 from .db import DATA, ROOT, Database
 
 
+
+def terminate_group(pid, sig):
+    try:
+        os.killpg(pid,sig)
+        return True
+    except (ProcessLookupError,PermissionError):
+        return False
+
+
 def serve():
     Database()
     lock = (DATA / "supervisor.lock").open("w")
@@ -39,6 +48,8 @@ def serve():
     }
     if os.environ.get("FLOWHUB_PORTABLE") == "1":
         commands["discovery"] = [sys.executable, "-m", "flowhub.portable"]
+    if os.environ.get('FLOWHUB_WORKER_ONLY') == '1':
+        commands={k:v for k,v in commands.items() if k=='worker'}
     children = {}
     spawned = {}
     restart_at = {}
@@ -59,10 +70,7 @@ def serve():
                     except Exception:
                         pass
                 if child and child.poll() is not None:
-                    try:
-                        os.killpg(child.pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
+                    terminate_group(child.pid,signal.SIGTERM)
                     children.pop(name)
                     restart_at[name] = time.time() + 5
                 if name not in children and time.time() >= restart_at.get(name, 0):
@@ -80,12 +88,14 @@ def serve():
     finally:
         for child in children.values():
             if child.poll() is None:
-                child.terminate()
+                try:child.terminate()
+                except (ProcessLookupError,PermissionError):pass
         for child in children.values():
             try:
                 child.wait(timeout=45)
             except subprocess.TimeoutExpired:
-                os.killpg(child.pid, signal.SIGKILL)
+                try:os.killpg(child.pid, signal.SIGKILL)
+                except (ProcessLookupError,PermissionError):pass
         log.close()
         lock.close()
 
@@ -117,7 +127,7 @@ def main():
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
-        print(json.dumps({"supervisor_pid": child.pid, "url": "http://127.0.0.1:38427/"}))
+        print(json.dumps({"supervisor_pid": child.pid, "worker_only":os.environ.get("FLOWHUB_WORKER_ONLY")=="1", "url":None if os.environ.get("FLOWHUB_WORKER_ONLY")=="1" else "http://127.0.0.1:38427/"}))
     elif args.action == "stop":
         pid = json.loads((DATA / "supervisor.json").read_text())["pid"]
         command = subprocess.run(

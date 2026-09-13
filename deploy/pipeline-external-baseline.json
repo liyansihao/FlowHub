@@ -1,0 +1,14 @@
+{
+  "description": "2026-09-13 tested external entrypoints; not a complete vendored dependency lock",
+  "files": {
+    "ozon-runtime/lib/maozi-transport.mjs": "0621324f0bb26d36120c263df97dc040bfbe2480b9d13fb8ba5937ab6ddd0bea",
+    "ozon-runtime/lib/maozi-credentials.mjs": "5ea97a9557503bb0a16493f2422a3a03377d1a6d6c7b01efaa9e4e5b36b447e6",
+    "ozon-runtime/lib/plugin-source-policy.mjs": "8a5abac160d15ec8d295a5511b16b953c2f7f22aeb9c9a931a93925b84e1527a",
+    "maozi_direct_new_method/maozi_new_method_direct.mjs": "b5e35470d2d7f27ffb59f2ee9ab37cb0c12404354d697d582840938d9651a9ed",
+    "maozi_direct_new_method/lib/match-feedback.mjs": "47433d0826207bc691a6987d051954b3293cc1608b29d8eff7b8ecb3b585edcd",
+    "maozi_direct_new_method/lib/portable-support/maozi-client.mjs": "c675862bfc42bb559fae39e8486ab2d6c0ad62bee701b75f3aab828f0df00f49",
+    "flow_ef_category_fbs/lib/brand-import-conflict.mjs": "2bfa9273f6af58c516fb07705430f32ea45f51151a02fdc9dbc57ac9fab15f95",
+    "FlowEF-production/bridges/exchange-rate.mjs": "9b1728de8be3bfbce4210be23250c77f8e9723fdf9ae09be822b3603320b7d3f",
+    "FlowEF-production/bridges/local-profit.mjs": "c4e96e9aa6e18823e43f2aed69a97e7f5a0d3c12176b156dbeb69165483c596b"
+  }
+}

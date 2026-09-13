@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from . import compat
@@ -55,7 +56,11 @@ async def screen(candidate, api_key="", *, ranking=None):
         inputs, output = folder / "input.json", folder / "output.json"
         inputs.write_text(json.dumps([manifest(candidate)], ensure_ascii=False), encoding="utf-8")
         args = [
-            os.environ.get("FLOWHUB_COMPAREBOT_PYTHON", sys.executable),
+            os.environ.get("FLOWHUB_COMPAREBOT_PYTHON") or (
+                str(ROOT.parent / "FlowHub-comparebot/.venv/bin/python")
+                if (ROOT.parent / "FlowHub-comparebot/.venv/bin/python").is_file()
+                else sys.executable
+            ),
             "-m",
             "comparebot.interfaces.screen_cli" if ranking is not None else "comparebot.interfaces.cli",
             "--manifest",
@@ -71,16 +76,23 @@ async def screen(candidate, api_key="", *, ranking=None):
             args += ["--ranking-input", str(cached)]
         if os.environ.get("FLOWHUB_COMPAREBOT_DEVICE"):
             args += ["--device", os.environ["FLOWHUB_COMPAREBOT_DEVICE"]]
-        process = await asyncio.create_subprocess_exec(
-            *args,
-            cwd=folder,
-            env=env,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
+        process = None
         try:
-            await asyncio.wait_for(process.wait(), 70 if ranking is not None else 90)
-            if process.returncode or not output.is_file():
+            if os.environ.get('FLOWHUB_COMPAREBOT_WARM') == '1':
+                from .comparebot_process import screen as warm_screen
+                options = dict(manifest=str(inputs), output=str(output), product_id=str(candidate['source_key']),
+                               top_k=10, device=os.environ.get('FLOWHUB_COMPAREBOT_DEVICE'))
+                if ranking is not None:
+                    options.update(ranking_input=str(cached), size=None, high_threshold=.86, medium_threshold=.63,
+                                   qwen_match_min_similarity=.82, qwen_mismatch_max_similarity=.64,
+                                   qwen_model=os.environ.get('QWEN_VL_MODEL','qwen3-vl-plus'),
+                                   qwen_base_url=os.environ.get('DASHSCOPE_BASE_URL','https://dashscope.aliyuncs.com/compatible-mode/v1'))
+                await warm_screen('screen' if ranking is not None else 'rank', options, api_key)
+            else:
+                process = await asyncio.create_subprocess_exec(
+                    *args, cwd=folder, env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                await asyncio.wait_for(process.wait(), 70 if ranking is not None else 90)
+            if (process and process.returncode) or not output.is_file():
                 raise ModuleError(
                     "compareBot failed: check its Python environment, model and image-search connection"
                 )
@@ -98,7 +110,7 @@ async def screen(candidate, api_key="", *, ranking=None):
                 "selected_offer_id": top["candidate"]["offer_id"] if top else None,
             }}
         except BaseException:
-            if process.returncode is None:
+            if process and process.returncode is None:
                 process.kill()
                 await process.wait()
             raise
@@ -165,11 +177,15 @@ async def invoke(operation, context, secret=""):
     if not credentials.get("erp_token"):
         raise ModuleError("workspace ERP token required")
     candidate = context["candidate"]
+    began=time.perf_counter()
     ranked = await screen(candidate)
+    timing={"dino_search_seconds":time.perf_counter()-began}
     source = source_from_result(ranked, candidate, evaluation_only=True)
     if source.get("manual_review") or source.get("rejected"):
         return source
+    began=time.perf_counter()
     evaluated = await compat.invoke("match", context, credentials["erp_token"], source=source)
+    timing["profit_seconds"]=time.perf_counter()-began
     if evaluated.get("rejected") or evaluated.get("manual_review"):
         return evaluated
     evidence = evaluated["evidence"]
@@ -180,7 +196,10 @@ async def invoke(operation, context, secret=""):
         "weight_g": profit["input"]["package_weight"],
         "sell_price_cny": profit["sell_price_cny"],
     }
+    began=time.perf_counter()
     result = await screen(enriched, credentials.get("dashscope_api_key", ""), ranking=ranked["search_and_rank"])
+    timing["qwen_screen_seconds"]=time.perf_counter()-began
+    evidence["module_timings"]=timing
     approved = source_from_result(result, enriched)
     evidence["source"]["comparebot"] = result
     if approved.get("manual_review") or approved.get("rejected"):

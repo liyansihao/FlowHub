@@ -356,3 +356,32 @@ def register_source_api(app, db, scope, admin):
                 "SELECT id,phase FROM jobs WHERE owner=? AND source_key=?", (owner, sku)
             ).fetchone()
         return {"job_id": job["id"], "phase": job["phase"], "created": job["id"] == key, "submitted": False}
+
+    @app.post("/api/sources/{sku}/comparebot")
+    async def plugin_comparebot(sku: str, seller: str = "", owner=Depends(scope)):
+        from .plugin_comparebot import evaluate
+        try:
+            report = await evaluate(db, owner, sku, seller)
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from None
+        except RuntimeError:
+            raise HTTPException(503, "核查连接暂不可用，商品已保留") from None
+        return {k: report[k] for k in ('sku','state','submitted','reason','cached') if k in report}
+
+    @app.post("/api/sources/{sku}/publish-pipeline")
+    def plugin_publish_pipeline(sku: str, seller: str = "", owner=Depends(scope)):
+        from .plugin_pipeline import enqueue
+        try:
+            return enqueue(db,owner,sku,seller)
+        except ValueError as error:
+            raise HTTPException(409,str(error)) from None
+
+    @app.get("/api/sources/{sku}/publish-pipeline")
+    def plugin_publish_status(sku: str, seller: str = "", owner=Depends(scope)):
+        from .plugin_pipeline import schema
+        schema(db)
+        with db.connect() as c:
+            row=c.execute('SELECT state,body FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()
+        if not row:
+            raise HTTPException(404,'没有请求过该商品的测算上架')
+        return {'state':row['state'],**json.loads(row['body'])}

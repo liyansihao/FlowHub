@@ -22,16 +22,18 @@ class StorefrontError(ValueError):
     pass
 
 
-def shop_url(url, seller):
+def shop_url(url, seller, trusted_path=None):
     value = urljoin(ORIGIN, url)
     parsed = urlsplit(value)
     match = re.fullmatch(r"/seller/(?:[^/]+-)?(\d+)/products/", parsed.path)
+    slug = re.fullmatch(r"/seller/([^/]+)/products/", parsed.path)
+    bound_slug = bool(not match and slug and parsed.path == trusted_path)
     if (
         parsed.scheme != "https"
         or parsed.netloc != "www.ozon.ru"
         or parsed.fragment
-        or not match
-        or match[1] != str(seller)
+        or not (match or bound_slug)
+        or (match and match[1] != str(seller))
     ):
         raise StorefrontError("identity_mismatch")
     return value
@@ -56,7 +58,7 @@ class PacketHTML(HTMLParser):
 
 def parse_packet(html, seller, requested_url):
     seller = identity(seller)
-    requested_url = shop_url(requested_url, seller)
+    requested_url = shop_url(requested_url, seller, urlsplit(requested_url).path)
     try:
         parser = PacketHTML()
         parser.feed(html)
@@ -68,13 +70,13 @@ def parse_packet(html, seller, requested_url):
         info = state["pageInfo"]
         if info.get("pageType") != "seller" or str(info["analyticsInfo"]["sellerId"]) != seller:
             raise StorefrontError("identity_mismatch")
-        actual_url = shop_url(info["url"], seller)
+        actual_url = shop_url(info["url"], seller, urlsplit(info["url"]).path)
         wanted_query = parse_qs(urlsplit(requested_url).query)
         actual_query = parse_qs(urlsplit(actual_url).query)
         if actual_query != wanted_query:
             raise StorefrontError("cursor_mismatch")
         if parser.canonical:
-            shop_url(parser.canonical, seller)
+            shop_url(parser.canonical, seller, urlsplit(actual_url).path)
         page = int(actual_query.get("page", ["1"])[0])
         grids = [(k, v) for k, v in parser.widgets.items() if k.startswith("state-tileGridDesktop-")]
         # Ozon's explicit empty sold-out tail is a valid end packet. Require
@@ -125,7 +127,7 @@ def parse_packet(html, seller, requested_url):
         continuation = continuations[0]
         if continuation is not None and not isinstance(continuation, str):
             raise StorefrontError("invalid_continuation")
-        next_url = shop_url(continuation, seller) if continuation else None
+        next_url = shop_url(continuation, seller, urlsplit(actual_url).path) if continuation else None
         if next_url:
             next_page = int(parse_qs(urlsplit(next_url).query).get("page", ["0"])[0])
             if next_page != page + 1:
@@ -280,7 +282,7 @@ class StorefrontCollector:
                 root_seeds=json.loads(task["roots"]),
             )
             try:
-                if shop_url(requested_url, seller) != task["next_url"]:
+                if shop_url(requested_url, seller, urlsplit(task["next_url"]).path) != task["next_url"]:
                     raise StorefrontError("checkpoint_mismatch")
                 packet = parse_packet(html, seller, requested_url)
                 if packet["page"] != task["page"]:

@@ -19,3 +19,6 @@ reports/
 *.key
 output/
 playwright-profile/
+.playwright-cli/
+
+node_modules/

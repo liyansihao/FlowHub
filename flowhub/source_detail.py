@@ -33,12 +33,18 @@ async def request(path, method, keys, query=None, body=None):
         )
         data = json.loads(output)
         if not data.get("ok"):
-            raise ModuleError("source acquisition failed; submission state retained")
+            raise SourceAcquisitionFailure(data.get("error", "SOURCE_REQUEST_FAILED"), data.get("diagnostic"))
         return data["data"]
     finally:
         if process.returncode is None:
             process.kill()
             await process.wait()
+
+
+class SourceAcquisitionFailure(ModuleError):
+    def __init__(self, code, diagnostic):
+        super().__init__("source_acquisition:" + str(code))
+        self.diagnostic = diagnostic or {}
 
 
 class SourceCollector:
@@ -130,6 +136,9 @@ class SourceCollector:
         if len(matches) > 1:
             raise ModuleError("ambiguous source favorite")
         if not matches:
+            if self.c.get("existing_favorite_only"):
+                self.save("claimed", data)
+                raise Pending("source favorite missing; a real price is required before creating one")
             if data.get("favorite_attempted"):
                 self.save("favorite_started", data)
                 raise Pending("favorite creation not confirmed; lookup again later")

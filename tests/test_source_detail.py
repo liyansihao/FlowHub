@@ -193,3 +193,20 @@ async def test_original_russian_title_wins_over_english_draft_label(context):
 
     result = await map_detail(snapshot, context, seller)
     assert result["dossier"]["name"] == "Папка для документов А3"
+
+
+async def test_existing_favorite_only_never_creates_unpriced_favorite(tmp_path, context):
+    context['existing_favorite_only'] = True
+    context['candidate']['price'] = None
+    collector = SourceCollector(Database(tmp_path), context)
+    calls = []
+
+    async def call(path, method='GET', query=None, body=None):
+        calls.append((path, method))
+        assert method == 'GET'
+        return []
+
+    collector.call = call
+    with pytest.raises(Pending, match='real price'):
+        await collector.collect()
+    assert calls == [('/api.product.favorite/lists', 'GET')]

@@ -45,7 +45,12 @@ export async function nativeShopPage(seller, page = 1, fetchImpl = globalThis.fe
     observed_at: new Date().toISOString(), coverage: 'native-shop-unverified', steps: []};
   const jar = new SessionCookies();
   const signal = AbortSignal.timeout(15000);
-  const fail = error => ({ok: false, error, diagnostic});
+  const fail = error => {
+    const retryable=error==='native_network'||error==='native_http_429'||/^native_http_5[0-9]{2}$/.test(error);
+    return {ok:false,error,diagnostic:{...diagnostic,retryable,
+      recovery:retryable?'retry_same_page_with_backoff':'blocked_requires_source_resolution',
+      checkpoint_advance:false}};
+  };
   try {
     for (let redirects = 0; redirects <= 3; redirects++) {
       const cookie = jar.header(url);

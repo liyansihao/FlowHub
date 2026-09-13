@@ -34,6 +34,9 @@ const phase = {
   ready: "准备上架",
   prepared: "待提交",
   publishing: "提交回查",
+  awaiting_remote: "等待平台回执",
+  awaiting_dependency: "等待审核服务恢复",
+  needs_fields: "补齐商品资料",
   reconciling: "平台处理中",
   stock_ready: "准备库存",
   stock_pending: "库存回查",
@@ -788,7 +791,7 @@ async function renderSourceLibrary(container) {
   <div class="panel" style="padding:20px;margin-bottom:20px"><strong>已积累 ${status.products} 个商品 · ${status.seeds} 个历史绑定 · ${status.current_seeds ?? 0} 个当前可用种子 · ${status.tasks} 个采集任务</strong><p class="muted tiny">支持毛子 ERP 榜单与 Safari / Chrome 店铺分页导入。店铺读取使用独立的暂停和续跑控制，页面商品需补齐 ERP 资料后才能通过筛选。统计均价为 RUB，不能直接用于最终利润计算。</p>
   <form id="source-library-form"><div class="form-grid">${[["price_min","最低统计均价 / RUB"],["price_max","最高统计均价 / RUB"],["weight_max_g","最大重量 / g"],["sales_min","最低 28 天榜单销量"],["max_age_hours","数据最长保存有效期 / 小时"]].map(([key,label])=>`<label>${label}<input type="number" min="0" step="any" name="${key}" value="${esc(sourceLibraryDraft[key] ?? (key==='max_age_hours'?168:''))}"></label>`).join("")}<label>类目 ID（逗号分隔）<input name="categories" value="${esc((sourceLibraryDraft.categories||[]).join(','))}"></label><label>商品来源 ERP 密钥<input type="password" name="erp_token" autocomplete="new-password" placeholder="留空保留原连接"></label></div><label class="checkline"><input type="checkbox" name="pure_fbs" ${sourceLibraryDraft.pure_fbs!==false?'checked':''}>仅纯 FBS</label><label class="checkline"><input type="checkbox" name="require_follow_allowed" ${sourceLibraryDraft.require_follow_allowed?'checked':''}>仅保留明确可跟卖的商品</label><label class="checkline"><input type="checkbox" name="same_seller_only" ${sourceLibraryDraft.same_seller_only?'checked':''}>只看种子同店扩品</label><div class="actions"><button class="primary" type="submit">保存筛选条件</button><button type="button" id="source-library-toggle">${status.enabled?'暂停采集':'启用采集'}</button>${me.role==='admin'?'<button type="button" id="source-library-import">导入本地历史上架记录</button>':''}<button type="button" id="source-library-export">导出本页初筛候选</button></div></form><p id="source-library-notice" class="muted tiny">缺失数据保留为空，资料不足不会默认合格。</p></div>
   <div class="actions"><select id="source-library-state"><option value="">全部判断</option>${Object.entries(labels).map(([key,label])=>`<option value="${key}" ${sourceLibraryState===key?'selected':''}>${label}</option>`).join('')}</select><button id="source-library-first">回到第一页</button><button id="source-library-next" ${!result.has_more?'disabled':''}>下一页</button></div>
-  <div class="table-wrap"><table><thead><tr><th>商品 / 来源</th><th>统计均价 / RUB</th><th>重量 / g</th><th>28 天榜单销量</th><th>判断与缺失</th><th>采集 / 实时核查</th></tr></thead><tbody>${result.items.map((p,i)=>`<tr><td><strong>${esc(p.title)}</strong><div class="muted tiny">SKU ${esc(p.sku)} · 来源店铺 ${esc(p.seller_id||'未知')} · 类目 ${esc(p.category_id||'未知')}</div></td><td>${esc(p.average_price_rub??'未知')}</td><td>${esc(p.weight_g??'未知')}</td><td>${esc(p.sold_count_28d??'未知')}</td><td>${labels[p.assessment.state]}<div class="muted tiny">${p.assessment.missing.concat(p.assessment.failed).map(x=>fieldLabels[x]||esc(x)).join('、')}</div>${p.listing_review?`<div class="muted tiny">上架核查：${esc(p.listing_review.label)} · ${stamp(p.listing_review.observed_at)}</div>`:''}</td><td><small>${stamp(p.collected_at)}<br>${stamp(p.verified_at)}</small><br><button data-source-check="${i}">实时核查</button><button data-source-proof="${i}">查看证据</button>${p.assessment.state==='qualified'?`<button data-source-handoff="${i}">送入主软件待核查</button>`:''}</td></tr>`).join('')||'<tr><td colspan="6"><div class="empty">暂无商品。导入历史种子并启用采集后，这里会持续积累候选。</div></td></tr>'}</tbody></table></div>`;
+  <div class="table-wrap"><table><thead><tr><th>商品 / 来源</th><th>统计均价 / RUB</th><th>重量 / g</th><th>28 天榜单销量</th><th>判断与缺失</th><th>采集 / 实时核查</th></tr></thead><tbody>${result.items.map((p,i)=>`<tr><td><strong>${esc(p.title)}</strong><div class="muted tiny">SKU ${esc(p.sku)} · 来源店铺 ${esc(p.seller_id||'未知')} · 类目 ${esc(p.category_id||'未知')}</div></td><td>${esc(p.average_price_rub??'未知')}</td><td>${esc(p.weight_g??'未知')}</td><td>${esc(p.sold_count_28d??'未知')}</td><td>${labels[p.assessment.state]}<div class="muted tiny">${p.assessment.missing.concat(p.assessment.failed).map(x=>fieldLabels[x]||esc(x)).join('、')}</div>${p.listing_review?`<div class="muted tiny">上架核查：${esc(p.listing_review.label)} · ${stamp(p.listing_review.observed_at)}</div>`:''}</td><td><small>${stamp(p.collected_at)}<br>${stamp(p.verified_at)}</small><br><button data-source-check="${i}">实时核查</button><button data-source-proof="${i}">查看证据</button>${p.plugin_detail?`<button data-source-comparebot="${i}">compareBot / 1688 测算</button><button data-source-publish="${i}">测算通过后上架</button>`:''}${p.assessment.state==='qualified'?`<button data-source-handoff="${i}">送入主软件待核查</button>`:''}</td></tr>`).join('')||'<tr><td colspan="6"><div class="empty">暂无商品。导入历史种子并启用采集后，这里会持续积累候选。</div></td></tr>'}</tbody></table></div>`;
   const browserPanel = document.createElement('div');
   browserPanel.className='panel';
   browserPanel.style='padding:20px;margin-bottom:20px';
@@ -864,6 +867,18 @@ async function renderSourceLibrary(container) {
     const p=result.items[Number(button.dataset.sourceHandoff)];
     const r=await api('/sources/'+encodeURIComponent(p.sku)+'/handoff?seller='+encodeURIComponent(p.seller_id||''),'POST',{});
     container.querySelector('#source-library-notice').textContent=r.created?'已进入主软件的需要处理列表，等待售价、规格和同款核查。':'主软件中已存在此商品，未重复创建。';
+  }));
+  container.querySelectorAll('[data-source-publish]').forEach(button=>button.onclick=()=>run(async()=>{
+    const p=result.items[Number(button.dataset.sourcePublish)];
+    const r=await api('/sources/'+encodeURIComponent(p.sku)+'/publish-pipeline?seller='+encodeURIComponent(p.seller_id||''),'POST',{});
+    notice='测算上架任务：'+r.state;
+    await render();
+  }));
+  container.querySelectorAll('[data-source-comparebot]').forEach(button=>button.onclick=()=>run(async()=>{
+    const p=result.items[Number(button.dataset.sourceComparebot)];
+    const r=await api('/sources/'+encodeURIComponent(p.sku)+'/comparebot?seller='+encodeURIComponent(p.seller_id||''),'POST',{});
+    notice='compareBot / 1688 测算：'+r.state;
+    await render();
   }));
   container.querySelectorAll('[data-source-proof]').forEach(button=>button.onclick=()=>{
     const p=result.items[Number(button.dataset.sourceProof)];const dialog=document.createElement('dialog');const pre=document.createElement('pre');pre.style.cssText='max-width:70vw;max-height:65vh;overflow:auto;white-space:pre-wrap';pre.textContent=JSON.stringify(p,null,2);const close=document.createElement('button');close.textContent='关闭';close.onclick=()=>dialog.close();dialog.append(close,pre);document.body.append(dialog);dialog.onclose=()=>dialog.remove();dialog.showModal();

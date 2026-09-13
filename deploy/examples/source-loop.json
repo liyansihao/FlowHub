@@ -1,0 +1,9 @@
+{
+  "enabled": false,
+  "owner": "REPLACE_WITH_LOCAL_OWNER_ID",
+  "run_id": "source-loop-initial",
+  "profile": "/path/to/dedicated/playwright/profile",
+  "pages_per_store": 3,
+  "max_source_backlog": 2000,
+  "resolve_interval_seconds": 120
+}

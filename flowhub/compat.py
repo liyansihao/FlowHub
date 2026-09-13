@@ -104,8 +104,9 @@ async def invoke(operation, context, token, *, source=None):
             ],
             "cursor": str(offset + len(rows)),
         }
-    if r.get("rejected") or not r.get("fbs", {}).get("verified"):
-        return {"rejected": True}
+    evaluation_only = r.get('evaluation_only_verified') is True and context.get('candidate',{}).get('origin',{}).get('profit_evaluation_only') is True
+    if r.get("rejected") or (not r.get("fbs", {}).get("verified") and not evaluation_only):
+        return {"rejected": True, "reason": str(r.get("rejected") or "source_unverified"), "evidence": r}
     source = r["source"]
     img = source["selected_offer_image"]
     return dict(

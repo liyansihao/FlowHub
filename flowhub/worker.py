@@ -468,26 +468,55 @@ class Worker:
                 await asyncio.sleep(2)
 
         async def collect_sources():
-            from .source_acquisition import SourceAcquirer
+            from .pipeline_modules.seed import SeedModule
+            from .pipeline_modules import control
             from .source_library import SourceLibrary
 
-            acquirer = SourceAcquirer(SourceLibrary(self.db))
+            acquirer = SeedModule(self.db)
+            control.schema(self.db)
             while True:
                 with self.db.connect() as c:
                     settings = [dict(r) for r in c.execute(
                         "SELECT s.* FROM sourcing_settings s JOIN users u ON u.id=s.owner WHERE s.enabled=1 AND u.active=1"
                     )]
+                if control.paused(self.db,'seed'):
+                    await asyncio.sleep(1)
+                    continue
                 for setting in settings:
+                    started=time.time()
                     try:
-                        await acquirer.cycle(setting["owner"], self.db.open(setting["secret"])["erp_token"])
+                        result=await acquirer.run(setting["owner"], self.db.open(setting["secret"])["erp_token"])
+                        control.record(self.db,"seed",setting["owner"],"",started,result.get("state","complete"))
                     except Exception:
                         self.db.health("source-collector-error")
                 await asyncio.sleep(5)
 
+        async def plugin_publications():
+            from .plugin_pipeline import tick
+            config_path=self.db.directory/'pipeline-v2.json'
+            if config_path.exists():
+                config=json.loads(config_path.read_text())
+                if config.get('enabled'):
+                    import os
+                    os.environ['FLOWHUB_COMPAREBOT_WARM']='1'
+                    from .pipeline_modules.runtime import run
+                    return await run(self.db,review_workers=config.get('review_workers',2),
+                                     submit_workers=config.get('submit_workers',2),reconcile_workers=config.get('reconcile_workers',2))
+            while True:
+                try:
+                    await tick(self.db)
+                except Exception:
+                    self.db.health('plugin-pipeline-error')
+                await asyncio.sleep(2)
+
         tasks = [asyncio.create_task(heartbeat()), asyncio.create_task(refill()),
-                 asyncio.create_task(collect_sources())]
+                 asyncio.create_task(collect_sources()), asyncio.create_task(plugin_publications())]
         try:
             while True:
+                for task in tasks:
+                    if task.done():
+                        task.result()
+                        raise RuntimeError("required background module exited")
                 if not await self.step():
                     await asyncio.sleep(0.5)
         finally:

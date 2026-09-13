@@ -1,14 +1,17 @@
 # 协作开发
 
+先读[当前协作交接](docs/COLLABORATOR_HANDOFF.md)，了解模块入口、生产隔离与优先分工。
+
 当前能力、限制与优先事项见 [开发状态](docs/DEVELOPMENT_STATUS.md)。请先提交 Issue 描述问题和可验证的结果，再从 `main` 创建 `codex/<topic>` 或个人功能分支，使用 Pull Request 协作。
 
 ## 本地验证
 
 ```sh
 python3.12 -m venv .venv
-.venv/bin/pip install -e '.[dev]'
+.venv/bin/pip install -e '.[dev]' -e ./vendor/compareBot
+npm ci --ignore-scripts
 .venv/bin/python -m pytest -q
-node --test tests/native-shop.test.mjs tests/storefront-auto.test.mjs
+npm test
 ```
 
 单元测试不需要提供真实店铺凭据。真实接口、真实采集与发布测试须使用自己有权限的账号，明确操作范围和限额。不要把测试通过写成真实上架成功。

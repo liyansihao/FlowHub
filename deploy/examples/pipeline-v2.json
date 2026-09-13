@@ -1,0 +1,6 @@
+{
+  "enabled": false,
+  "review_workers": 2,
+  "submit_workers": 2,
+  "reconcile_workers": 2
+}

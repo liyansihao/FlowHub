@@ -222,6 +222,7 @@ async def test_real_node_bridge_uses_selected_price_without_legacy_search(
     tmp_path, monkeypatch, candidate, result
 ):
     files = {
+        "ozon-runtime/lib/plugin-source-policy.mjs": "export function verifiedPluginSource(){return false};export function verifiedPluginEvaluation(){return false}",
         "ozon-runtime/lib/maozi-credentials.mjs": "export async function resolveConfiguredMaoziToken(){return 'test'}",
         "ozon-runtime/lib/maozi-transport.mjs": "export function createGloballyPacedMaoziTransport(o){if(o.allowWrites)throw Error('writes');return async()=>({})}",
         "maozi_direct_new_method/maozi_new_method_direct.mjs": """
