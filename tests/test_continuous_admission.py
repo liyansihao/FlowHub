@@ -144,3 +144,21 @@ def test_submission_priority_defers_remote_reads_but_not_stock_write():
     assert readback_delay(b,'reconciling',submission_priority=True)==360
     assert readback_delay(b,'stock_ready',submission_priority=True)==0
     assert readback_delay(b,'stock_pending',submission_priority=True)==20
+
+
+def test_acceptance_cohort_precedes_backlog_without_bypassing_bounds(tmp_path):
+    db,owner=setup(tmp_path)
+    with db.connect() as c:
+        c.execute("UPDATE pipeline_campaigns SET body=json_set(body,'$.acceptance_skus',json('[\"2\"]'))")
+    assert admit_one(db,owner)['sku']=='2'
+    assert admit_one(db,owner)['state']=='backpressure'
+    with db.connect() as c:c.execute("UPDATE plugin_pipeline SET state='selling'")
+    assert admit_one(db,owner)['sku']=='1'
+
+
+def test_acceptance_cohort_still_excludes_blocked_skus(tmp_path):
+    db,owner=setup(tmp_path)
+    with db.connect() as c:
+        c.execute("UPDATE pipeline_campaigns SET body=json_set(body,'$.acceptance_skus',json('[\"2\"]'))")
+        c.execute('INSERT INTO blocks VALUES(?,?,?)',(owner,'2','explicit exclusion'))
+    assert admit_one(db,owner)['sku']=='1'

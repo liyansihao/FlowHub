@@ -45,6 +45,24 @@ def candidate(product, now=None):
             'origin':origin, 'source_contract':'maozi-plugin-comparebot-v1'}
 
 
+def eligible_roots(bindings, blocks, seller=None):
+    blocked_offers={tuple(v) for v in blocks['offers']}
+    result=[]
+    for r in bindings:
+        sku=str(r.get('source_sku') or r.get('sku') or '')
+        if not sku.isdigit() or sku in blocks['skus']:continue
+        shop,offer=r.get('shop'),r.get('offer')
+        if shop is not None and offer is not None:
+            if (str(shop),offer) in blocked_offers or ('*',offer) in blocked_offers:continue
+        else:
+            evidence=r.get('evidence') or {}
+            if r.get('channel')!='other-seller-discovery' or evidence.get('channel')!='ozon-other-sellers-browser' or str(evidence.get('sku'))!=sku or not evidence.get('sha256'):
+                continue
+            if seller is not None and str(seller) not in evidence.get('sellers',[]):continue
+        result.append(r)
+    return result
+
+
 async def evaluate(db, owner, sku, seller):
     library = SourceLibrary(db)
     with db.connect() as c:
@@ -60,10 +78,7 @@ async def evaluate(db, owner, sku, seller):
     blocks = await read_delists()
     if sku in blocks['skus']:
         raise ValueError('explicit_delist')
-    blocked_offers = {tuple(v) for v in blocks['offers']}
-    roots = [r for r in envelope['origin']['expansion_source']['seed_bindings']
-             if str(r.get('source_sku') or r.get('sku')) not in blocks['skus']
-             and (str(r['shop']),r['offer']) not in blocked_offers and ('*',r['offer']) not in blocked_offers]
+    roots = eligible_roots(envelope['origin']['expansion_source']['seed_bindings'],blocks,seller)
     if not roots:
         raise ValueError('source_roots_delisted')
     envelope['origin']['expansion_source']['seed_bindings'] = roots

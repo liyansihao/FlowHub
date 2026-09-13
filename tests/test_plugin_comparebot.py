@@ -47,3 +47,19 @@ def test_no_monthly_sales_uses_cny_display_without_currency_conversion():
     assert c['sell_price_cny']==49.71 and c['price_currency']=='CNY'
     assert c['origin']['average_price_rub'] is None
     assert c['origin']['publication_blockers']
+
+
+def test_discovery_roots_need_evidence_but_not_own_offer():
+    from flowhub.plugin_comparebot import eligible_roots
+    root={'sku':'123','channel':'other-seller-discovery','evidence':{'sku':'123','channel':'ozon-other-sellers-browser','sha256':'hash'}}
+    assert eligible_roots([root],{'skus':[],'offers':[]})==[root]
+    assert eligible_roots([root],{'skus':['123'],'offers':[]})==[]
+    assert eligible_roots([{'sku':'123'}],{'skus':[],'offers':[]})==[]
+    assert eligible_roots([{'sku':'123','shop':'1','offer':'x'}],{'skus':[],'offers':[['*','x']]})==[]
+
+
+def test_discovery_root_must_include_the_actual_source_seller():
+    from flowhub.plugin_comparebot import eligible_roots
+    root={'sku':'123','channel':'other-seller-discovery','evidence':{'sku':'123','channel':'ozon-other-sellers-browser','sha256':'hash','sellers':['20']}}
+    assert eligible_roots([root],{'skus':[],'offers':[]},'20')==[root]
+    assert eligible_roots([root],{'skus':[],'offers':[]},'21')==[]

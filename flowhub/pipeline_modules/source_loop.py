@@ -195,6 +195,25 @@ async def tick(db,config):
             control.record(db,'seed',owner,result.get('sku',''),now,result['state'],result)
             sync_stores(db,owner,config['run_id'])
         if control.paused(db,'seed'):return {'state':'paused'}
+        if config.get('other_sellers_enabled'):
+            from .. import other_sellers
+            other_sellers.schema(db)
+            other_sellers.prepare_samples(db,owner)
+            other_sellers.promote_qualified(db,owner)
+            with db.connect() as c:
+                due=c.execute('SELECT due FROM source_discovery_clock WHERE owner=?',(owner,)).fetchone()
+                discovery_due=not due or now>=due[0]
+                if discovery_due:
+                    c.execute('INSERT OR REPLACE INTO source_discovery_clock VALUES(?,?)',
+                        (owner,now+config.get('discovery_interval_seconds',120)))
+            if discovery_due:
+                other_sellers.replenish(db,owner,explore_pending=config.get('explore_pending_sources',False))
+                result=await other_sellers.discover_one(db,owner,config)
+                control.record(db,'seed',owner,result.get('sku',''),now,'other_sellers',result)
+                other_sellers.prepare_samples(db,owner)
+            if discovery_due and backlog<config.get('max_source_backlog',2000):
+                result=await other_sellers.sample_one(db,owner,config)
+                if result['state']!='no_due_sample':return result
         if backlog>=config.get('max_source_backlog',2000):return {'state':'source_backpressure','backlog':backlog}
         task=choose(db,owner)
         result=await collect(db,task,config) if task else {'state':'no_due_store'}
@@ -227,6 +246,13 @@ def status(db,owner):
           AND q.seller=json_extract(e.body,'$.provenance.seller_id')
           WHERE e.owner=? AND json_extract(e.body,'$.provenance.channel')='browser-page-source'
           AND json_extract(e.body,'$.provenance.browser')='playwright' ''',(owner,)).fetchall()
+        discovery={}
+        if c.execute("SELECT 1 FROM sqlite_master WHERE name='source_discovery_seeds'").fetchone():
+            discovery['seed_states']={r[0]:r[1] for r in c.execute('SELECT state,COUNT(*) FROM source_discovery_seeds WHERE owner=? GROUP BY state',(owner,))}
+            discovery['observed_other_sellers']=c.execute('SELECT COUNT(DISTINCT seller) FROM source_other_sellers WHERE owner=?',(owner,)).fetchone()[0]
+        if c.execute("SELECT 1 FROM sqlite_master WHERE name='source_discovered_stores'").fetchone():
+            discovery['store_assessments']={r[0]:r[1] for r in c.execute('SELECT state,COUNT(*) FROM source_discovered_stores WHERE owner=? GROUP BY state',(owner,))}
     from collections import Counter
     return {'configured':True,'stores':sum(states.values()),'store_states':states,'seed_resolutions':resolutions,
-            'browser_new_candidates':len(candidates),'candidate_states':dict(Counter(r['state'] or 'not_admitted' for r in candidates))}
+            'browser_new_candidates':len(candidates),'candidate_states':dict(Counter(r['state'] or 'not_admitted' for r in candidates)),
+            'other_seller_discovery':discovery}

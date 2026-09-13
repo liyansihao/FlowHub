@@ -5,5 +5,8 @@
   "profile": "/path/to/dedicated/playwright/profile",
   "pages_per_store": 3,
   "max_source_backlog": 2000,
-  "resolve_interval_seconds": 120
+  "resolve_interval_seconds": 120,
+  "other_sellers_enabled": false,
+  "explore_pending_sources": false,
+  "discovery_interval_seconds": 120
 }

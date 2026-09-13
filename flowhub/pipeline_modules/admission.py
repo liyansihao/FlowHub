@@ -68,6 +68,10 @@ def admit_one(db, owner, now=None):
         if not stores:return {'state':'blocked','reason':'no_verified_target_store'}
         # Alternate fresh discoveries and oldest backlog without starving either.
         order='DESC' if policy.get('mix_fresh_sources') and total%2==0 else 'ASC'
+        # A bounded acceptance cohort must not get trapped between a growing
+        # newest-first queue and a large oldest-first backlog. All gates above
+        # and exclusions below still apply to these SKUs.
+        cohort=json.dumps([str(s) for s in policy.get('acceptance_skus',[])][:100])
         rows=c.execute('''SELECT p.* FROM sourcing_products p WHERE p.owner=?
           AND json_extract(p.body,'$.coverage') IN ('storefront-page','maozi-exact-seller-page')
           AND json_extract(p.body,'$.source_relation.seller_id')=json_extract(p.body,'$.seller_id')
@@ -76,7 +80,8 @@ def admit_one(db, owner, now=None):
           AND NOT EXISTS(SELECT 1 FROM plugin_pipeline q WHERE q.owner=p.owner AND q.sku=p.sku)
           AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.owner=p.owner AND j.source_key=p.sku)
           AND NOT EXISTS(SELECT 1 FROM blocks b WHERE b.owner=p.owner AND b.source_key=p.sku)
-          ORDER BY p.id '''+order+' LIMIT 200',(owner,)).fetchall()
+          ORDER BY CASE WHEN p.sku IN (SELECT value FROM json_each(?)) THEN 0 ELSE 1 END,
+          p.id '''+order+' LIMIT 200',(owner,cohort)).fetchall()
         for row in rows:
             p=json.loads(row['body']);relation=p.get('source_relation') or {}
             if relation.get('seller_id')!=p.get('seller_id') or not relation.get('root_seeds'):continue
