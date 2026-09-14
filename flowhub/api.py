@@ -73,6 +73,8 @@ def create_app(database=None):
     from .source_api import register_source_api
 
     register_source_api(app, db, scope, admin)
+    from .manual_reviews import register as register_manual_reviews
+    register_manual_reviews(app, db, scope, auth)
 
     class Login(BaseModel):
         username: str = Field(min_length=1, max_length=60)

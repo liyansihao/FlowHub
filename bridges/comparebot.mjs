@@ -1,5 +1,6 @@
 // compareBot supplier binding with existing ERP product, FBS and profit verification.
 import fs from 'node:fs/promises';
+import {cachedCategory} from './category-cache.mjs';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
 const root=path.resolve(process.env.FLOWEF_LEGACY_ROOT||path.join(import.meta.dirname,'../..'));
@@ -40,7 +41,15 @@ async function main(){
  const plugin=product.plugin_detail, monthly=plugin?.monthly_sales;
  const {verifiedPluginSource,verifiedPluginEvaluation}=await load('ozon-runtime/lib/plugin-source-policy.mjs');
  const explicitPluginSource=verifiedPluginSource(product);
- const evaluationOnly=verifiedPluginEvaluation(product);
+ const q=product.price_evidence;
+ const weightFirst=product.weight_first_valuation===true && product.profit_evaluation_only===true
+  && Number(product.valuation_weight_g)>0 && Number.isFinite(Number(product.valuation_weight_g))
+  && String(plugin?.sku||product.direct_source_facts?.sku)===String(product.sku)
+  && String(product.source_relation?.seller_id)===String(product.seller_id)
+  && product.expansion_source?.contract==='flowhub-same-seller-v1' && product.expansion_source.seed_bindings?.length>0
+  && ['CNY','RUB'].includes(q?.currency) && q.value>0 && Number.isFinite(q.value)
+  && Number.isFinite(q.observed_at) && Date.now()/1000-q.observed_at>=0 && Date.now()/1000-q.observed_at<21600;
+ const evaluationOnly=weightFirst||verifiedPluginEvaluation(product);
  // Priority lists select ranking discoveries; explicitly supplied, verified plugin
  // candidates need not belong to a ranking-priority list. Hard exclusions remain.
  if(category.holdout||engine.prohibitedCategoryMatch(product,rules)||blockedImportBrand(product,cfg.flow_f.blocked_source_brands)||feedbackBlockForProduct(product,feedback).blocked)return {rejected:'protected_product'};
@@ -68,9 +77,17 @@ async function main(){
    ||source.selected_image_url!==row.candidate.image_url)throw Error('invalid compareBot source binding');
  }
  if(feedbackBlockForPair(product,source,feedback).blocked)return {rejected:'human_mismatch'};
- const useLocalProfit=await fs.access(path.join(root,'FlowEF-production/state/production/local-profit.enabled')).then(()=>true).catch(()=>false);
+ const useLocalProfit=weightFirst||await fs.access(path.join(root,'FlowEF-production/state/production/local-profit.enabled')).then(()=>true).catch(()=>false);
  stage('commission_and_category');
- const [commissions,categoryData]=await Promise.all([useLocalProfit?Promise.resolve(null):client.listCategoryCommissions(),client.getCategoryBySku(product.sku)]);
+ const savedCategory=cachedCategory(product);
+ const categoryRequest=savedCategory?Promise.resolve(savedCategory):client.getCategoryBySku(product.sku);
+ const [commissions,categoryData]=await Promise.all([
+  useLocalProfit?Promise.resolve(null):client.listCategoryCommissions(),
+  categoryRequest.catch(error=>{
+   if(!weightFirst)throw error;
+   return {cate:[null,null,product.category_id||null],product_info:{},lookup_unavailable:true};
+  }),
+ ]);
  if(engine.prohibitedLeafCategoryMatch(categoryData))return {rejected:'prohibited_leaf'};
  stage('fbs_verification');
  let fbs=evaluationOnly?{verified:false,source:'deferred_until_publication',raw_mode:monthly?.sales_schema??null}:await engine.observePureFbs(transport,product,'flowef-production-decision');

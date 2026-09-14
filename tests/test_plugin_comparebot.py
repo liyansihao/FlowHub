@@ -21,10 +21,10 @@ def test_plugin_to_existing_matcher_preserves_price_units_and_provenance():
     assert p==prior
 
 
-@pytest.mark.parametrize('kind',['stale','identity','dimensions','price','roots'])
+@pytest.mark.parametrize('kind',['weight','identity','price','roots'])
 def test_incomplete_plugin_facts_do_not_reach_paid_matching(kind):
     p=product();d=p['plugin_detail']
-    if kind=='stale':d['observed_at']=-30000
+    if kind=='weight':d['weight_g']=None
     if kind=='identity':d['sku']='9'
     if kind=='mode':d['monthly_sales']['sales_schema']='FBO'
     if kind=='follow':d['monthly_sales']['blocked_by_seller']=None
@@ -63,3 +63,14 @@ def test_discovery_root_must_include_the_actual_source_seller():
     root={'sku':'123','channel':'other-seller-discovery','evidence':{'sku':'123','channel':'ozon-other-sellers-browser','sha256':'hash','sellers':['20']}}
     assert eligible_roots([root],{'skus':[],'offers':[]},'20')==[root]
     assert eligible_roots([root],{'skus':[],'offers':[]},'21')==[]
+
+
+def test_static_dossier_age_and_missing_dimensions_do_not_block_valuation():
+    p=product();p['plugin_detail'].update(observed_at=-30000,dimensions_mm=[])
+    c=candidate(p,now=101)
+    assert c['dimensions_cm'] is None
+    assert c['origin']['weight_first_valuation'] is True
+    assert c['origin']['valuation_weight_g']==10
+    assert c['origin']['commission_fallback_pct']==12
+    p['plugin_detail']['monthly_sales']['observed_at']=-30000
+    with pytest.raises(ValueError):candidate(p,now=101)

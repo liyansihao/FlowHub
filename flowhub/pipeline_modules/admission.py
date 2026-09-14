@@ -54,8 +54,11 @@ def admit_one(db, owner, now=None):
         # preparation of the next products while waiting for platform visibility.
         remote_sql="state IN ('publishing','awaiting_remote') AND COALESCE(json_extract(body,'$.phase'),'') IN ('submitting','reconciling','sync_pending','stock_ready','stock_pending','manual_review')"
         remote=c.execute('SELECT count(*) FROM plugin_pipeline WHERE owner=? AND ('+remote_sql+')',(owner,)).fetchone()[0]
-        active=c.execute("SELECT count(*) FROM plugin_pipeline WHERE owner=? AND state IN ('queued','evaluating','publishing','needs_fields') AND NOT ("+remote_sql+")",(owner,)).fetchone()[0]
+        active=c.execute("SELECT count(*) FROM plugin_pipeline WHERE owner=? AND state IN ('queued','evaluating','publishing') AND NOT ("+remote_sql+")",(owner,)).fetchone()[0]
         if remote>=policy.get('max_remote_pending',40):return {'state':'backpressure','remote_pending':remote}
+        repairs=c.execute("SELECT count(*) FROM plugin_pipeline WHERE owner=? AND state='needs_fields'",(owner,)).fetchone()[0]
+        if repairs>=policy.get('max_repair_pending',48):return {'state':'backpressure','repair_pending':repairs}
+        active+=c.execute("SELECT count(*) FROM plugin_pipeline q JOIN plugin_pipeline_leases l USING(owner,sku,seller) WHERE q.owner=? AND q.state='needs_fields' AND l.expires>?",(owner,now)).fetchone()[0]
         if active>=policy.get('max_inflight',12):return {'state':'backpressure','active':active}
         total=c.execute('SELECT count(*) FROM pipeline_admissions WHERE owner=? AND json_extract(body,\'$.run_id\')=?',(owner,policy['run_id'])).fetchone()[0]
         if policy.get('max_admissions') and total>=policy['max_admissions']:return {'state':'admission_limit'}

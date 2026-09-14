@@ -10,17 +10,28 @@ from .local_profit import ProfitInput, calculate
 
 def production_profit(c):
     product, category, source = c["product"], c["category_data"], c["source"]
-    facts = category["product_info"]
+    minimal=product.get("weight_first_valuation") is True
+    category=category or {}
+    facts = category.get("product_info") or {}
+    cate_ids=(list(category.get("cate") or [])+[None,None,None])[:3]
     fx = Decimal(str(c["rub_cny"]))
     if not fx.is_finite() or fx <= 0:
         raise ValueError("invalid exchange rate")
     sell = Decimal(str(c["sell_cny"]))
-    dims = [Decimal(str(facts[k])) for k in ("depth", "width", "height")]
+    purchase=Decimal(str(source["selected_cost_cny"]))
+    if not purchase.is_finite() or purchase<=0:raise ValueError('purchase cost unavailable')
+    raw_dims=[facts.get(k) for k in ('depth','width','height')]
+    if minimal:
+        saved_dims=(product.get('plugin_detail') or {}).get('dimensions_mm') or []
+        if len(saved_dims)==3 and all(saved_dims):
+            raw_dims=[Decimal(str(v))/10 for v in saved_dims]
+    dims=[Decimal(str(v)) for v in raw_dims] if len(raw_dims)==3 and all(raw_dims) else None
+    if dims is None and not minimal:raise ValueError('dimensions unavailable')
     # Existing postal warehouse's size limits, retained from verified production carrier rules.
-    if sum(dims) > 90 or max(dims) > 60:
+    if dims and (sum(dims) > 90 or max(dims) > 60):
         return {"rejected": "no_logistics_route"}
     commission = resolve_production(
-        sell_rub=sell / fx, type_id=str(category["cate"][2]), brand=product.get("brand", ""), mode="realFBS"
+        sell_rub=sell / fx, type_id=str(cate_ids[2] or ""), brand=product.get("brand", ""), mode="realFBS", fallback_pct=12 if minimal else None
     )
     inputs = ProfitInput(
         provider="ChinaPost",
@@ -29,9 +40,10 @@ def production_profit(c):
         sell_cny=sell,
         rub_per_cny=1 / fx,
         purchase_cny=source["selected_cost_cny"],
-        weight_g=facts["weight"],
+        weight_g=product.get("valuation_weight_g") if minimal else facts["weight"],
         dimensions_cm=dims,
-        type_id="" if commission["estimated"] else str(category["cate"][2]),
+        weight_only=minimal,
+        type_id="" if commission["estimated"] else str(cate_ids[2] or ""),
         commission_pct=commission["rate_pct"] if commission["estimated"] else None,
         commission_source=commission["source_url"],
         category=commission["name"],
@@ -42,7 +54,7 @@ def production_profit(c):
         ads_pct=0,
         reserve_pct=1,
         profit_min=30,
-        eligibility_confirmed=True,
+        eligibility_confirmed=dims is not None,
     )
     result = calculate(inputs)
     if commission["estimated"]:
@@ -52,15 +64,15 @@ def production_profit(c):
         return {"rejected": "no_logistics_route"}
     q = result["quotes"][0]
     fees = q["fees_cny"]
-    cate = category["cate"][:2] + [f"{commission['tier']},{commission['rate_pct']:.2f}"]
+    cate = cate_ids[:2] + [f"{commission['tier']},{commission['rate_pct']:.2f}"]
     legacy_input = dict(
         sku=product["sku"],
         sell_price=float(sell),
         purchase_price=float(inputs.purchase_cny),
         package_weight=float(inputs.weight_g),
-        package_length=float(dims[0]),
-        package_width=float(dims[1]),
-        package_height=float(dims[2]),
+        package_length=float(dims[0]) if dims else None,
+        package_width=float(dims[1]) if dims else None,
+        package_height=float(dims[2]) if dims else None,
         china_fee=0,
         ad_rate=0,
         other_rate=1,
@@ -115,6 +127,8 @@ def production_profit(c):
         config_version=result["version"],
         calculation_source="flowhub-local-postal-estimated-commission" if commission["estimated"] else "flowhub-local-postal-official-commission",
         commission=commission,
+        pending_publication_fields=[] if dims else ["dimensions_cm"],
+        weight_only_estimate=dims is None,
         calculation=result,
     )
 

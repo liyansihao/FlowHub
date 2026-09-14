@@ -13,7 +13,7 @@ const $ = (s) => document.querySelector(s),
     );
 let me = null,
   owner = "",
-  page = "overview",
+  page = location.hash === "#reviews" ? "reviews" : "overview",
   jobs = [],
   stores = [],
   wf = {},
@@ -53,7 +53,7 @@ const kinds = {
 };
 
 const navGroups = [
-  ["上架工作", ["overview", "运行概览"], ["jobs", "上架商品"]],
+  ["上架工作", ["overview", "运行概览"], ["jobs", "上架商品"], ["reviews", "人工审核"]],
   ["自动化", ["sources", "商品来源与筛选"], ["calculator", "利润计算器"], ["workflow", "工作流配置"], ["modules", "模块中心"]],
   ["店铺资产", ["stores", "店铺连接"], ["blocks", "禁止上架清单"]],
 ];
@@ -404,7 +404,9 @@ async function render() {
     const activeNav = document.querySelector("[data-page].active");
     if ($("#currentpage") && activeNav)
       $("#currentpage").textContent = activeNav.textContent;
-    if (page === "sources") {
+    if (page === "reviews") {
+      await renderManualReviews(c);
+    } else if (page === "sources") {
       await renderSourceLibrary(c);
     } else if (page === "overview" || page === "jobs") {
       jobs = (
@@ -883,4 +885,35 @@ async function renderSourceLibrary(container) {
   container.querySelectorAll('[data-source-proof]').forEach(button=>button.onclick=()=>{
     const p=result.items[Number(button.dataset.sourceProof)];const dialog=document.createElement('dialog');const pre=document.createElement('pre');pre.style.cssText='max-width:70vw;max-height:65vh;overflow:auto;white-space:pre-wrap';pre.textContent=JSON.stringify(p,null,2);const close=document.createElement('button');close.textContent='关闭';close.onclick=()=>dialog.close();dialog.append(close,pre);document.body.append(dialog);dialog.onclose=()=>dialog.remove();dialog.showModal();
   });
+}
+
+let reviewOffset=0,reviewSearch='',reviewHistory=false;
+function reviewUrl(value){try{const u=new URL(value);return u.protocol==='https:'?u.href:'';}catch{return '';}}
+async function renderManualReviews(container){
+  const labels={approve:'通过同款审核',reject:'拒绝',repair:'补资料'};
+  const stamp=t=>t?new Date(t*1000).toLocaleString():'未知';
+  container.innerHTML=head('人工审核','逐件核对 Ozon 与 1688 商品。通过后继续原有上架检查。','<button id="review-history">'+(reviewHistory?'返回待审核':'审核记录')+'</button><button id="review-refresh">刷新</button>')+'<div id="review-notice" role="status"></div><div id="review-content">正在加载…</div>';
+  container.querySelector('#review-refresh').onclick=()=>renderManualReviews(container);
+  container.querySelector('#review-history').onclick=()=>{reviewHistory=!reviewHistory;renderManualReviews(container);};
+  const content=container.querySelector('#review-content');
+  if(reviewHistory){
+    const items=await api('/manual-reviews/history');
+    content.innerHTML='<section class="panel"><h2>最近 50 次审核</h2>'+items.map(r=>`<div class="review-history-row"><strong>SKU ${esc(r.sku)} · ${esc(labels[r.action])}</strong><p>${esc(r.note)}</p><small class="muted">${esc(stamp(r.at))} · 审核人 ${esc(r.actor)}</small></div>`).join('')+(items.length?'':'<p class="empty">暂无人工审核记录</p>')+'</section>';return;
+  }
+  const data=await api('/manual-reviews?offset='+reviewOffset+'&search='+encodeURIComponent(reviewSearch));
+  const reasonLabels={qwen_match_outside_safe_band:'千问认为同款，但未达到自动通过条件',qwen_mismatch_outside_safe_band:'千问认为不同款，需要人工核对',qwen_uncertain_outside_safe_band:'千问无法确定是否同款'};
+  const photo=(url,title)=>reviewUrl(url)?`<a href="${esc(reviewUrl(url))}" target="_blank" rel="noopener noreferrer"><img src="${esc(reviewUrl(url))}" alt="${esc(title)}" loading="lazy" referrerpolicy="no-referrer"></a>`:'<div class="review-no-image">暂无图片，请补资料</div>';
+  const link=(url,title)=>reviewUrl(url)?`<a href="${esc(reviewUrl(url))}" target="_blank" rel="noopener noreferrer">${esc(title)} ↗</a>`:esc(title);
+  const n=v=>typeof v==='number'&&Number.isFinite(v)?v.toFixed(2):'未知';
+  content.innerHTML=`<form id="review-search" class="list-toolbar"><input aria-label="搜索待审核SKU" name="sku" placeholder="输入 SKU 搜索" value="${esc(reviewSearch)}"><button>搜索</button><span class="muted">待审核 ${data.total} 件</span></form>`+data.items.map((r,i)=>`<section class="panel review-card" data-review-card="${i}"><div class="panel-title"><div><h2>SKU ${esc(r.sku)}</h2><small class="muted">来源店铺 ${esc(r.seller)} · 测算时间 ${esc(stamp(r.observed_at))}</small></div><span class="badge pending">待人工处理</span></div><div class="review-images"><div>${photo(r.image,'Ozon商品图片')}<h3>${link(r.url,'Ozon 商品')}</h3><p>${esc(r.title||'标题缺失')}</p></div><div>${photo(r.supplier_image,'1688商品图片')}<h3>${link(r.supplier_url,'1688 采购商品')}</h3><p>${esc(r.supplier_title||'未匹配到采购商品')}</p><small>货源 ID ${esc(r.supplier_id||'未知')}</small></div></div><div class="review-figures"><span>采购成本 <strong>¥${n(r.purchase)}</strong></span><span>拟售价 <strong>¥${n(r.sell_price_cny)}</strong></span><span>成本利润率 <strong>${n(r.profit_rate)}%</strong></span><span>DINO 相似度 <strong>${n(r.dino_score==null?null:r.dino_score*100)}%</strong></span></div><div class="review-explanation"><strong>${esc(reasonLabels[r.reason]||r.reason||'需要人工检查')}</strong><p>千问判断：${esc(({match:'同款',mismatch:'不同款',uncertain:'不确定'})[r.qwen.verdict]||'暂无')} · 置信度 ${n(r.qwen.confidence==null?null:r.qwen.confidence*100)}%</p><p>${esc(r.qwen.reason||'暂无千问说明。请补齐资料后重新测算。')}</p></div>${r.approval_block?`<p class="review-block">暂不能通过：${esc(r.approval_block)}</p>`:''}<label>审核理由（必填）<textarea data-review-note rows="2" maxlength="1000" placeholder="记录商品本体、规格等核对结论，或需要补充的资料"></textarea></label><div class="actions"><button class="primary" data-decision="approve" ${r.can_approve?'':'disabled'}>通过并继续上架</button><button data-decision="reject">拒绝该候选</button><button data-decision="repair">退回补资料</button></div></section>`).join('')+(data.items.length?'':'<section class="panel empty">没有待审核商品</section>')+`<div class="actions"><button id="review-prev" ${reviewOffset?'':'disabled'}>上一页</button><span>${reviewOffset+1}–${reviewOffset+data.items.length} / ${data.total}</span><button id="review-next" ${reviewOffset+20<data.total?'':'disabled'}>下一页</button></div>`;
+  content.querySelector('#review-search').onsubmit=e=>{e.preventDefault();reviewSearch=new FormData(e.target).get('sku').trim();reviewOffset=0;renderManualReviews(container);};
+  content.querySelector('#review-prev').onclick=()=>{reviewOffset=Math.max(0,reviewOffset-20);renderManualReviews(container);};
+  content.querySelector('#review-next').onclick=()=>{reviewOffset+=20;renderManualReviews(container);};
+  content.querySelectorAll('[data-review-card]').forEach(card=>card.querySelectorAll('[data-decision]').forEach(button=>button.onclick=async()=>{
+    const r=data.items[Number(card.dataset.reviewCard)],note=card.querySelector('textarea').value.trim(),notice=container.querySelector('#review-notice');
+    if(!note){notice.textContent='请先填写审核理由。';card.querySelector('textarea').focus();return;}
+    card.querySelectorAll('button').forEach(b=>b.disabled=true);
+    try{await api('/manual-reviews/'+encodeURIComponent(r.sku)+'/'+encodeURIComponent(r.seller),'POST',{action:button.dataset.decision,note,revision:r.revision});await renderManualReviews(container);container.querySelector('#review-notice').textContent='SKU '+r.sku+'：'+labels[button.dataset.decision]+'已记录。';}
+    catch(error){notice.textContent=error.message;card.querySelectorAll('button').forEach(b=>b.disabled=b.dataset.decision==='approve'&&!r.can_approve);}
+  }));
 }

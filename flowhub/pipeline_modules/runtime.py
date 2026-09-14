@@ -29,6 +29,8 @@ async def run(db, *, review_workers=2, submit_workers=2, reconcile_workers=2):
     tasks.append(asyncio.create_task(admission_loop(db)))
     from .source_loop import run as source_loop
     tasks.append(asyncio.create_task(source_loop(db)))
+    from .draft_cleanup import run as draft_cleanup
+    tasks.append(asyncio.create_task(draft_cleanup(db)))
     try:
         await asyncio.gather(*tasks)
     finally:

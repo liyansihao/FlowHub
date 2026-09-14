@@ -15,16 +15,14 @@ def candidate(product, now=None):
     now = time.time() if now is None else now
     detail = product.get('plugin_detail') or {}
     sales = detail.get('monthly_sales') or {}
-    for observed in (detail.get('observed_at'),):
-        if not isinstance(observed, (int, float)) or not 0 <= now - observed < 21600:
-            raise ValueError('plugin_facts_missing_or_stale')
-    if str(detail.get('sku')) != str(product['sku']):
+    if str(detail.get('sku') or (product.get('direct_source_facts') or {}).get('sku')) != str(product['sku']):
         raise ValueError('plugin_identity_mismatch')
     quote=sale_price(product,now)
-    weight, price = positive(detail.get('weight_g')), quote['value'] if quote else None
-    dims = detail.get('dimensions_mm') or []
-    if weight is None or price is None or len(dims) != 3 or any(positive(v) is None for v in dims):
-        raise ValueError('pricing_facts_missing')
+    weight=positive(detail.get('weight_g')) or positive(product.get('weight_g'))
+    price=quote['value'] if quote else None
+    dims=detail.get('dimensions_mm') or []
+    if weight is None or price is None:raise ValueError('pricing_facts_missing')
+    dims_valid=len(dims)==3 and all(positive(v) for v in dims)
     relation = product.get('source_relation') or {}
     if relation.get('seller_id') != product['seller_id'] or not relation.get('root_seeds'):
         raise ValueError('source_provenance_missing')
@@ -33,13 +31,13 @@ def candidate(product, now=None):
                   category_name=sales.get('category_name') or detail.get('description_type_name') or product.get('category_name',''),
                   brand=sales.get('brand') or detail.get('brand') or (product.get('raw') or {}).get('brand',''),
                   average_price_rub=price if quote['currency']=='RUB' else None, price_evidence=quote,
-                  profit_evaluation_only=True, publication_blockers=publication_blockers(product,now),
+                  profit_evaluation_only=True, weight_first_valuation=True, valuation_weight_g=weight, commission_fallback_pct=12, publication_blockers=publication_blockers(product,now),
                   category_id=product.get('category_id') or detail.get('description_type'),
                   specifications={'attributes':detail.get('attributes'), 'variant_id':detail.get('variant_id')},
                   expansion_source={'contract':'flowhub-same-seller-v1','coverage':'storefront-exact-seller',
                                     'seed_bindings':relation['root_seeds'],'evidence_hash':product.get('source_relation_evidence_hash')})
     return {'source_key':str(product['sku']), 'title':product['title'], 'image':image_url(product['image']),
-            'price':price, 'weight_g':weight, 'dimensions_cm':[float(v)/10 for v in dims],
+            'price':price, 'weight_g':weight, 'dimensions_cm':[float(v)/10 for v in dims] if dims_valid else None,
             'pure_fbs':sales.get('sales_schema')=='FBS', 'price_currency':quote['currency'],
             **({'sell_price_cny':price} if quote['currency']=='CNY' else {}),
             'origin':origin, 'source_contract':'maozi-plugin-comparebot-v1'}
@@ -84,7 +82,7 @@ async def evaluate(db, owner, sku, seller):
     envelope['origin']['expansion_source']['seed_bindings'] = roots
     started = time.time()
     matcher_secret=db.open(workflow['secrets'])['flowb-matcher']
-    digest = fingerprint({'credential_revision':fingerprint(matcher_secret),'adapter_version':3,'plugin':product['plugin_detail'],'quote':envelope['origin']['price_evidence'],'roots':roots,'rules':workflow['rules']})
+    digest = fingerprint({'credential_revision':fingerprint(matcher_secret),'adapter_version':4,'plugin':product['plugin_detail'],'quote':envelope['origin']['price_evidence'],'roots':roots,'rules':workflow['rules']})
     with db.connect() as c:
         c.execute('BEGIN IMMEDIATE')
         prior = c.execute('SELECT * FROM plugin_reviews WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()

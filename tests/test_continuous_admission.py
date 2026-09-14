@@ -21,6 +21,7 @@ def setup(tmp_path):
 def test_restart_dedup_backpressure_and_real_source_time_preserved(tmp_path):
     db,owner=setup(tmp_path)
     assert admit_one(db,owner)['state']=='admitted'
+    with db.connect() as c:c.execute("UPDATE plugin_pipeline SET state='queued'")
     assert admit_one(Database(tmp_path),owner)['state']=='backpressure'
     with db.connect() as c:
         p=json.loads(c.execute("SELECT body FROM sourcing_products WHERE sku='1'").fetchone()[0])
@@ -151,6 +152,7 @@ def test_acceptance_cohort_precedes_backlog_without_bypassing_bounds(tmp_path):
     with db.connect() as c:
         c.execute("UPDATE pipeline_campaigns SET body=json_set(body,'$.acceptance_skus',json('[\"2\"]'))")
     assert admit_one(db,owner)['sku']=='2'
+    with db.connect() as c:c.execute("UPDATE plugin_pipeline SET state='queued'")
     assert admit_one(db,owner)['state']=='backpressure'
     with db.connect() as c:c.execute("UPDATE plugin_pipeline SET state='selling'")
     assert admit_one(db,owner)['sku']=='1'
@@ -162,3 +164,21 @@ def test_acceptance_cohort_still_excludes_blocked_skus(tmp_path):
         c.execute("UPDATE pipeline_campaigns SET body=json_set(body,'$.acceptance_skus',json('[\"2\"]'))")
         c.execute('INSERT INTO blocks VALUES(?,?,?)',(owner,'2','explicit exclusion'))
     assert admit_one(db,owner)['sku']=='1'
+
+
+def test_sleeping_repairs_release_capacity_but_repair_backlog_is_bounded(tmp_path):
+    db,owner=setup(tmp_path);admit_one(db,owner)
+    with db.connect() as c:
+        c.execute("UPDATE plugin_pipeline SET state='needs_fields',due=?",(time.time()+300,))
+        c.execute("UPDATE pipeline_campaigns SET body=json_set(body,'$.max_repair_pending',1)")
+    assert admit_one(db,owner)=={'state':'backpressure','repair_pending':1}
+    with db.connect() as c:c.execute("UPDATE pipeline_campaigns SET body=json_set(body,'$.max_repair_pending',48)")
+    assert admit_one(db,owner)['sku']=='2'
+
+
+def test_running_repair_reserves_a_main_slot(tmp_path):
+    db,owner=setup(tmp_path);admit_one(db,owner)
+    with db.connect() as c:
+        c.execute("UPDATE plugin_pipeline SET state='needs_fields'")
+        c.execute('INSERT INTO plugin_pipeline_leases VALUES(?,?,?,?,?)',(owner,'1','3','lease',time.time()+120))
+    assert admit_one(db,owner)['state']=='backpressure'

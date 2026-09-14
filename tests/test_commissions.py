@@ -120,3 +120,43 @@ def test_price_fallback_keeps_exact_rate_and_rejects_invalid_price():
     for p in (0,-1,'NaN'):
         with pytest.raises(ValueError):
             resolve_production(sell_rub=p,type_id='91303')
+
+
+def test_weight_first_uses_actual_cost_and_weight_without_fabricating_dimensions():
+    c=dict(product={'sku':'test','weight_first_valuation':True,'valuation_weight_g':100},
+           category_data={'cate':[]},source={'selected_cost_cny':10},rub_cny=0.1,sell_cny=100)
+    partial=production_profit(c)
+    assert partial['commission']['rate_pct']==12
+    assert partial['commission']['estimated'] is True
+    assert partial['input']['package_length'] is None
+    assert partial['weight_only_estimate'] is True
+    c['category_data']['product_info']={'depth':20,'width':15,'height':5}
+    complete=production_profit(c)
+    assert partial['assessment']['total_cost_cny']==complete['assessment']['total_cost_cny']
+    assert partial['assessment']['profit_cny']==complete['assessment']['profit_cny']
+    assert complete['weight_only_estimate'] is False
+    c['source']['selected_cost_cny']=0
+    with pytest.raises(ValueError):production_profit(c)
+
+
+def test_authorized_flat_commission_still_prefers_known_official_rate():
+    from flowhub.commissions import resolve_production
+    assert resolve_production(sell_rub=1600,type_id='unknown',fallback_pct=12)['rate_pct']==12
+    assert resolve_production(sell_rub=1600,type_id='97894',brand='无品牌',fallback_pct=12)['rate_pct']==14
+
+
+def test_saved_package_dimensions_win_over_category_cache():
+    c=dict(product={'sku':'test','weight_first_valuation':True,'valuation_weight_g':100,
+                    'plugin_detail':{'dimensions_mm':[200,150,50]}},
+           category_data={'cate':[], 'product_info':{'depth':99,'width':99,'height':99}},
+           source={'selected_cost_cny':10},rub_cny=0.1,sell_cny=100)
+    result=production_profit(c)
+    assert result['input']['package_length']==20
+    assert result['input']['package_width']==15
+    assert result['input']['package_height']==5
+
+
+def test_only_authorized_flat_fallback_is_accepted():
+    from flowhub.commissions import resolve_production
+    for rate in (0,-1,99,float('nan')):
+        with pytest.raises(ValueError):resolve_production(sell_rub=100,type_id='unknown',fallback_pct=rate)

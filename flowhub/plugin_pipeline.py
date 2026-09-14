@@ -77,6 +77,11 @@ async def tick(db, lane=None):
               WHEN q.state='publishing' THEN 3
               ELSE 4 END,q.due LIMIT 1""", (now, now, *(RECONCILE if lane in ('submit','reconcile') else ()))).fetchone()
         if not r:return False
+        if r['state']=='needs_fields':
+            campaign=c.execute('SELECT body FROM pipeline_campaigns WHERE owner=? AND enabled=1',(r['owner'],)).fetchone() if c.execute("SELECT 1 FROM sqlite_master WHERE name='pipeline_campaigns'").fetchone() else None
+            limit=json.loads(campaign[0]).get('max_inflight',12) if campaign else 12
+            active=c.execute("SELECT count(*) FROM plugin_pipeline WHERE owner=? AND state IN ('queued','evaluating','publishing') AND COALESCE(json_extract(body,'$.phase'),'') NOT IN ('submitting','reconciling','sync_pending','stock_ready','stock_pending','manual_review')",(r['owner'],)).fetchone()[0]
+            if active>=limit:return False
         row=dict(r);key=(row['owner'],row['sku'],row['seller']);token=secrets.token_hex(16)
         c.execute('INSERT OR REPLACE INTO plugin_pipeline_leases VALUES(?,?,?,?,?)',(*key,token,now+120))
     async def renew():
@@ -93,8 +98,30 @@ async def tick(db, lane=None):
             from .pipeline_modules.repair import PriceRepairModule
             result=await PriceRepairModule().run(db,*key)
             body['repair_reason']=result['reason']
-            if result['state']=='ready':state='queued';body.pop('error',None)
-            else:delay=300
+            if result['state']=='ready':
+                state='queued';body.pop('error',None);body.pop('reason',None)
+                if body.get('repair_retry'):
+                    body.setdefault('repair_history',[]).append(body.pop('repair_retry'))
+                with db.connect() as c:
+                    c.execute('BEGIN IMMEDIATE')
+                    if c.execute("SELECT 1 FROM sqlite_master WHERE name='plugin_reviews'").fetchone():
+                        from .pipeline_modules.dossier import synchronize_repaired_review
+                        if synchronize_repaired_review(c,key):
+                            state='publishing'
+                            body.update(evaluation_state='matched',repair_reason='dossier_synced_to_approved_review')
+                            body.pop('pending_publication_fields',None)
+                        else:
+                            c.execute('DELETE FROM plugin_reviews WHERE owner=? AND sku=? AND seller=?',key)
+            else:
+                repair=body.setdefault('repair_retry',{})
+                repair['attempts']=int(repair.get('attempts',0))+1
+                repair.setdefault('first_attempt_at',started)
+                repair.update(last_attempt_at=started,missing_fields=result.get('missing_fields',[]),reason=result['reason'])
+                delay=min(3600,300*2**min(repair['attempts']-1,4))
+                repair['delay_seconds']=delay
+                if repair['attempts']>=6:
+                    state='needs_review';body['reason']='repair_retry_exhausted: '+result['reason']
+                    repair['exhausted_at']=time.time();delay=0
         elif state in ('queued','evaluating'):
             report=await evaluate(db,*key)
             reason=report.get('reason') or report.get('result',{}).get('reason')
@@ -104,7 +131,18 @@ async def tick(db, lane=None):
                     c.execute('CREATE TABLE IF NOT EXISTS pipeline_capabilities(name TEXT PRIMARY KEY,state TEXT,body TEXT,updated REAL)')
                     c.execute('INSERT OR REPLACE INTO pipeline_capabilities VALUES(?,?,?,?)',('qwen_review','ready' if decision.get('qwen_review') else 'blocked',json.dumps({'reason':reason,'sku':key[1]}),time.time()))
             body['evaluation_state']=report['state']
-            if report['state']=='matched':state='publishing'
+            if report['state']=='matched':
+                state='publishing'
+                origin=(report.get('candidate') or {}).get('origin') or {}
+                if origin.get('weight_first_valuation'):
+                    from .pipeline_modules.repair import missing_fields
+                    pending=missing_fields(origin)
+                    if pending:
+                        state='needs_fields'
+                        body.update(reason='publication_dossier_pending',pending_publication_fields=pending)
+                    else:
+                        body.pop('pending_publication_fields',None)
+                        body.pop('reason',None)
             elif report['state']=='running':state='evaluating';delay=5
             elif report['state']=='error':raise RuntimeError(report.get('reason','evaluation_error'))
             else:

@@ -138,3 +138,26 @@ async def test_official_wrong_source_cannot_replace_identity(monkeypatch):
     p={'sku':'1'}
     result,evidence=await direct_identity_fields(p,{'store':{'config':{},'credentials':{'client_id':'x','api_key':'y'}}})
     assert result==p and evidence['fallback']=='maozi-direct'
+
+@pytest.mark.asyncio
+async def test_category_fast_path_avoids_price_page_and_draft_requests(tmp_path,monkeypatch):
+    from flowhub.pipeline_modules import direct_facts
+    from flowhub.source_detail import SourceCollector
+    db,owner=setup(tmp_path);(tmp_path/'direct-first.json').write_text('{"enabled":true}')
+    with db.connect() as c:
+        p=json.loads(c.execute('SELECT body FROM sourcing_products').fetchone()[0])
+        p['plugin_detail']={};p['source_relation']={'seller_id':'2','root_seeds':[{'sku':'3','shop':'4','offer':'x'}]}
+        p['proposed_sale_price']={'value':30,'currency':'CNY','observed_at':time.time()}
+        c.execute('UPDATE sourcing_products SET body=?',(json.dumps(p),))
+    calls=[]
+    async def erp(self,method,path,**kwargs):
+        calls.append(path)
+        return {'sku':'1','cate':[1,2,3],'product_info':{'weight':40,'depth':25,'width':25,'height':5}}
+    async def forbidden(*args):pytest.fail('fast path must not load a page or collect a draft')
+    monkeypatch.setattr(MaoziPublisher,'erp',erp)
+    monkeypatch.setattr(direct_facts,'public_detail',forbidden);monkeypatch.setattr(SourceCollector,'collect',forbidden)
+    result=await PriceRepairModule().run(db,owner,'1','2')
+    assert result['state']=='ready' and 'attributes' in result['missing_fields']
+    assert calls==['/api.tool/get_category_by_sku']
+    calls.clear();assert (await PriceRepairModule().run(db,owner,'1','2'))['state']=='ready'
+    assert calls==[]

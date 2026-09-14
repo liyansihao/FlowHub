@@ -6,7 +6,7 @@ def reviewed_snapshot(review, now=None):
     now=time.time() if now is None else now
     candidate=review['candidate'];origin=candidate['origin'];detail=origin.get('plugin_detail') or {}
     observed=detail.get('observed_at',0)
-    if detail.get('contract') not in ('maozi-plugin-sku-detail-v1','maozi-erp-draft-detail-v1') or str(detail.get('sku'))!=str(candidate['source_key']):
+    if detail.get('contract') not in ('maozi-plugin-sku-detail-v1','maozi-erp-draft-detail-v1','direct-field-dossier-v1') or str(detail.get('sku'))!=str(candidate['source_key']):
         return None
     if not isinstance(observed,(int,float)) or not 0<=now-observed<21600:
         return None
@@ -70,3 +70,42 @@ def refresh_procurement_plan(connection, journal_path, record, latest):
         (json.dumps(revised['plan'],sort_keys=True),record['offer_id'],row['phase'],row['plan'])).rowcount
     if changed!=1:raise ValueError('plan_revision_conflict')
     return revised
+
+
+def repaired_review(review, product, now=None):
+    """Attach complete new facts to an unchanged, still-valid approved valuation."""
+    import copy
+    from ..plugin_comparebot import candidate
+    from .pricing import approved_price_intent
+    from ..plugin_publication import same_postal_package
+    now=time.time() if now is None else now
+    if approved_price_intent(review,now) is None:return None
+    try:
+        latest=candidate(product,now=now)
+        old=review['candidate']
+        if any(latest.get(k)!=old.get(k) for k in ('source_key','title','image')):return None
+        if latest['origin'].get('seller_id')!=old['origin'].get('seller_id'):return None
+        if latest['origin'].get('category_id')!=old['origin'].get('category_id'):return None
+        quote=latest['origin']['price_evidence'];prior=old['origin']['price_evidence']
+        if (quote['currency'],float(quote['value']))!=(prior['currency'],float(prior['value'])):return None
+        updated=copy.deepcopy(review);updated['candidate']=latest
+        snapshot=reviewed_snapshot(updated,now)
+        if not snapshot or not same_postal_package(snapshot['detail'],review['result']['evidence']['profit']['input']):return None
+        updated['publication_blockers']=latest['origin']['publication_blockers']
+        updated['price_basis']=quote
+        updated.setdefault('dossier_revisions',[]).append({'at':now,'previous_observed_at':old['origin'].get('plugin_detail',{}).get('observed_at'),'reason':'repaired_fields_same_approved_economics'})
+        # Keep original approval time; supplementing attributes cannot renew Qwen approval.
+        return updated
+    except (ValueError,KeyError,TypeError):return None
+
+
+def synchronize_repaired_review(connection, key):
+    """Caller owns the queue lease and transaction; never overwrite a newer review."""
+    import json
+    row=connection.execute('SELECT body FROM plugin_reviews WHERE owner=? AND sku=? AND seller=?',key).fetchone()
+    product=connection.execute('SELECT body FROM sourcing_products WHERE owner=? AND sku=? AND seller=?',key).fetchone()
+    if not row or not product:return False
+    updated=repaired_review(json.loads(row[0]),json.loads(product[0]))
+    if updated is None:return False
+    connection.execute('UPDATE plugin_reviews SET body=? WHERE owner=? AND sku=? AND seller=?',(json.dumps(updated),*key))
+    return True

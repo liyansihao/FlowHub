@@ -48,6 +48,7 @@ class SourceAcquisitionFailure(ModuleError):
 
 
 class SourceCollector:
+    recovery_pages = {}
     def __init__(self, db, context):
         self.db, self.c = db, context
         self.keys = context["store"]["credentials"]
@@ -83,6 +84,32 @@ class SourceCollector:
                 (self.key, state, self.db.seal(data), time.time()),
             )
 
+    async def recover_draft(self, data):
+        # Read-only full listing, cached per owner/account. Never infer success from a favorite.
+        account=self.c['owner']+':'+hashlib.sha256(self.keys.get('erp_token','').encode()).hexdigest()
+        cached=self.recovery_pages.get(account)
+        if not cached or time.time()-cached[0]>60:
+            rows=[];complete=False
+            for page in range(1,21):
+                response=await self.call('/api.product.collect/lists',query={'page':page,'page_size':100})
+                batch=response if isinstance(response,list) else response.get('data',[])
+                if not isinstance(batch,list):raise Pending('invalid draft recovery listing')
+                rows.extend(batch)
+                total=response.get('total') if isinstance(response,dict) else None
+                if len(batch)<100 or (total is not None and len(rows)>=int(total)):
+                    complete=True;break
+            if not complete:raise Pending('draft recovery listing incomplete')
+            self.recovery_pages[account]=(time.time(),rows)
+        else:rows=cached[1]
+        matches={str(r['id']):r for r in rows if str(r.get('goods_id'))==self.sku and r.get('collect_from')=='ozon' and r.get('id')}
+        if len(matches)!=1:raise Pending('source draft recovery missing or ambiguous; no creation repeated')
+        draft_id=int(next(iter(matches)))
+        detail=await self.call('/api.product.collect/detail',query={'id':draft_id,'is_online':0})
+        data=data|{'source_key':self.sku,'draft_id':draft_id,'detail':detail,'observed_at':time.time(),
+                   'recovery':{'source':'exact-ozon-draft-list','at':time.time()}}
+        self.save('ready',data)
+        return data
+
     async def collect(self):
         # Claim once per source/account. A crashed collecting call is not repeated blindly.
         with self.db.connect() as db:
@@ -105,7 +132,9 @@ class SourceCollector:
             data |= {"detail": detail, "observed_at": time.time()}
             self.save("ready", data)
             return data
-        if not inserted and state in ("claimed", "favorite_started") and time.time() - updated > 120:
+        if not inserted and state=="draft_started" and time.time()-updated>120:
+            return await self.recover_draft(data)
+        if not inserted and state in ("claimed", "favorite_started", "draft_rejected") and time.time() - updated > 120:
             # A read may be retried after its bounded subprocess timeout. A favorite write
             # is recovered by lookup only; the write itself is never replayed.
             if state == "favorite_started":
@@ -166,7 +195,16 @@ class SourceCollector:
             raise ModuleError("source favorite not confirmed")
         data = {"source_key": self.sku, "favorite_id": int(matches[0]["id"])}
         self.save("draft_started", data)
-        draft = await self.call("/api.product.favorite/edit_import", "POST", body={"id": data["favorite_id"]})
+        try:
+            draft = await self.call("/api.product.favorite/edit_import", "POST", body={"id": data["favorite_id"]})
+        except SourceAcquisitionFailure as error:
+            # A documented capacity refusal is definitive; transport failures remain unknown.
+            diagnostic=error.diagnostic
+            if (diagnostic.get('api_code')==0 and diagnostic.get('operation')=='/api.product.favorite/edit_import'
+                    and '采集箱已满' in str(diagnostic.get('api_message',''))):
+                data['last_rejection']=diagnostic
+                self.save('draft_rejected',data)
+            raise
         draft_id = int(draft.get("jump_id") or draft.get("id") or 0)
         if draft_id <= 0:
             raise ModuleError("source draft acknowledgement missing")

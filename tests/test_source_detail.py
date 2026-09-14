@@ -210,3 +210,48 @@ async def test_existing_favorite_only_never_creates_unpriced_favorite(tmp_path, 
     with pytest.raises(Pending, match='real price'):
         await collector.collect()
     assert calls == [('/api.product.favorite/lists', 'GET')]
+
+
+async def test_capacity_refusal_can_retry_but_unknown_write_still_cannot(tmp_path,context):
+    import time
+    from flowhub.source_detail import SourceAcquisitionFailure
+    db=Database(tmp_path);one=SourceCollector(db,context);writes=[]
+    async def full(path,method='GET',query=None,body=None):
+        if path.endswith('/lists'):return [{'id':7,'sku':'123'}]
+        writes.append(path)
+        raise SourceAcquisitionFailure('ERP_SOURCE_REJECTED',{'api_code':0,'api_message':'采集箱已满，上限1000个','operation':path})
+    one.call=full
+    with pytest.raises(SourceAcquisitionFailure):await one.collect()
+    assert one.load()[0]=='draft_rejected'
+    with db.connect() as c:c.execute('UPDATE source_details SET updated=?',(time.time()-121,))
+    async def freed(path,method='GET',query=None,body=None):
+        if path.endswith('/lists'):return [{'id':7,'sku':'123'}]
+        if path.endswith('/edit_import'):writes.append(path);return {'jump_id':88}
+        return {'skus':[{}]}
+    two=SourceCollector(db,context);two.call=freed
+    assert (await two.collect())['draft_id']==88
+    assert len(writes)==2
+
+
+@pytest.mark.parametrize('ambiguous',[False,True])
+async def test_unknown_draft_is_recovered_by_exact_listing_without_writes(tmp_path,context,ambiguous):
+    import time
+    db=Database(tmp_path);one=SourceCollector(db,context);one.recovery_pages.clear()
+    one.save('draft_started',{'source_key':'123','favorite_id':7})
+    with db.connect() as c:c.execute('UPDATE source_details SET updated=?',(time.time()-121,))
+    calls=[]
+    async def read(path,method='GET',query=None,body=None):
+        assert method=='GET';calls.append(path)
+        if path.endswith('/lists'):
+            rows=[{'id':88,'goods_id':'123','collect_from':'ozon'},{'id':90,'goods_id':'999','collect_from':'ozon'}]
+            if ambiguous:rows.append({'id':89,'goods_id':'123','collect_from':'ozon'})
+            return {'data':rows,'total':len(rows)}
+        assert query=={'id':88,'is_online':0}
+        return {'skus':[{}]}
+    one.call=read
+    if ambiguous:
+        with pytest.raises(Pending,match='ambiguous'):await one.collect()
+        assert one.load()[0]=='draft_started'
+    else:
+        assert (await one.collect())['draft_id']==88
+        assert one.load()[0]=='ready'

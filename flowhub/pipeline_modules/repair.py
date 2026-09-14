@@ -1,4 +1,5 @@
 """Field-specific Maozi ERP supplementation, independent of publication deadlines."""
+import asyncio
 import json
 import time
 from ..maozi import MaoziPublisher
@@ -24,30 +25,29 @@ def missing_fields(product):
     return missing
 
 
+def valuation_ready(product):
+    from ..plugin_comparebot import candidate
+    try:
+        candidate(product)
+        return True
+    except (ValueError,KeyError):
+        return False
+
+
 def merge_draft(product, snapshot):
     if str(snapshot.get('source_key'))!=str(product['sku']):raise ValueError('draft_source_mismatch')
     detail=snapshot.get('detail') or {}
     if len(detail.get('skus') or [])!=1:raise ValueError('ambiguous_draft_variant')
-    p=json.loads(json.dumps(product));old=p.get('plugin_detail') or {}
+    p=json.loads(json.dumps(product))
     fields={'weight_g':detail.get('package_weight'),
             'dimensions_mm':[detail.get(k) for k in ('package_length','package_width','package_height')],
             'attributes':detail.get('common_attributes')}
-    # Preserve each independently observed field even if another field is absent.
-    merged=dict(old);observed_fields=[]
-    for key,value in fields.items():
-        valid=(bool(value) if key=='attributes' else
-               len(value)==3 and all(positive(v) for v in value) if key=='dimensions_mm' else positive(value))
-        if valid:
-            merged[key]=value;observed_fields.append(key)
-    merged.setdefault('field_observations',{}).update({key:{'source':'maozi-erp-draft',
-        'observed_at':snapshot['observed_at'],'draft_id':snapshot.get('draft_id')} for key in observed_fields})
-    if len(observed_fields)==3:
-        merged.update(contract='maozi-erp-draft-detail-v1',sku=str(p['sku']),
-                      observed_at=snapshot['observed_at'],erp_draft_id=snapshot.get('draft_id'))
-        categories=detail.get('category_id') or []
-        if len(categories)>1:merged['description_category_id']=categories[1]
-    p['plugin_detail']=merged
-    if detail.get('title'):p['title']=detail['title']
+    from .direct_facts import merge_fields
+    p,applied=merge_fields(p,fields,'maozi-erp-draft',snapshot['observed_at'])
+    merged=p['plugin_detail'];merged['erp_draft_id']=snapshot.get('draft_id')
+    categories=detail.get('category_id') or []
+    if len(categories)>1 and not merged.get('description_category_id'):merged['description_category_id']=categories[1]
+    if not p.get('title') and detail.get('title'):p['title']=detail['title']
     if not p.get('url') and detail.get('url'):p['url']=detail['url']
     images=detail.get('images') or []
     if not p.get('image') and images and isinstance(images[0],str):p['image']=images[0]
@@ -89,6 +89,10 @@ class PriceRepairModule:
             row=c.execute('SELECT body FROM plugin_reviews WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()
         if not store or not product:return {'state':'waiting','reason':'source_or_store_missing'}
         p=json.loads(product[0]);review=json.loads(row[0]) if row else {};before=missing_fields(p)
+        # Measurement can proceed without the full publishing dossier.
+        can_value=valuation_ready(p)
+        if can_value and review.get('state')!='matched':
+            return {'state':'ready','reason':'valuation_inputs_ready','missing_fields':before}
         evidence={'at':time.time(),'before':before,'steps':[]};context={'store':{'config':json.loads(store['config']),'credentials':db.open(store['secret'])}}
         p,direct_step=await direct_identity_fields(p,context)
         evidence['steps'].append(direct_step)
@@ -112,13 +116,30 @@ class PriceRepairModule:
                 if policy.get('retain_captured_asking_price') and recorded['run_id']==policy['run_id'] and quote and time.time()-admission['at']<21600:
                     p['proposed_sale_price']={**quote,'observed_at':admission['at'],'source':'campaign-asking-price-decision','reference_observed_at':p.get('collected_at'),'run_id':policy['run_id']}
                     evidence['steps'].append({'source':'campaign-asking-price-decision','decided_at':admission['at']})
-        needed=missing_fields(p)
+        from . import direct_facts
+        needed=missing_fields(p);direct_enabled=direct_facts.enabled(db)
+        # Independent read-only calls overlap; sku3 is only useful for missing price.
+        requests={}
+        if direct_enabled and any(k in needed for k in ('weight_g','dimensions_mm')):
+            requests['category']=('GET','/api.tool/get_category_by_sku',{'params':{'keyword':sku}})
         if 'sale_price' in needed:
+            requests['price']=('POST','/api.chrome/sku3',{'params':{'sku':sku},'body':{'sku':sku}})
+        async def read(kind,request):
+            began=time.monotonic();method,path,kwargs=request
             try:
-                response=await MaoziPublisher(context).erp('POST','/api.chrome/sku3',params={'sku':sku},body={'sku':sku})
+                response=await MaoziPublisher(context).erp(method,path,**kwargs)
+                return kind,response,{'source':kind,'endpoint':path,'elapsed_ms':round((time.monotonic()-began)*1000),'ok':True}
             except Exception as error:
-                evidence['steps'].append({'source':'maozi-sku3','reason':type(error).__name__})
-                response={}
+                return kind,{}, {'source':kind,'endpoint':path,'elapsed_ms':round((time.monotonic()-began)*1000),'reason':type(error).__name__,'ok':False}
+        responses={}
+        for kind,response,step in await asyncio.gather(*(read(k,v) for k,v in requests.items())):
+            responses[kind]=response;evidence['steps'].append(step)
+        if 'category' in responses:
+            p,step=direct_facts.from_category(p,responses['category'],time.time());evidence['steps'].append(step)
+        if 'price' in responses:
+            response=responses['price']
+            if direct_enabled:
+                p,step=direct_facts.from_maozi(p,response,time.time());evidence['steps'].append(step)
             data=response.get('data') or {};flags=response.get('status') or {}
             evidence['steps'].append({'source':'maozi-sku3','status':flags,'returned_sku':data.get('sku'),'seller_id':data.get('sellerId'),'price':data.get('avgPrice')})
             if flags.get('update_sales') is False and str(data.get('sku'))==sku and str(data.get('sellerId'))==seller and positive(data.get('avgPrice')):
@@ -128,7 +149,11 @@ class PriceRepairModule:
                     if data.get(src) is not None:monthly[dst]=data[src]
                 p.setdefault('plugin_detail',{}).setdefault('monthly_sales',{})
                 p['plugin_detail']['monthly_sales']=(p['plugin_detail']['monthly_sales'] or {})|monthly
-        if any(k in missing_fields(p) for k in ('weight_g','dimensions_mm','attributes','title','image','url','fresh_dossier')):
+        can_value=valuation_ready(p)
+        if direct_enabled and (not can_value or review.get('state')=='matched') and any(k in missing_fields(p) for k in ('weight_g','dimensions_mm','title','image','url')):
+            p,step=await direct_facts.public_detail(db,p);evidence['steps'].append(step)
+        can_value=valuation_ready(p)
+        if (not can_value or review.get('state')=='matched') and any(k in missing_fields(p) for k in ('weight_g','dimensions_mm','attributes','title','image','url','fresh_dossier')):
             quote=sale_price(p)
             draft_price=intent['value'] if intent else None
             if draft_price is None and quote:
@@ -159,4 +184,9 @@ class PriceRepairModule:
             c.execute('CREATE TABLE IF NOT EXISTS plugin_repair_events(id INTEGER PRIMARY KEY,owner TEXT,sku TEXT,seller TEXT,at REAL,body TEXT)')
             c.execute('INSERT INTO plugin_repair_events(owner,sku,seller,at,body) VALUES(?,?,?,?,?)',(owner,sku,seller,time.time(),json.dumps(evidence)))
             SourceLibrary(db).put(owner,p,{'channel':'maozi-field-repair'},connection=c)
-        return {'state':'waiting' if missing else 'ready','reason':'missing:'+','.join(missing) if missing else 'complete_dossier','missing_fields':missing}
+        reason='missing:'+','.join(missing) if missing else 'complete_dossier'
+        if missing and any('采集箱已满' in str((step.get('diagnostic') or {}).get('api_message','')) for step in evidence['steps']):
+            reason='maozi_collection_box_full: '+reason
+        can_value=valuation_ready(p)
+        ready=not missing or (can_value and review.get('state')!='matched')
+        return {'state':'ready' if ready else 'waiting','reason':'valuation_inputs_ready' if ready and missing else reason,'missing_fields':missing}

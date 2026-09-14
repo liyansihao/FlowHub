@@ -3,7 +3,7 @@
   "private": true,
   "engines": {"node": ">=22"},
   "scripts": {
-    "test": "node --test tests/native-shop.test.mjs tests/storefront-auto.test.mjs",
+    "test": "node --test tests/native-shop.test.mjs tests/storefront-auto.test.mjs tests/category-cache.test.mjs",
     "test:integration": "node --test tests/*.test.mjs"
   },
   "dependencies": {"playwright": "1.62.1"}

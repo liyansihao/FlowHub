@@ -24,7 +24,8 @@ class ProfitInput(BaseModel):
     rub_per_cny: Decimal = Field(gt=0, le=1000)
     purchase_cny: Decimal = Field(ge=0, le=1000000)
     weight_g: Decimal = Field(gt=0, le=1000000)
-    dimensions_cm: tuple[Decimal, Decimal, Decimal]
+    dimensions_cm: tuple[Decimal, Decimal, Decimal] | None
+    weight_only: bool = False
     category: str = Field(default="", max_length=200)
     commission_row_id: str = Field(default="", max_length=100)
     type_id: str = Field(default="", max_length=30)
@@ -76,7 +77,9 @@ def catalog():
 
 
 def calculate(p: ProfitInput):
-    dims = sorted(p.dimensions_cm, reverse=True)
+    if p.dimensions_cm is None and not (p.weight_only and p.provider=='ChinaPost'):
+        raise ValueError('dimensions required for this route')
+    dims = sorted(p.dimensions_cm, reverse=True) if p.dimensions_cm is not None else []
     if any(not x.is_finite() or x <= 0 or x > 1000 for x in dims):
         raise ValueError("三边尺寸须为大于 0、不超过 1000 的厘米数")
     matched = None

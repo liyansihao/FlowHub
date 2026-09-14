@@ -1,0 +1,95 @@
+import json,time
+import pytest
+from flowhub.db import Database
+from flowhub.pipeline_modules.admission import schema as pipeline_schema
+from flowhub.pipeline_modules import draft_cleanup as cleanup
+
+
+def setup(tmp_path):
+ db=Database(tmp_path);pipeline_schema(db);cleanup.schema(db)
+ (tmp_path/'draft-cleanup.json').write_text(json.dumps({'enabled':True}))
+ with db.connect() as c:
+  owner=c.execute('SELECT id FROM users').fetchone()[0]
+  c.execute('INSERT INTO pipeline_campaigns VALUES(?,?,?,?)',(owner,1,'{}',0))
+  c.execute('INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)',(owner,'123','2','selling',json.dumps({'offer_id':'offer'}),0,0))
+ item={'sku':'123','seller':'2','snapshot':{'draft_id':8,'favorite_id':7,'source_key':'123','detail':{'skus':[{}]}},'queue':{'offer_id':'offer'},'context':{'store':{'config':{'shop_id':'4'}}},'source_record':'key'}
+ return db,owner,item
+
+
+class Fake:
+ def __init__(self,mode='ok'):self.present=True;self.writes=0;self.mode=mode
+ async def call(self,path,method='GET',params=None):
+  if path.endswith('collect/lists'):
+   return {'used':1000,'limit':1000,'total':1 if self.present else 0,'data':[{'id':8,'goods_id':'123','collect_from':'ozon'}] if self.present else []}
+  if path.endswith('online/lists'):
+   return {'data':[{'shop_id':'4','offer_id':'offer','online_status':'selling','stock':0 if self.mode=='no_stock' else 99}]}
+  if path.endswith('/detail'):return {'skus':[{}],'title':'backup'}
+  assert path=='/api.product.collect/del' and method=='DELETE' and params=={'ids':'8'}
+  self.writes+=1
+  if self.mode=='unknown_present':raise TimeoutError()
+  self.present=False
+  if self.mode=='lost_ack':raise TimeoutError()
+  return {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode',['ok','lost_ack','unknown_present','no_stock'])
+async def test_cleanup_exact_backup_and_unknown_delete_never_replayed(tmp_path,mode):
+ db,owner,item=setup(tmp_path);api=Fake(mode)
+ result=await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
+ with db.connect() as c:r=c.execute('SELECT * FROM draft_cleanup_receipts').fetchone()
+ if mode=='no_stock':assert r is None and api.writes==0
+ else:
+  assert db.open(r['body'])['fresh_detail']['title']=='backup'
+  assert r['state']==('unconfirmed' if mode=='unknown_present' else 'deleted')
+  assert result['deleted']==(0 if mode=='unknown_present' else 1)
+ await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
+ assert api.writes==(0 if mode=='no_stock' else 1)
+
+
+@pytest.mark.asyncio
+async def test_pause_prevents_delete_after_reads(tmp_path):
+ from flowhub.pipeline_modules.control import set_paused
+ db,owner,item=setup(tmp_path);api=Fake();set_paused(db,'seed',True)
+ await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
+ assert api.writes==0
+
+
+@pytest.mark.asyncio
+async def test_mismatched_source_and_below_threshold_do_not_delete(tmp_path):
+ db,owner,item=setup(tmp_path);api=Fake();item['sku']='999'
+ await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
+ assert api.writes==0
+ class Low(Fake):
+  async def call(self,path,method='GET',params=None):
+   d=await super().call(path,method,params)
+   if path.endswith('collect/lists'):d['used']=800
+   return d
+ api=Low();item['sku']='123'
+ assert (await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api))['state']=='below_threshold'
+ assert api.writes==0
+
+
+@pytest.mark.parametrize('kind',['eligible','recent','recovered','no_creation_proof'])
+def test_only_old_locally_created_sold_drafts_are_candidates(tmp_path,kind):
+ from flowhub.source_detail import SourceCollector
+ db,owner,item=setup(tmp_path)
+ ctx={'owner':owner,'candidate':{'source_key':'123'},'store':{'config':{'shop_id':'4'},'credentials':{'erp_token':'test'}}}
+ with db.connect() as c:
+  c.execute('INSERT INTO stores(id,owner,name,kind,config,secret) VALUES(?,?,?,?,?,?)',('s',owner,'test','maozi',json.dumps(ctx['store']['config']),db.seal(ctx['store']['credentials'])))
+  c.execute('INSERT INTO plugin_routes VALUES(?,?,?,?,?,?)',(owner,'123','2','s',0,'test'))
+ collector=SourceCollector(db,ctx);snapshot=item['snapshot']
+ if kind=='recovered':snapshot['recovery']={'source':'exact-ozon-draft-list'}
+ if kind=='no_creation_proof':snapshot.pop('favorite_id')
+ collector.save('ready',snapshot)
+ if kind!='recent':
+  with db.connect() as c:c.execute('UPDATE source_details SET updated=?',(time.time()-7200,))
+ assert bool(cleanup.candidates(db,owner,cleanup.config(db)))==(kind=='eligible')
+
+
+@pytest.mark.asyncio
+async def test_unstable_pagination_cannot_prove_absence():
+ class Moving:
+  async def call(self,path,method='GET',params=None):
+   return {'total':101,'data':[{'id':i} for i in range(100)] if params['page']==1 else [{'id':99}]}
+ with pytest.raises(ValueError,match='unstable'):await cleanup.listing(Moving())
