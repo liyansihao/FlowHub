@@ -79,7 +79,7 @@ async def screen(candidate, api_key="", *, ranking=None):
         process = None
         try:
             if os.environ.get('FLOWHUB_COMPAREBOT_WARM') == '1':
-                from .comparebot_process import screen as warm_screen
+                from .comparebot_process import ScreeningFailure, screen as warm_screen
                 options = dict(manifest=str(inputs), output=str(output), product_id=str(candidate['source_key']),
                                top_k=10, device=os.environ.get('FLOWHUB_COMPAREBOT_DEVICE'))
                 if ranking is not None:
@@ -87,7 +87,14 @@ async def screen(candidate, api_key="", *, ranking=None):
                                    qwen_match_min_similarity=.82, qwen_mismatch_max_similarity=.64,
                                    qwen_model=os.environ.get('QWEN_VL_MODEL','qwen3-vl-plus'),
                                    qwen_base_url=os.environ.get('DASHSCOPE_BASE_URL','https://dashscope.aliyuncs.com/compatible-mode/v1'))
-                await warm_screen('screen' if ranking is not None else 'rank', options, api_key)
+                try:
+                    await warm_screen('screen' if ranking is not None else 'rank', options, api_key)
+                except ScreeningFailure as error:
+                    if ranking is None and error.diagnostic.get('code') == 'no_candidates':
+                        return {'search_and_rank': {'query': manifest(candidate), 'candidates': []},
+                                'decision': {'outcome': 'manual_review', 'reason': 'no_supplier_candidates',
+                                             'selected_offer_id': None}}
+                    raise
             else:
                 process = await asyncio.create_subprocess_exec(
                     *args, cwd=folder, env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)

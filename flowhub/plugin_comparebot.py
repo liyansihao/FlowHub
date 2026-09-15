@@ -105,6 +105,8 @@ async def evaluate(db, owner, sku, seller):
                 report.update(state='rejected',reason='profit_below_workflow_threshold')
     except Exception as error:
         report.update(state='error',reason=str(error)[:180] if isinstance(error,ModuleError) else type(error).__name__)
+        if getattr(error, 'diagnostic', None):
+            report['diagnostic'] = error.diagnostic
     report['finished_at']=time.time()
     with db.connect() as c:
         c.execute('UPDATE plugin_reviews SET state=?,body=?,updated=? WHERE owner=? AND sku=? AND seller=?',

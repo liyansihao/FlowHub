@@ -4,9 +4,16 @@ import json
 import os
 import sys
 from pathlib import Path
+from .modules import ModuleError
 
 ROOT = Path(__file__).resolve().parents[1]
 _workers = {}
+
+
+class ScreeningFailure(ModuleError):
+    def __init__(self, diagnostic):
+        self.diagnostic = diagnostic
+        super().__init__(f"compareBot {diagnostic['stage']}/{diagnostic['code']}")
 
 
 class ScreeningWorker:
@@ -38,8 +45,17 @@ class ScreeningWorker:
                 self.process.stdin.write(request.encode())
                 await self.process.stdin.drain()
                 line = await asyncio.wait_for(self.process.stdout.readline(), 90 if mode == 'rank' else 70)
-                if not line or not json.loads(line).get('ok'):
+                if not line:
+                    raise RuntimeError('compareBot worker exited; review remains unapproved')
+                result = json.loads(line)
+                if not result.get('ok'):
+                    diagnostic = result.get('diagnostic')
+                    if result.get('reusable') and isinstance(diagnostic, dict):
+                        raise ScreeningFailure(diagnostic)
                     raise RuntimeError('compareBot worker failed; review remains unapproved')
+            except ScreeningFailure:
+                # The request failed upstream; the DINO model remains healthy.
+                raise
             except BaseException:
                 await self.stop()
                 raise

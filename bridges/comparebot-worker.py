@@ -41,7 +41,13 @@ async def main():
             result = {'ok': True}
         except Exception as error:
             # No exception text: upstream messages can include account credentials.
-            result = {'ok': False, 'error': type(error).__name__}
+            diagnostic = getattr(error, 'diagnostic', None)
+            if diagnostic is None and str(error) == '1688 image search returned no candidates':
+                diagnostic = {'stage': 'search1688', 'code': 'no_candidates'}
+            if diagnostic is None and str(error) == 'no 1688 candidate image could be downloaded':
+                diagnostic = {'stage': 'candidate_download', 'code': 'no_images'}
+            result = {'ok': False, 'error': type(error).__name__,
+                      'diagnostic': diagnostic, 'reusable': diagnostic is not None}
         print(json.dumps(result), flush=True)
 
 
