@@ -21,17 +21,18 @@ def fresh(detail,key,now):
  return valid and isinstance(at,(int,float)) and 0<=now-at<21600
 
 
-def merge_fields(product,fields,source,observed_at):
+def merge_fields(product,fields,source,observed_at,*,now=None):
+ now=observed_at if now is None else now
  p=copy.deepcopy(product);d=p.setdefault('plugin_detail',{});applied=[]
  # Preserve field timestamps before advancing the aggregate snapshot timestamp.
  obs=d.setdefault('field_observations',{})
  for key in FIELDS:
   if key in d and key not in obs:obs[key]={'source':d.get('contract','existing'),'observed_at':d.get('observed_at',0)}
  for key,value in fields.items():
-  if key not in FIELDS or fresh(d,key,observed_at):continue
-  if not fresh({key:value,'observed_at':observed_at},key,observed_at):continue
+  if key not in FIELDS or fresh(d,key,now):continue
+  if not fresh({key:value,'observed_at':observed_at},key,now):continue
   d[key]=value;obs[key]={'source':source,'observed_at':observed_at,'sku':str(p['sku'])};applied.append(key)
- if all(fresh(d,key,observed_at) for key in FIELDS):
+ if all(fresh(d,key,now) for key in FIELDS):
   d.update(sku=str(p['sku']),observed_at=min(obs[k]['observed_at'] for k in FIELDS),contract='direct-field-dossier-v1')
  return p,applied
 

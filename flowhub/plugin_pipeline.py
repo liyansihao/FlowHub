@@ -75,7 +75,8 @@ async def tick(db, lane=None):
               WHEN json_extract(q.body,'$.phase') IN ('reconciling','sync_pending','submitting','favorite_pending') THEN 1
               WHEN json_extract(q.body,'$.phase')='ready' THEN 2
               WHEN q.state='publishing' THEN 3
-              ELSE 4 END,q.due LIMIT 1""", (now, now, *(RECONCILE if lane in ('submit','reconcile') else ()))).fetchone()
+              ELSE 4 END,
+              CASE WHEN q.state='needs_fields' AND json_extract(q.body,'$.pending_publication_fields') IS NOT NULL THEN 0 ELSE 1 END,q.due LIMIT 1""", (now, now, *(RECONCILE if lane in ('submit','reconcile') else ()))).fetchone()
         if not r:return False
         if r['state']=='needs_fields':
             campaign=c.execute('SELECT body FROM pipeline_campaigns WHERE owner=? AND enabled=1',(r['owner'],)).fetchone() if c.execute("SELECT 1 FROM sqlite_master WHERE name='pipeline_campaigns'").fetchone() else None

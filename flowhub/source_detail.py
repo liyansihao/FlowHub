@@ -49,6 +49,7 @@ class SourceAcquisitionFailure(ModuleError):
 
 class SourceCollector:
     recovery_pages = {}
+    read_failures = {}
     def __init__(self, db, context):
         self.db, self.c = db, context
         self.keys = context["store"]["credentials"]
@@ -70,12 +71,40 @@ class SourceCollector:
             )
 
     async def call(self, path, method="GET", query=None, body=None):
-        return await request(path, method, self.keys, query, body)
+        # Old unresolved drafts must not each pay a full timeout during an outage.
+        # Writes keep their original one-shot journal semantics and never use this gate.
+        scope=(self.c['owner'],hashlib.sha256(self.keys.get('erp_token','').encode()).hexdigest(),path)
+        failures,until=self.read_failures.get(scope,(0,0))
+        if method=='GET' and time.monotonic()<until:
+            raise SourceAcquisitionFailure('CONNECT_TIMEOUT_BACKOFF',{'operation':path,'retry_after_ms':60000})
+        try:
+            result=await request(path, method, self.keys, query, body)
+            if method=='GET':self.read_failures.pop(scope,None)
+            return result
+        except Exception as error:
+            code=str(error).lower()
+            network=isinstance(error,TimeoutError) or any(v in code for v in ('connect_timeout','etimedout','econnreset','enotfound','fetch failed'))
+            if method=='GET' and network:
+                failures+=1
+                self.read_failures[scope]=(failures,time.monotonic()+60 if failures>=3 else 0)
+            raise
 
     def load(self):
         with self.db.connect() as db:
             row = db.execute("SELECT * FROM source_details WHERE key=?", (self.key,)).fetchone()
         return (row["state"], self.db.open(row["body"]), row["updated"]) if row else ("new", {}, 0)
+
+    def cached_snapshot(self, *, now=None):
+        """Reuse only a completed, exact-account/SKU snapshot; never resume writes here."""
+        now = time.time() if now is None else now
+        state, data, updated = self.load()
+        observed = data.get('observed_at')
+        if (state == 'ready' and str(data.get('source_key')) == self.sku
+                and isinstance(observed, (int, float)) and not isinstance(observed, bool)
+                and 0 <= now - updated < 21600 and 0 <= now - observed < 21600
+                and len((data.get('detail') or {}).get('skus') or []) == 1):
+            return data
+        return None
 
     def save(self, state, data):
         with self.db.connect() as db:

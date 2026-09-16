@@ -9,6 +9,7 @@ from ..source_library import SourceLibrary
 from ..evaluation_requirements import sale_price
 from ..plugin_detail import positive
 from .pricing import approved_price_intent
+from .repair_reads import RepairReads
 
 
 def missing_fields(product):
@@ -34,7 +35,7 @@ def valuation_ready(product):
         return False
 
 
-def merge_draft(product, snapshot):
+def merge_draft(product, snapshot, *, now=None):
     if str(snapshot.get('source_key'))!=str(product['sku']):raise ValueError('draft_source_mismatch')
     detail=snapshot.get('detail') or {}
     if len(detail.get('skus') or [])!=1:raise ValueError('ambiguous_draft_variant')
@@ -43,7 +44,7 @@ def merge_draft(product, snapshot):
             'dimensions_mm':[detail.get(k) for k in ('package_length','package_width','package_height')],
             'attributes':detail.get('common_attributes')}
     from .direct_facts import merge_fields
-    p,applied=merge_fields(p,fields,'maozi-erp-draft',snapshot['observed_at'])
+    p,applied=merge_fields(p,fields,'maozi-erp-draft',snapshot['observed_at'],now=now)
     merged=p['plugin_detail'];merged['erp_draft_id']=snapshot.get('draft_id')
     categories=detail.get('category_id') or []
     if len(categories)>1 and not merged.get('description_category_id'):merged['description_category_id']=categories[1]
@@ -94,8 +95,18 @@ class PriceRepairModule:
         if can_value and review.get('state')!='matched':
             return {'state':'ready','reason':'valuation_inputs_ready','missing_fields':before}
         evidence={'at':time.time(),'before':before,'steps':[]};context={'store':{'config':json.loads(store['config']),'credentials':db.open(store['secret'])}}
-        p,direct_step=await direct_identity_fields(p,context)
-        evidence['steps'].append(direct_step)
+        # Read completed local drafts before spending any remote request or conversion.
+        # The collector key binds owner, ERP account and SKU; merge preserves good fields.
+        if any(k in before for k in ('weight_g','dimensions_mm','attributes','title','image','url','fresh_dossier')):
+            collector=SourceCollector(db,context|{'owner':owner,'candidate':{'source_key':sku}})
+            cached=collector.cached_snapshot()
+            if cached:
+                p=merge_draft(p,cached,now=time.time())
+                evidence['steps'].append({'source':'maozi-erp-draft-cache','draft_id':cached.get('draft_id'),
+                                          'observed_at':cached['observed_at']})
+        if any(k in missing_fields(p) for k in ('title','image')):
+            p,direct_step=await direct_identity_fields(p,context)
+            evidence['steps'].append(direct_step)
         # Preserve the real approved asking price and its original decision time.
         # This does not claim the old competitor observation has become fresh.
         intent=approved_price_intent(review)
@@ -127,7 +138,8 @@ class PriceRepairModule:
         async def read(kind,request):
             began=time.monotonic();method,path,kwargs=request
             try:
-                response=await MaoziPublisher(context).erp(method,path,**kwargs)
+                response=(await RepairReads.get(MaoziPublisher(context),path,params=kwargs.get('params'))
+                          if method=='GET' else await MaoziPublisher(context).erp(method,path,**kwargs))
                 return kind,response,{'source':kind,'endpoint':path,'elapsed_ms':round((time.monotonic()-began)*1000),'ok':True}
             except Exception as error:
                 return kind,{}, {'source':kind,'endpoint':path,'elapsed_ms':round((time.monotonic()-began)*1000),'reason':type(error).__name__,'ok':False}
@@ -160,7 +172,7 @@ class PriceRepairModule:
                 if quote['currency']=='CNY':draft_price=quote['value']
                 else:
                     try:
-                        exchange=await MaoziPublisher(context).erp('GET','/api.exchange_rate/index')
+                        exchange=await RepairReads.get(MaoziPublisher(context),'/api.exchange_rate/index')
                     except Exception as error:
                         evidence['steps'].append({'source':'maozi-RUBCNY','reason':type(error).__name__})
                         exchange={}
