@@ -67,9 +67,13 @@ def admit_one(db, owner, now=None):
         capacity_schema(c)
         stores=[]
         for sid in policy['store_ids']:
-            store=c.execute('SELECT id,config FROM stores WHERE owner=? AND id=? AND verified=1',(owner,sid)).fetchone()
+            store=c.execute('SELECT id,config,secret FROM stores WHERE owner=? AND id=? AND verified=1',(owner,sid)).fetchone()
             if store and not c.execute("SELECT 1 FROM store_publication_capacity WHERE owner=? AND store_id=? AND state='blocked'",(owner,sid)).fetchone():
                 config=json.loads(store['config'])
+                from ..official_publication import backend
+                if backend(config) != 'maozi':
+                    credentials=db.open(store['secret'])
+                    if not credentials.get('client_id') or not credentials.get('api_key'):continue
                 if all(config.get(k) for k in ('shop_id','warehouse_id','watermark_id')):stores.append(store)
         if not stores:return {'state':'blocked','reason':'no_available_target_store'}
         # Alternate fresh discoveries and oldest backlog without starving either.

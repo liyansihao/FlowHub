@@ -85,10 +85,44 @@ async def direct_identity_fields(product, context):
         return product,step|{'reason':type(error).__name__,'fallback':'maozi-direct'}
 
 
+async def official_dossier_fields(db, owner, product, review, context):
+    """Validate supplementary facts with official schema; never import or set stock."""
+    from .. import official_api
+    from ..official_publication import LocalPublisher, hydrate_local_dossier
+    from ..ozon_direct import dossier
+    from ..modules import ModuleError
+
+    keys = context['store']['credentials']
+    if not keys.get('client_id') or not keys.get('api_key'):
+        return product, ['official_credentials_required']
+    profit = review.get('result', {}).get('evidence', {}).get('profit', {})
+    candidate = review.get('candidate', {}) | {
+        'source_key': str(product['sku']), 'origin': product,
+        'title': product.get('title', ''), 'image': product.get('image', ''),
+        'price': profit.get('sell_price_cny'),
+    }
+    packet = context | {'owner': owner, 'candidate': candidate, 'match': review.get('result', {}),
+                        'idempotency_key': 'dossier-check-' + str(product['sku'])}
+    async with official_api.client(db, keys) as api:
+        publisher = LocalPublisher(packet, db, api)
+        issues = await hydrate_local_dossier(publisher, db, packet)
+        _, missing = dossier(publisher.c)
+        if issues or missing:
+            return product, list(dict.fromkeys(issues + missing))
+        try:
+            prepared = await publisher.invoke('prepare')
+        except ModuleError as error:
+            return product, [str(error)]
+        if not prepared.get('ready'):
+            return product, prepared.get('missing') or ['official_dossier_invalid']
+        return product | {'ozon_dossier': prepared['source_dossier']}, []
+
+
 class PriceRepairModule:
     name='seed'
 
     async def run(self, db, owner, sku, seller, *, full_dossier=False):
+        official_pending=False
         with db.connect() as c:
             route=c.execute('SELECT * FROM plugin_routes WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()
             if not route:return {'state':'waiting','reason':'route_missing'}
@@ -98,6 +132,7 @@ class PriceRepairModule:
             if c.execute("SELECT 1 FROM sqlite_master WHERE name='plugin_pipeline'").fetchone():
                 queued=c.execute('SELECT body FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()
                 full_dossier=full_dossier or bool(queued and json.loads(queued[0]).get('repair_full_dossier'))
+                official_pending=bool(queued and json.loads(queued[0]).get('official_dossier_pending'))
         if not store or not product:return {'state':'waiting','reason':'source_or_store_missing'}
         p=json.loads(product[0]);review=json.loads(row[0]) if row else {};before=missing_fields(p)
         # Measurement can proceed without the full publishing dossier.
@@ -105,7 +140,7 @@ class PriceRepairModule:
         require_dossier=full_dossier or review.get('state') in ('matched','needs_review')
         if can_value and not require_dossier:
             return {'state':'ready','reason':'valuation_inputs_ready','missing_fields':before}
-        evidence={'at':time.time(),'before':before,'steps':[]};context={'store':{'config':json.loads(store['config']),'credentials':db.open(store['secret'])}}
+        evidence={'at':time.time(),'before':before,'steps':[]};context={'store':{'id':route['store_id'],'config':json.loads(store['config']),'credentials':db.open(store['secret'])}}
         # Read completed local drafts before spending any remote request or conversion.
         # The collector key binds owner, ERP account and SKU; merge preserves good fields.
         if any(k in before for k in ('weight_g','dimensions_mm','attributes','title','image','url','fresh_dossier')):
@@ -176,7 +211,7 @@ class PriceRepairModule:
         if direct_enabled and (not can_value or require_dossier) and any(k in missing_fields(p) for k in ('weight_g','dimensions_mm','title','image','url')):
             p,step=await direct_facts.public_detail(db,p);evidence['steps'].append(step)
         can_value=valuation_ready(p)
-        if (not can_value or require_dossier) and any(k in missing_fields(p) for k in ('weight_g','dimensions_mm','attributes','title','image','url','fresh_dossier')):
+        if ((not can_value or require_dossier) and any(k in missing_fields(p) for k in ('weight_g','dimensions_mm','attributes','title','image','url','fresh_dossier'))) or (official_pending and not p.get('ozon_dossier',{}).get('attributes')):
             quote=sale_price(p)
             if quote is None:
                 # A stored real reference price may seed acquisition metadata only.
@@ -212,7 +247,12 @@ class PriceRepairModule:
                 evidence['steps'].append({'source':'maozi-draft','reason':str(error)})
             except Exception as error:
                 evidence['steps'].append({'source':'maozi-draft','reason':str(error) if getattr(error,'diagnostic',None) is not None else type(error).__name__,'diagnostic':getattr(error,'diagnostic',{})})
-        missing=missing_fields(p);evidence['after']=missing
+        missing=missing_fields(p)
+        if official_pending:
+            p,official_missing=await official_dossier_fields(db,owner,p,review,context)
+            missing=list(dict.fromkeys(missing+official_missing))
+            evidence['steps'].append({'source':'official-dossier-validation','missing_fields':official_missing})
+        evidence['after']=missing
         p['collection_evidence']=(p.get('collection_evidence') or {})|{'missing_fields':missing,'last_repair':evidence}
         with db.connect() as c:
             c.execute('CREATE TABLE IF NOT EXISTS plugin_repair_events(id INTEGER PRIMARY KEY,owner TEXT,sku TEXT,seller TEXT,at REAL,body TEXT)')

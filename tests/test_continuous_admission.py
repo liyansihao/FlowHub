@@ -10,7 +10,7 @@ def setup(tmp_path):
     db=Database(tmp_path);lib=SourceLibrary(db);schema(db)
     with db.connect() as c:
         owner=c.execute('SELECT id FROM users').fetchone()[0]
-        c.execute('INSERT INTO stores(id,owner,name,kind,config,secret,verified) VALUES(?,?,?,?,?,?,1)',('test',owner,'test','maozi',json.dumps({'shop_id':'1','warehouse_id':'2','watermark_id':'3'}),db.seal({})))
+        c.execute('INSERT INTO stores(id,owner,name,kind,config,secret,verified) VALUES(?,?,?,?,?,?,1)',('test',owner,'test','maozi',json.dumps({'shop_id':'1','warehouse_id':'2','watermark_id':'3'}),db.seal({'client_id':'synthetic','api_key':'synthetic'})))
         policy={'run_id':'test','store_ids':['test'],'max_inflight':1,'allow_unknown':True,'retain_captured_asking_price':True}
         c.execute('INSERT INTO pipeline_campaigns VALUES(?,?,?,?)',(owner,1,json.dumps(policy),time.time()))
     for sku in ('1','2'):
@@ -268,3 +268,13 @@ async def test_explicit_single_repair_runs_without_resuming_campaign(tmp_path,mo
     assert seen==['2'] and admit_one(db,owner)['state']=='paused'
     with pytest.raises(ValueError):await pipeline.tick(db,lane='seed_repair',run_paused=True)
     with pytest.raises(ValueError):await pipeline.tick(db,lane='submit',target=(owner,'2','3'),run_paused=True)
+
+
+def test_new_official_admission_skips_store_without_credentials(tmp_path):
+    db,owner=setup(tmp_path)
+    with db.connect() as c:c.execute('UPDATE stores SET secret=?',(db.seal({'erp_token':'test'}),))
+    assert admit_one(db,owner)=={'state':'blocked','reason':'no_available_target_store'}
+    with db.connect() as c:
+        assert not c.execute('SELECT 1 FROM plugin_pipeline').fetchone()
+        c.execute("UPDATE stores SET config=json_set(config,'$.publication_backend','maozi')")
+    assert admit_one(db,owner)['state']=='admitted'

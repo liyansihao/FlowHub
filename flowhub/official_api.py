@@ -30,6 +30,7 @@ READS = set(METADATA_TTL) | {
     "/v2/warehouse/list",
     "/v3/product/info/list",
     "/v4/product/info/limit",
+    "/v5/product/info/prices",
     "/v1/product/import/info",
     "/v2/product/info/stocks-by-warehouse/fbs",
 }

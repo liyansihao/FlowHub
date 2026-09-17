@@ -235,3 +235,24 @@ def test_cached_draft_refreshes_fields_stale_now_using_real_observation_time():
     unchanged=merge_draft(p,packet,now=now)
     assert unchanged['plugin_detail']['observed_at']==now-22000
     assert unchanged['plugin_detail']['weight_g']==25
+
+
+async def test_official_supplement_cannot_return_ready_with_only_generic_fields(tmp_path,monkeypatch):
+    from unittest.mock import AsyncMock
+    from flowhub.source_detail import SourceCollector
+    db,owner=setup(tmp_path)
+    with db.connect() as c:
+        product=json.loads(c.execute('SELECT body FROM sourcing_products').fetchone()[0])
+        product['proposed_sale_price']={'value':30,'currency':'CNY','observed_at':time.time()}
+        c.execute('UPDATE sourcing_products SET body=?',(json.dumps(product),))
+        c.execute('CREATE TABLE plugin_pipeline(owner TEXT,sku TEXT,seller TEXT,body TEXT)')
+        c.execute('INSERT INTO plugin_pipeline VALUES(?,?,?,?)',(owner,'1','2',json.dumps({'repair_full_dossier':True,'official_dossier_pending':True})))
+    collect=AsyncMock(return_value={'source_key':'1','observed_at':time.time(),'draft_id':5,
+        'detail':{'skus':[{}],'package_weight':20,'package_length':100,'package_width':100,
+                  'package_height':10,'common_attributes':[{'id':1}],'category_id':[]}})
+    monkeypatch.setattr(SourceCollector,'collect',collect)
+    check=AsyncMock(side_effect=lambda db,owner,p,review,context:(p,['85：必填属性缺失']))
+    monkeypatch.setattr('flowhub.pipeline_modules.repair.official_dossier_fields',check)
+    result=await PriceRepairModule().run(db,owner,'1','2')
+    assert result['state']=='waiting' and result['missing_fields']==['85：必填属性缺失']
+    collect.assert_awaited_once();check.assert_awaited_once()

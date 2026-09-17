@@ -16,7 +16,7 @@ from .source_library import fingerprint
 
 
 def backend(config):
-    value = config.get("publication_backend", "official_preferred")
+    value = config.get("publication_backend", "official_only")
     if value not in ("official_preferred", "official_only", "maozi"):
         raise ValueError("invalid_publication_backend")
     return value
@@ -40,6 +40,29 @@ class LocalPublisher(OzonDirectPublisher):
         if not isinstance(result, dict):
             raise ValueError("invalid_official_response")
         return result
+
+
+async def hydrate_local_dossier(publisher, db, context):
+    """Use local facts plus official metadata, without source acquisition."""
+    if publisher.c['candidate'].get('origin', {}).get('ozon_dossier', {}).get('attributes'):
+        return []
+    from .source_detail import SourceCollector, map_detail
+    from .modules import ModuleError
+
+    snapshot = SourceCollector(db, context).cached_snapshot()
+    if not snapshot:
+        return []
+    mapping = snapshot.get('mapping')
+    try:
+        if (not mapping or mapping.get('mapping_version') != 3
+                or snapshot.get('mapping_client') != str(publisher.keys['client_id'])):
+            mapping = await map_detail(snapshot, publisher.c, publisher.seller)
+    except ModuleError as error:
+        return [str(error)]
+    issues = mapping.get('issues', []) + [f'{aid}：必填属性缺失' for aid in mapping.get('required_missing', [])]
+    if not issues:
+        publisher.c = publisher.c | {'prepared': {'source_dossier': mapping['dossier']}}
+    return issues
 
 
 async def advance_if_selected(db, owner, sku, seller):
@@ -82,9 +105,7 @@ async def advance_if_selected(db, owner, sku, seller):
         if not record and mode == "maozi":
             return None
         if not keys.get("client_id") or not keys.get("api_key"):
-            if record or mode == "official_only":
-                raise ValueError("official_credentials_required")
-            return None
+            raise ValueError("official_credentials_required")
         r = c.execute("SELECT body FROM plugin_reviews WHERE owner=? AND sku=? AND seller=?", key).fetchone()
         if not r:
             raise ValueError("review_missing")
@@ -133,31 +154,15 @@ async def advance_if_selected(db, owner, sku, seller):
         publisher = LocalPublisher(context, db, api)
         if record:
             publisher.c = publisher.c | {"prepared": record["prepared"]}
-        if not record and not candidate.get("origin", {}).get("ozon_dossier", {}).get("attributes"):
-            from .source_detail import SourceCollector, map_detail
-
-            snapshot = SourceCollector(db, context).cached_snapshot()
-            if snapshot:
-                mapping = snapshot.get("mapping")
-                if (
-                    not mapping
-                    or mapping.get("mapping_version") != 3
-                    or snapshot.get("mapping_client") != str(keys["client_id"])
-                ):
-                    mapping = await map_detail(snapshot, publisher.c, publisher.seller)
-                if not mapping.get("issues"):
-                    publisher.c = publisher.c | {"prepared": {"source_dossier": mapping["dossier"]}}
+        mapping_issues = await hydrate_local_dossier(publisher, db, context) if not record else []
         item, missing = dossier(publisher.c)
+        missing.extend(mapping_issues)
         if not record and missing:
-            if mode == "official_only":
-                return {
-                    "phase": "manual_review",
-                    "verified": False,
-                    "reason": "official_dossier_incomplete",
-                    "missing_fields": missing,
-                    "backend": "official",
-                }
-            return None
+            return {
+                "phase": "awaiting_dossier", "needs_dossier": True,
+                "verified": False, "reason": "official_dossier_incomplete",
+                "missing_fields": missing, "backend": "official",
+            }
         if not record:
             legacy.approved(review, rules, allow_unknown=allow_unknown)
             dimensions = {
@@ -253,7 +258,7 @@ async def advance_if_selected(db, owner, sku, seller):
             prepared = await publisher.invoke("prepare")
             if not prepared.get("ready"):
                 return {
-                    "phase": "manual_review",
+                    "phase": "awaiting_dossier", "needs_dossier": True,
                     "verified": False,
                     "reason": "official_dossier_invalid",
                     "missing_fields": prepared.get("missing", []),
@@ -263,6 +268,7 @@ async def advance_if_selected(db, owner, sku, seller):
             # Pin first: a crash must never send the same intent to the ERP fallback.
             record = {
                 "backend": "official",
+                "source_dedupe": "local_official_v1",
                 "owner": owner,
                 "sku": sku,
                 "seller": seller,
@@ -303,9 +309,12 @@ async def advance_if_selected(db, owner, sku, seller):
                     raise ValueError("official_intent_mismatch")
                 try:
                     await write_guard(plan, ListedProduct("", "", plan.shop_id, offer, "", ""))
-                    from .official_source_guard import verify_unimported
+                    from .official_source_guard import verify_local_official, verify_unimported
 
-                    await verify_unimported(db, owner, sku, keys)
+                    if record.get('source_dedupe') == 'local_official_v1':
+                        await verify_local_official(db, owner, sku, seller, offer, api)
+                    else:
+                        await verify_unimported(db, owner, sku, keys, seller=seller)
                     legacy.require_source_modes(
                         (),
                         candidate["origin"].get("plugin_detail", {}).get("monthly_sales", {}),

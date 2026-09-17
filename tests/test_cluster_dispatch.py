@@ -75,3 +75,11 @@ def test_platform_wait_releases_device_but_live_step_does_not(tmp_path):
     assert device_for(tmp_path,p,('o','1','s'))==d['device_id']
     with hub.connect() as c:
         assert c.execute("SELECT count(*) FROM erp_assignments WHERE state='waiting_on_platform'").fetchone()[0]==1
+
+
+def test_new_official_dossier_wait_releases_old_transport_assignment(tmp_path):
+    hub,relay,d,p=setup(tmp_path)
+    assert device_for(tmp_path,p,('o','0','s'))==d['device_id']
+    with sqlite3.connect(tmp_path/'flowhub.sqlite3') as c:
+        c.execute("UPDATE plugin_pipeline SET state='needs_fields',body=? WHERE sku='0'",(json.dumps({'phase':'awaiting_dossier','official_dossier_pending':True}),))
+    assert device_for(tmp_path,p,('o','1','s'))==d['device_id']

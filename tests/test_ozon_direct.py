@@ -360,3 +360,14 @@ async def test_title_repair_never_overwrites_blocked_or_unrelated_product(port, 
     else:
         assert (await port.invoke("reconcile"))["issue"]
     assert all(p != "/v3/product/import" for p, _ in port.calls)
+
+
+def test_vat_profile_requires_three_exact_consistent_cny_samples():
+    from flowhub.store_vat import verified_sample_profile
+    offers=['a','b','c']
+    items=[{'offer_id':o,'price':{'vat':0,'currency_code':'CNY'}} for o in offers]
+    assert verified_sample_profile('123',offers,items)['vat']=='0'
+    for bad in (items[:2],items+[items[0]],items[:2]+[{'offer_id':'other','price':items[2]['price']}],
+                items[:2]+[{'offer_id':'c','price':{'vat':0.2,'currency_code':'CNY'}}],
+                items[:2]+[{'offer_id':'c','price':{'vat':0,'currency_code':'RUB'}}]):
+        with pytest.raises(ValueError):verified_sample_profile('123',offers,bad)

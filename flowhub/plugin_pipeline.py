@@ -171,13 +171,17 @@ async def tick(db, lane=None, *, target=None, run_paused=False):
                 state='publishing'
             body['submitted']=bool(body.get('submitted')) or result['phase'] in ('reconciling','sync_pending','stock_ready','stock_pending','stock_verified')
             if result.get('verified'):state='selling'
+            elif result.get('needs_dossier'):
+                state='needs_fields';delay=300
+                body.update(repair_full_dossier=True,official_dossier_pending=True,
+                            pending_publication_fields=result.get('missing_fields',[]))
             elif result.get('retryable_readback'):
                 state='awaiting_remote';delay=3600 if result.get('reason')=='favorite_visibility_exhausted' else 900 if result.get('phase')=='manual_review' else 300
                 if result.get('reason')=='favorite_visibility_exhausted':
                     unchanged=(result.get('favorite_recovery') or {}).get('unchanged_checks',0)
                     delay=min(21600,3600*2**min(max(0,unchanged-1),3))
             elif result['phase'] in ('failed','manual_review'):state='needs_review'
-            if state!='awaiting_remote':
+            if state not in ('awaiting_remote','needs_fields'):
                 with db.connect() as c:
                     campaign=c.execute('SELECT body FROM pipeline_campaigns WHERE owner=? AND enabled=1',(key[0],)).fetchone() if c.execute("SELECT 1 FROM sqlite_master WHERE name='pipeline_campaigns'").fetchone() else None
                 policy=json.loads(campaign[0]) if campaign else {}

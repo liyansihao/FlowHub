@@ -37,7 +37,8 @@ def device_for(directory, policy, key):
                 if current and current[0] in ('selling','needs_review','failed','rejected'):
                     c.execute('UPDATE erp_assignments SET state=?,finished=? WHERE id=?',
                               (current[0],time.time(),active['id']))
-                elif current and json.loads(current[1]).get('phase') in ('reconciling','sync_pending','stock_pending'):
+                elif current and (json.loads(current[1]).get('phase') in ('reconciling','sync_pending','stock_pending')
+                                  or current[0]=='needs_fields' and json.loads(current[1]).get('official_dossier_pending')):
                     # A waiting platform response does not reserve a whole device.
                     # Never hand off the transport during an in-flight pipeline step.
                     has_leases=prod.execute("SELECT 1 FROM sqlite_master WHERE name='plugin_pipeline_leases'").fetchone()
