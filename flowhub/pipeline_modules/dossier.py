@@ -57,7 +57,8 @@ def refresh_unchanged_plan(record, latest):
     """Refresh evidence before dispatch only if the immutable economics still match."""
     snapshot=reviewed_snapshot(latest)
     if not snapshot:raise ValueError('fresh_source_packet_required')
-    plan=record['plan'];match=latest['result'];profit=match['evidence']['profit']
+    plan=record['plan']
+    match=latest['result'];profit=match['evidence']['profit']
     if (str(match['supplier_id'])!=str(plan['supplier_identity'])
         or float(match['purchase'])!=float(plan['purchase_price_cny'])
         or float(profit['sell_price_cny'])!=float(plan['sell_price_cny'])):
@@ -107,7 +108,8 @@ def repaired_review(review, product, now=None, *, allow_manual=False):
     from .pricing import approved_price_intent
     from ..plugin_publication import same_postal_package
     now=time.time() if now is None else now
-    if approved_price_intent(review,now) is None:
+    intent=approved_price_intent(review,now)
+    if intent is None:
         # Supplement a still-current human comparison without turning it into approval.
         # The automatic repair-to-publication path does not enable this option.
         if not allow_manual:return None
@@ -132,7 +134,13 @@ def repaired_review(review, product, now=None, *, allow_manual=False):
         if latest['origin'].get('seller_id')!=old['origin'].get('seller_id'):return None
         if latest['origin'].get('category_id')!=old['origin'].get('category_id'):return None
         quote=latest['origin']['price_evidence'];prior=old['origin']['price_evidence']
-        if (quote['currency'],float(quote['value']))!=(prior['currency'],float(prior['value'])):return None
+        same_quote=(quote['currency'],float(quote['value']))==(prior['currency'],float(prior['value']))
+        # Repair preserves the already-approved CNY asking price, not a new
+        # exchange-rate calculation. Its original RUB reference stays attached.
+        same_approved_price=bool(intent and quote.get('source')=='approved-listing-price-intent'
+            and quote['currency']=='CNY' and float(quote['value'])==intent['value']
+            and quote.get('observed_at')==intent['decided_at'] and quote.get('source_quote')==prior)
+        if not (same_quote or same_approved_price):return None
         updated=copy.deepcopy(review);updated['candidate']=latest
         snapshot=reviewed_snapshot(updated,now)
         if not snapshot or not same_postal_package(snapshot['detail'],review['result']['evidence']['profit']['input']):return None

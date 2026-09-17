@@ -278,3 +278,16 @@ def test_new_official_admission_skips_store_without_credentials(tmp_path):
         assert not c.execute('SELECT 1 FROM plugin_pipeline').fetchone()
         c.execute("UPDATE stores SET config=json_set(config,'$.publication_backend','maozi')")
     assert admit_one(db,owner)['state']=='admitted'
+
+
+def test_official_dossier_backlog_does_not_starve_bounded_fresh_repairs(tmp_path):
+    db,owner=setup(tmp_path)
+    with db.connect() as c:
+        for i in range(60):
+            c.execute('INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)',(owner,str(i+100),'3','needs_fields',json.dumps({'official_dossier_pending':True}),0,0))
+    assert admit_one(db,owner)['state']=='admitted'
+    with db.connect() as c:
+        for i in range(7):
+            c.execute('INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)',(owner,str(i+200),'3','needs_fields','{}',0,0))
+    result=admit_one(db,owner)
+    assert result['state']=='backpressure' and result['repair_pending']==8 and result['publication_repair_pending']==60

@@ -57,6 +57,11 @@ def admit_one(db, owner, now=None):
         active=c.execute("SELECT count(*) FROM plugin_pipeline WHERE owner=? AND state IN ('queued','evaluating','publishing') AND NOT ("+remote_sql+")",(owner,)).fetchone()[0]
         if remote>=policy.get('max_remote_pending',40):return {'state':'backpressure','remote_pending':remote}
         repairs=c.execute("SELECT count(*) FROM plugin_pipeline WHERE owner=? AND state='needs_fields'",(owner,)).fetchone()[0]
+        publication_repairs=c.execute("SELECT count(*) FROM plugin_pipeline WHERE owner=? AND state='needs_fields' AND json_extract(body,'$.official_dossier_pending')=1",(owner,)).fetchone()[0]
+        valuation_repairs=repairs-publication_repairs
+        # Existing post-review dossier backlog has its own lane. Admit a small,
+        # bounded fresh cohort instead of letting it stop all new acquisition.
+        repair_limit=min(policy.get('max_repair_pending',48),8) if publication_repairs else policy.get('max_repair_pending',48)
         active+=c.execute("SELECT count(*) FROM plugin_pipeline q JOIN plugin_pipeline_leases l USING(owner,sku,seller) WHERE q.owner=? AND q.state='needs_fields' AND l.expires>?",(owner,now)).fetchone()[0]
         if active>=max(1,policy.get('max_inflight',12)-(1 if repairs else 0)):return {'state':'backpressure','active':active}
         promoted=promote_ready_candidate(c,db,owner,now)
@@ -104,7 +109,7 @@ def admit_one(db, owner, now=None):
                 p['proposed_sale_price']={**quote,'observed_at':now,'source':'campaign-asking-price-decision','run_id':policy['run_id'],'reference_observed_at':p.get('collected_at')}
             from .repair import valuation_ready
             ready=valuation_ready(p)
-            if not ready and repairs>=policy.get('max_repair_pending',48):continue
+            if not ready and valuation_repairs>=repair_limit:continue
             expires=min(now+policy.get('write_window_seconds',21600),policy.get('until') or float('inf'))
             c.execute('INSERT INTO pipeline_admissions VALUES(?,?,?,?,?)',(*key,now,json.dumps(stamp)))
             c.execute('INSERT INTO plugin_routes VALUES(?,?,?,?,?,?)',(*key,target['id'],expires,policy['run_id']))
@@ -113,7 +118,8 @@ def admit_one(db, owner, now=None):
             c.execute("INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)",(*key,'queued' if ready else 'needs_fields',json.dumps({'requested_at':now,'submitted':False,'campaign_run_id':policy['run_id']}),now,0))
             SourceLibrary(db).put(owner,p,{'channel':'continuous-admission','run_id':policy['run_id']},connection=c)
             return {'state':'admitted','sku':row['sku'],'seller':row['seller']}
-        if repairs>=policy.get('max_repair_pending',48):return {'state':'backpressure','repair_pending':repairs}
+        if valuation_repairs>=repair_limit:
+            return {'state':'backpressure','repair_pending':valuation_repairs,**({'publication_repair_pending':publication_repairs} if publication_repairs else {})}
         return {'state':'source_exhausted','reason':'no_new_bound_source_candidate'}
 
 

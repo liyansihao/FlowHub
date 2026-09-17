@@ -52,7 +52,9 @@ def readback_delay(body, phase, verified=False, submission_priority=False):
     return delay
 
 
-async def tick(db, lane=None, *, target=None, run_paused=False):
+async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None):
+    if repair_kind not in (None,'publication','valuation') or (repair_kind and lane!='seed_repair'):
+        raise ValueError('invalid_repair_kind')
     if target is not None and (len(target)!=3 or not all(isinstance(v,str) and v for v in target)):
         raise ValueError('exact_pipeline_identity_required')
     if run_paused and (target is None or lane not in ('seed_repair','review')):
@@ -73,6 +75,8 @@ async def tick(db, lane=None, *, target=None, run_paused=False):
             'reconcile_history': " AND q.state IN ('publishing','awaiting_remote') AND json_extract(q.body,'$.phase')='manual_review'",
             'reconcile': " AND COALESCE(json_extract(q.body,'$.phase'),'')!='manual_review' AND q.state IN ('publishing','awaiting_remote') AND json_extract(q.body,'$.phase') IN (" + ','.join('?' for _ in RECONCILE) + ')',
         }[lane]
+        if repair_kind:
+            lane_sql += " AND COALESCE(json_extract(q.body,'$.official_dossier_pending'),0)" + ('=1' if repair_kind=='publication' else '!=1')
         now = time.time()
         r=c.execute("""SELECT q.* FROM plugin_pipeline q JOIN users u ON u.id=q.owner
             LEFT JOIN plugin_pipeline_leases l ON l.owner=q.owner AND l.sku=q.sku AND l.seller=q.seller
@@ -127,7 +131,8 @@ async def tick(db, lane=None, *, target=None, run_paused=False):
                             if state=='needs_review':body['reason']=synced.get('result',{}).get('reason','manual_same_product_review')
                             body.pop('pending_publication_fields',None)
                         else:
-                            c.execute('DELETE FROM plugin_reviews WHERE owner=? AND sku=? AND seller=?',key)
+                            from .pipeline_modules.repair_queue import preserve_review
+                            preserve_review(c,db,key,body)
             else:
                 repair=body.setdefault('repair_retry',{})
                 from .pipeline_modules.repair_retry import schedule
@@ -140,6 +145,9 @@ async def tick(db, lane=None, *, target=None, run_paused=False):
                 from .identity_review import evaluate as evaluate_identity
                 report=await evaluate_identity(db,*key)
                 body.pop('force_identity_review',None)
+            elif body.get('force_full_evaluation'):
+                report=await evaluate(db,*key,force=True)
+                body.pop('force_full_evaluation',None)
             else:report=await evaluate(db,*key)
             reason=report.get('reason') or report.get('result',{}).get('reason')
             decision=report.get('result',{}).get('evidence',{}).get('source',{}).get('comparebot',{}).get('decision',{})

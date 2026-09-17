@@ -33,12 +33,15 @@ async def run(db, *, review_workers=2, submit_workers=2, reconcile_workers=2, se
                 await asyncio.sleep(.5)
                 continue
             if name=='seed_repair' and index>0:
-                from .transport import StepTransport
-                if not StepTransport.healthy_for_more_work():
+                from .repair_queue import can_expand
+                if not can_expand(db):
                     await asyncio.sleep(5)
                     continue
             try:
-                if name in ('submit','reconcile'):
+                if name=='seed_repair' and seed_workers==2:
+                    from .repair_queue import tick_repair
+                    worked=await tick_repair(db,index,tick)
+                elif name in ('submit','reconcile'):
                     worked = await publication_tick(db,name,index,tick)
                 else:
                     worked = await tick(db, lane='review' if name=='remote_review' else name)

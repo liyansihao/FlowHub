@@ -680,3 +680,30 @@ async def test_pipeline_cooldown_keeps_attempts_and_does_not_report_old_errors(t
         ).fetchone()
         assert event["outcome"] == "waiting_dependency"
         assert json.loads(event["details"])["reason"] == "official_authentication"
+
+
+async def test_new_website_listing_preparation_uses_official_quota_without_erp_lookup(flow,monkeypatch):
+    from flowhub import listing_controls,compat
+    from flowhub.identity_review import envelope
+    db,owner,platform,review=flow;now=time.time()
+    with db.connect() as c:
+        product=json.loads(c.execute('SELECT body FROM sourcing_products').fetchone()[0])
+        product.update(url='https://www.ozon.ru/product/123/',
+            proposed_sale_price={'value':100,'currency':'CNY','observed_at':now},
+            source_relation={'seller_id':'456','root_seeds':[{'sku':'99','shop':'11','offer':'root'}]})
+        product['plugin_detail'].update(sku='123',weight_g=400,dimensions_mm=[100,100,100],attributes=[],observed_at=now)
+        cb={'search_and_rank':{'query':{'product_id':'123','title':product['title'],'image_url':product['image'],
+            'specifications':envelope(product)['origin']['specifications']},'candidates':[{'candidate':{'offer_id':'1','offer_url':'https://example.com/1',
+            'title':'same product','price_cny':4.1,'image_url':'https://example.com/supplier.jpg'},'dinov2_similarity':.9}]},
+            'decision':{'selected_offer_id':'1','outcome':'approved'}}
+        review['identity_review']={'verdict':'match','human_review':{'actor':'user','at':now},'comparison':cb}
+        c.execute('UPDATE sourcing_products SET body=?',(json.dumps(product),))
+        c.execute('UPDATE plugin_reviews SET body=?',(json.dumps(review),))
+        c.execute('INSERT INTO plugin_routes VALUES(?,?,?,?,?,?)',(owner,'123','456','one',now+3600,'test'))
+    monkeypatch.setattr(listing_controls,'read_delists',AsyncMock(return_value={'skus':[],'offers':[]}))
+    monkeypatch.setattr(listing_controls,'owned_targets',AsyncMock(side_effect=AssertionError('No ERP import-log lookup')))
+    monkeypatch.setattr(compat,'invoke',AsyncMock(return_value=review['result']))
+    state,body=await listing_controls.prepare_listing(db,(owner,'123','456'),{'id':'existing-intent','actor':'user','requested_at':now})
+    assert state=='waiting' and body['phase']=='publication_pipeline'
+    assert any(path=='/v4/product/info/limit' for path,_ in platform.calls)
+    assert not any(path in ('/v3/product/import','/v2/products/stocks') for path,_ in platform.calls)

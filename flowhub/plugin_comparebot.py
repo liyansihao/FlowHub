@@ -61,7 +61,7 @@ def eligible_roots(bindings, blocks, seller=None):
     return result
 
 
-async def evaluate(db, owner, sku, seller):
+async def evaluate(db, owner, sku, seller, *, force=False):
     library = SourceLibrary(db)
     with db.connect() as c:
         c.execute('CREATE TABLE IF NOT EXISTS plugin_reviews(owner TEXT,sku TEXT,seller TEXT,state TEXT,body TEXT,updated REAL,PRIMARY KEY(owner,sku,seller))')
@@ -86,7 +86,7 @@ async def evaluate(db, owner, sku, seller):
     with db.connect() as c:
         c.execute('BEGIN IMMEDIATE')
         prior = c.execute('SELECT * FROM plugin_reviews WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()
-        if prior and 0 <= started-prior['updated'] < (600 if prior['state']=='running' else 21600) and prior['state']!='error':
+        if prior and not force and 0 <= started-prior['updated'] < (600 if prior['state']=='running' else 21600) and prior['state']!='error':
             saved=json.loads(prior['body'])
             retryable=(saved.get('result',{}).get('reason') or '').startswith('qwen_')
             if prior['state']=='running' or (saved.get('input_digest')==digest and not retryable):

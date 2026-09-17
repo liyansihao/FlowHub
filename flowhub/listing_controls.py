@@ -111,7 +111,7 @@ def save(db,key,state,body):
 
 
 async def prepare_listing(db,key,body):
- from .identity_review import confirm,comparison,bound,envelope
+ from .identity_review import comparison,bound,envelope
  from .evaluation_requirements import review_sale_price
  from .plugin_comparebot import candidate
  from .plugin_publication import require_quota
@@ -122,14 +122,27 @@ async def prepare_listing(db,key,body):
   return await official_restore(db,key,body,record,cfg,api.keys)
  blocks=await read_delists()
  if key[1] in blocks['skus']:raise ValueError('商品在飞书明确下架清单中')
- targets=await owned_targets(api,cfg,record,key[1])
+ from .official_publication import backend
+ new_official=not record and backend(cfg)!='maozi'
+ # A new official intent uses the local/official preflight in the publication
+ # lane. Do not reintroduce the old import-log dependency while resuming review.
+ targets=[] if new_official else await owned_targets(api,cfg,record,key[1])
  if targets:
   if not record or record.get('phase') not in (None,'prepared','ready','favorite_pending'):return await restore(db,key,body,api,cfg,targets,blocks)
   observed=await online(api,targets[0])
   if observed:return await restore(db,key,body,api,cfg,targets,blocks)
- quota=await api.erp('POST','/api.shop/sync_single_product_limit',body={'id':int(cfg['shop_id'])});body['quota']=quota
+ if new_official:
+  from .official_api import client,capacity
+  if not api.keys.get('client_id') or not api.keys.get('api_key'):raise ValueError('official_credentials_required')
+  async with client(db,api.keys) as official:quota=await capacity(official)
+ else:quota=await api.erp('POST','/api.shop/sync_single_product_limit',body={'id':int(cfg['shop_id'])})
+ body['quota']=quota
  try:require_quota(quota)
  except ValueError:
+  if new_official:
+   from .pipeline_modules.store_capacity import observe
+   observe(db,key[0],store['id'],quota)
+   return 'waiting',body|{'next_attempt_at':time.time()+900,'error':'target_quota_unavailable'}
   from .listing_fallback import choose
   if record:raise ValueError('已有发布记录，需回查原店结果，不能自动换店重复发布')
   chosen=await choose(db,key,body,api,store,quota)

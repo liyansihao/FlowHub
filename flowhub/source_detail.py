@@ -418,7 +418,7 @@ async def map_detail(snapshot, context, seller):
                         brand = detail.get("brand_select") or {}
                         if str(brand.get("id")) == str(identifier):
                             label = brand.get("value")
-                    if isinstance(label, str) and label.strip():
+                    if isinstance(label, str) and len(label.strip()) >= 2:
                         found = await seller(
                             "/v1/description-category/attribute/values/search",
                             {
