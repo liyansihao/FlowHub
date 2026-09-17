@@ -85,6 +85,40 @@ def candidates(db,owner,settings):
     return groups
 
 
+async def sold_observation(db,owner,item,client):
+    """Read sale and stock from the backend that actually published this offer."""
+    from dataclasses import asdict
+    key=(owner,item['sku'],item['seller']);offer=item['queue'].get('offer_id')
+    if not offer:return None
+    with db.connect() as c:
+        exists=c.execute("SELECT 1 FROM sqlite_master WHERE name='plugin_publications'").fetchone()
+        row=c.execute('SELECT body FROM plugin_publications WHERE owner=? AND sku=? AND seller=?',key).fetchone() if exists else None
+    record=json.loads(row[0]) if row else {}
+    cfg=item['context']['store']['config'];shop=str(cfg['shop_id'])
+    if record.get('backend')=='official' or item['queue'].get('backend')=='official':
+        from ..plugin_publication import classify_product_issues
+        from ..official_status import OzonSellerStatusAdapter
+        from .. import official_api
+        keys=item['context']['store'].get('credentials') or {}
+        if (record.get('backend')!='official' or record.get('offer_id')!=offer
+            or record.get('account_binding')!=[str(keys.get('client_id')),str(cfg.get('warehouse_id')),shop]
+            or not keys.get('api_key')):return None
+        async with official_api.client(db,keys) as api:
+            port=OzonSellerStatusAdapter(api,shop_id=shop,warehouse_id=str(cfg['warehouse_id']))
+            await port.verify_identity()
+            product=await port.find_product(shop,offer)
+            if (not product or product.status!='selling' or product.sku=='0'
+                or classify_product_issues(product.issue_codes,status=product.status)):return None
+            stocks=await port.read_stocks(product)
+            if not any(s.warehouse_id==str(cfg['warehouse_id']) and s.present>0 for s in stocks):return None
+            return {'backend':'official','product':asdict(product),'stocks':[asdict(s) for s in stocks],
+                    'account_binding':record['account_binding']}
+    data=await client.call('/api.product.online/lists',params={'page':1,'page_size':100,'shop_id':cfg['shop_id'],'offer_id':offer})
+    exact=[r for r in rows(data) if str(r.get('shop_id'))==shop and str(r.get('offer_id'))==str(offer)]
+    if len(exact)!=1 or exact[0].get('online_status')!='selling' or float(exact[0].get('stock') or 0)<=0:return None
+    return exact[0]
+
+
 async def clean_account(db,owner,account,items,settings,client=None):
     client=client or Client(items[0]['context'])
     header,remote=await listing(client)
@@ -101,6 +135,7 @@ async def clean_account(db,owner,account,items,settings,client=None):
     count=min(settings['batch_size'],len(items) if settings.get('clear_completed') else max(0,used-int(limit*settings['target_ratio'])))
     touched=[];seen=set()
     for item in items:
+        if control.paused(db,'seed') or not config(db)['enabled']:return summary|{'state':'paused'}
         draft=str(item['snapshot']['draft_id']);sku=item['sku'];row=present.get(draft)
         if draft in seen:continue
         seen.add(draft)
@@ -108,29 +143,25 @@ async def clean_account(db,owner,account,items,settings,client=None):
         if not row or str(row.get('goods_id'))!=sku or row.get('collect_from')!='ozon':continue
         with db.connect() as c:
             if c.execute('SELECT 1 FROM draft_cleanup_receipts WHERE account=? AND draft_id=?',(account,draft)).fetchone():continue
-        # Verify exact online offer/shop using the candidate's own route.
-        current=client
-        shop=item['context']['store']['config']['shop_id'];offer=item['queue'].get('offer_id')
-        if not offer:continue
-        try:
-            data=await current.call('/api.product.online/lists',params={'page':1,'page_size':100,'shop_id':shop,'offer_id':offer})
+        current=client;offer=item['queue'].get('offer_id')
+        try:online=await sold_observation(db,owner,item,current)
         except Exception:
             summary['skipped']+=1;continue
-        exact=[r for r in rows(data) if str(r.get('shop_id'))==str(shop) and str(r.get('offer_id'))==str(offer)]
-        if len(exact)!=1 or exact[0].get('online_status')!='selling' or float(exact[0].get('stock') or 0)<=0:
+        if online is None:
             summary['skipped']+=1;continue
         try:
             detail=await current.call('/api.product.collect/detail',params={'id':int(draft),'is_online':0})
         except Exception:
             summary['skipped']+=1;continue
         if not isinstance(detail,dict) or not detail.get('skus'):continue
-        backup={'source_snapshot':item['snapshot'],'fresh_detail':detail,'draft_row':row,'online':exact[0],
+        backup={'source_snapshot':item['snapshot'],'fresh_detail':detail,'draft_row':row,'online':online,
                 'at':time.time(),'source_record':item['source_record'],'scope':'source draft only'}
         with db.connect() as c:
             c.execute('BEGIN IMMEDIATE')
             q=c.execute('SELECT state,body FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?',(owner,sku,item['seller'])).fetchone()
             if not q or q['state']!='selling' or json.loads(q['body']).get('offer_id')!=offer:continue
             if c.execute('SELECT 1 FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=? AND expires>?',(owner,sku,item['seller'],time.time())).fetchone():continue
+            if c.execute("SELECT 1 FROM plugin_pipeline WHERE owner=? AND sku=? AND state IN ('queued','evaluating','needs_fields','publishing','awaiting_remote','delisting')",(owner,sku)).fetchone():continue
             if control.paused(db,'seed') or not config(db)['enabled']:return summary|{'state':'paused'}
             if not c.execute('SELECT 1 FROM pipeline_campaigns WHERE owner=? AND enabled=1',(owner,)).fetchone():return summary|{'state':'disabled'}
             inserted=c.execute('INSERT OR IGNORE INTO draft_cleanup_receipts VALUES(?,?,?,?,?,?,?)',
