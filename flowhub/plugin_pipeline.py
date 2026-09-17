@@ -110,6 +110,10 @@ async def tick(db, lane=None, *, target=None, run_paused=False):
             body['repair_reason']=result['reason']
             if result['state']=='ready':
                 state='queued';body.pop('error',None);body.pop('reason',None)
+                if body.pop('official_dossier_pending',False):
+                    for field in ('needs_dossier','missing_fields','pending_publication_fields','repair_full_dossier'):
+                        body.pop(field,None)
+                    body.pop('phase',None)
                 if body.get('repair_retry'):
                     body.setdefault('repair_history',[]).append(body.pop('repair_retry'))
                 with db.connect() as c:
@@ -173,6 +177,7 @@ async def tick(db, lane=None, *, target=None, run_paused=False):
             if result.get('verified'):state='selling'
             elif result.get('needs_dossier'):
                 state='needs_fields';delay=300
+                body.pop('error',None)
                 body.update(repair_full_dossier=True,official_dossier_pending=True,
                             pending_publication_fields=result.get('missing_fields',[]))
             elif result.get('retryable_readback'):

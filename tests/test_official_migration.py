@@ -492,6 +492,7 @@ async def test_missing_dossier_leaves_submit_lane_and_never_falls_back(flow,monk
     review['candidate']['origin']['ozon_dossier'].pop('attributes')
     with db.connect() as c:
         c.execute('UPDATE plugin_reviews SET body=?',(json.dumps(review),))
+        c.execute('UPDATE plugin_pipeline SET body=?',(json.dumps({'error':'old ERP timeout'}),))
         cfg=json.loads(c.execute('SELECT config FROM stores').fetchone()[0])
         cfg['publication_backend']=mode
         c.execute('UPDATE stores SET config=?',(json.dumps(cfg),))
@@ -501,7 +502,8 @@ async def test_missing_dossier_leaves_submit_lane_and_never_falls_back(flow,monk
     with db.connect() as c:
         row=c.execute('SELECT * FROM plugin_pipeline').fetchone()
         assert row['state']=='needs_fields' and row['due']>time.time()+290
-        assert json.loads(row['body'])['official_dossier_pending']
+        body=json.loads(row['body'])
+        assert body['official_dossier_pending'] and 'error' not in body
         assert not c.execute('SELECT 1 FROM plugin_publications').fetchone()
     assert not await plugin_pipeline.tick(db,lane='submit')
     old.assert_not_awaited()
