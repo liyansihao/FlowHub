@@ -44,9 +44,14 @@ class Client:
 def rows(response):return response if isinstance(response,list) else response.get('data',[])
 
 
-async def listing(client):
+class CleanupPaused(Exception):
+    pass
+
+
+async def listing(client,should_stop=lambda:False):
     found=[];header=None;total=None
     for page in range(1,101):
+        if should_stop():raise CleanupPaused()
         response=await client.call('/api.product.favorite/lists',params={'page':page,'page_size':100})
         if not isinstance(response,dict) or response.get('total') is None:raise ValueError('favorite total required')
         if header is None:header=response;total=int(response['total'])
@@ -123,7 +128,10 @@ def archive(db,c,item,favorite,online):
 
 async def clean_account(db,owner,account,items,settings,client=None):
     client=client or Client(items[0]['context'])
-    header,remote=await listing(client);present={str(r['id']):r for r in remote}
+    def stopped():return control.paused(db,'seed') or not config(db)['enabled']
+    try:header,remote=await listing(client,stopped)
+    except CleanupPaused:return {'state':'paused','deleted':0,'skipped':0}
+    present={str(r['id']):r for r in remote}
     with db.connect() as c:prior=c.execute('SELECT * FROM favorite_cleanup_receipts WHERE account=?',(account,)).fetchall()
     # A timeout is reconciled by absence; a still-present favorite is never blindly deleted again.
     for r in prior:
@@ -136,6 +144,7 @@ async def clean_account(db,owner,account,items,settings,client=None):
     count=min(settings['batch_size'],len(items) if settings.get('clear_completed') else max(0,used-int(limit*settings['target_ratio'])))
     touched=[]
     for item in items:
+        if stopped():return result|{'state':'paused'}
         if len(touched)>=count:break
         sku=item['sku'];matches=[r for r in remote if str(r.get('sku'))==sku]
         if len(matches)!=1 or str(matches[0].get('is_imported'))!='1':continue
@@ -167,7 +176,9 @@ async def clean_account(db,owner,account,items,settings,client=None):
         except Exception as e:
             backup['error_type']=type(e).__name__;update_receipt(db,account,fid,'unconfirmed',backup);break
     if touched:
-        after,remote=await listing(client);remaining={str(r['id']) for r in remote}
+        try:after,remote=await listing(client,stopped)
+        except CleanupPaused:return result|{'state':'paused'}
+        remaining={str(r['id']) for r in remote}
         for fid in touched:
             if fid in remaining:continue
             with db.connect() as c:r=c.execute('SELECT body FROM favorite_cleanup_receipts WHERE account=? AND favorite_id=?',(account,fid)).fetchone()
@@ -188,6 +199,7 @@ async def tick(db):
         results=[]
         for owner in owners:
             for account,items in candidates(db,owner,settings).items():
+                if control.paused(db,'seed') or not config(db)['enabled']:return results
                 started=time.time()
                 try:result=await clean_account(db,owner,account,items,settings)
                 except Exception as e:result={'state':'error','error_type':type(e).__name__,'reason':str(e)[:160] if isinstance(e,ValueError) else type(e).__name__}

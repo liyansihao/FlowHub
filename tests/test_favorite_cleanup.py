@@ -159,3 +159,54 @@ async def test_clear_completed_favorites_do_not_stop_below_threshold(tmp_path):
     api=Low()
     result=await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db)|{'clear_completed':True},api)
     assert result['deleted']==1
+
+
+@pytest.mark.asyncio
+async def test_pause_between_pages_never_reconciles_partial_absence(tmp_path):
+    db,owner,item=setup(tmp_path)
+    with db.connect() as c:
+        c.execute('INSERT INTO favorite_cleanup_receipts VALUES(?,?,?,?,?,?,?)',
+                  ('account','missing',owner,'999','unconfirmed',db.seal({}),0))
+    class Paged(Fake):
+        async def call(self,path,**kwargs):
+            assert kwargs['params']['page']==1
+            cleanup.control.set_paused(db,'seed',True)
+            return {'total':101,'data':[{'id':i} for i in range(100)]}
+    result=await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),Paged())
+    assert result['state']=='paused'
+    with db.connect() as c:
+        assert c.execute('SELECT state FROM favorite_cleanup_receipts').fetchone()[0]=='unconfirmed'
+
+
+@pytest.mark.asyncio
+async def test_pause_stops_scan_even_when_online_items_are_ineligible(tmp_path):
+    db,owner,item=setup(tmp_path)
+    class Pausing(Fake):
+        calls=0
+        async def call(self,path,**kwargs):
+            if path.endswith('online/lists'):
+                self.calls+=1
+                cleanup.control.set_paused(db,'seed',True)
+                return {'data':[]}
+            return await super().call(path,**kwargs)
+    api=Pausing()
+    result=await cleanup.clean_account(db,owner,'account',[item,item],cleanup.config(db),api)
+    assert result['state']=='paused' and api.calls==1 and api.writes==0
+
+
+@pytest.mark.asyncio
+async def test_pause_after_ack_preserves_receipt_without_replaying_write(tmp_path):
+    db,owner,item=setup(tmp_path)
+    class Pausing(Fake):
+        async def call(self,path,**kwargs):
+            response=await super().call(path,**kwargs)
+            if path.endswith('favorite/toggle'):cleanup.control.set_paused(db,'seed',True)
+            return response
+    api=Pausing(db=db)
+    result=await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
+    assert result['state']=='paused' and api.writes==1
+    with db.connect() as c:assert c.execute('SELECT state FROM favorite_cleanup_receipts').fetchone()[0]=='acknowledged'
+    cleanup.control.set_paused(db,'seed',False)
+    await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
+    assert api.writes==1
+    with db.connect() as c:assert c.execute('SELECT state FROM favorite_cleanup_receipts').fetchone()[0]=='deleted'
