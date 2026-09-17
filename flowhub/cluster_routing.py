@@ -62,4 +62,5 @@ def route_bridge(bridge, directory, key):
             finally:
                 if proc.returncode is None:
                     proc.kill(); await proc.wait()
+        bridge.execution_route = "windows:" + selected
         bridge.call = remote_call

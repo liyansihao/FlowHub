@@ -19,9 +19,10 @@ class StepTransport(httpx.AsyncBaseTransport):
         if len(rows)<10 or any(r.get("error_type") for r in rows[-10:]):return False
         return all(r.get("network_ms",float("inf"))<5000 and r.get("pacing_wait_ms",float("inf"))<15000 for r in rows[-10:])
 
-    def __init__(self, transport, ttl=30, namespace=None):
+    def __init__(self, transport, ttl=30, namespace=None, circuit_namespace="local"):
         self.transport=transport;self.ttl=ttl;self.cache={};self.timings=[]
         self.namespace=namespace if namespace is not None else object()
+        self.circuit_namespace=circuit_namespace
 
     def scope(self,path):return (asyncio.get_running_loop(),self.namespace,path)
 
@@ -69,7 +70,9 @@ class StepTransport(httpx.AsyncBaseTransport):
             if generation!=self.generations.get(scope,0):return await self.handle_async_request(request)
             self.timings.append({'path':path,'seconds':round(time.monotonic()-start,3),'cache_hit':False,'coalesced':True})
             return httpx.Response(result[0],content=result[1],headers=result[2],request=request)
-        circuit=self.circuits.get(scope,{})
+        # Connection failures belong to an execution host, not the shared account.
+        circuit_scope=(*scope,self.circuit_namespace)
+        circuit=self.circuits.get(circuit_scope,{})
         if read and circuit.get('until',0)>start:
             self.timings.append({'path':path,'seconds':0,'cache_hit':False,'circuit_wait':True})
             raise httpx.ConnectError('ERP endpoint cooling down after connection failures',request=request)
@@ -83,7 +86,7 @@ class StepTransport(httpx.AsyncBaseTransport):
             content=await response.aread()
             metric.update(response.extensions.get('erp_timing',{}))
             if response.status_code in (401,403):self.invalidate('/authentication-failure')
-            self.circuits.pop(scope,None)
+            self.circuits.pop(circuit_scope,None)
             if cacheable and response.status_code==200:
                 try:ok=response.json().get('code') in (1,'1')
                 except (ValueError,AttributeError):ok=False
@@ -100,7 +103,7 @@ class StepTransport(httpx.AsyncBaseTransport):
             metric.update(getattr(getattr(self.transport,'bridge',None),'last_timing',{}))
             if read and self.network_failure(error):
                 failures=circuit.get('failures',0)+1
-                self.circuits[scope]={'failures':failures,'until':time.monotonic()+min(120,30*2**min(failures-3,2)) if failures>=3 else 0}
+                self.circuits[circuit_scope]={'failures':failures,'until':time.monotonic()+min(120,30*2**min(failures-3,2)) if failures>=3 else 0}
             if future:future.set_exception(error)
             raise
         finally:

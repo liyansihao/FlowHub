@@ -29,6 +29,10 @@ class Coordinator:
         self.directory=Path(directory);self.directory.mkdir(parents=True,exist_ok=True,mode=0o700)
         self.path=self.directory/'cluster.sqlite3';self.clock=clock
         with self.connect() as c:
+            # Device heartbeats/results must not wait behind status readers.
+            # WAL keeps reads concurrent with the single durable writer.
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA synchronous=FULL")
             c.executescript('''
             CREATE TABLE IF NOT EXISTS enrollments(hash TEXT PRIMARY KEY,name TEXT,expires REAL,used INTEGER DEFAULT 0);
             CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY,name TEXT,token_hash TEXT UNIQUE,enabled INTEGER,last_seen REAL,platform TEXT);

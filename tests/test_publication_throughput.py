@@ -174,3 +174,25 @@ def test_second_repair_lane_requires_recent_measured_health():
     StepTransport.health_samples.append((time.monotonic(),{'error_type':'ConnectError'}))
     assert not StepTransport.healthy_for_more_work()
     StepTransport.health_samples.clear()
+
+
+@pytest.mark.asyncio
+async def test_local_connection_outage_does_not_disable_healthy_windows_route():
+    calls={'local':0,'remote':0}
+    async def broken(request):
+        calls['local']+=1
+        raise httpx.ConnectError('connect timeout',request=request)
+    async def healthy(request):
+        calls['remote']+=1
+        return httpx.Response(200,json={'code':1,'data':[]})
+    local=StepTransport(httpx.MockTransport(broken),namespace='same-account-route-test')
+    remote=StepTransport(httpx.MockTransport(healthy),namespace='same-account-route-test',circuit_namespace='windows:04')
+    url='https://api.maozierp.com/api.product.import_logs/index?sku=123'
+    for _ in range(3):
+        with pytest.raises(httpx.ConnectError):await local.handle_async_request(httpx.Request('GET',url))
+    response=await remote.handle_async_request(httpx.Request('GET',url))
+    assert response.status_code==200
+    # Remote success must not clear the failing local host's circuit either.
+    with pytest.raises(httpx.ConnectError,match='cooling down'):
+        await local.handle_async_request(httpx.Request('GET',url))
+    assert calls=={'local':3,'remote':1}

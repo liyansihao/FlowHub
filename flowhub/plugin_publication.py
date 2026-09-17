@@ -160,7 +160,8 @@ async def _advance(db, owner, sku, seller):
     def save():
         with db.connect() as c:c.execute('INSERT OR REPLACE INTO plugin_publications VALUES(?,?,?,?,?)',(owner,sku,seller,json.dumps(record),time.time()))
     from .pipeline_modules.transport import StepTransport
-    transport=StepTransport(MeasuredTransport(bridge),ttl=15,namespace=fingerprint({'token':keys['erp_token']}))
+    transport=StepTransport(MeasuredTransport(bridge),ttl=15,namespace=fingerprint({'token':keys['erp_token']}),
+                            circuit_namespace=getattr(bridge,'execution_route','local'))
     async with httpx.AsyncClient(base_url='https://api.maozierp.com',transport=transport) as client, AsyncExitStack() as observation_clients:
         from .pipeline_modules.favorite_lookup import PublicationSourceAdapter, PublicationAdapter
         base=PublicationSourceAdapter(client)
