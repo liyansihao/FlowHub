@@ -140,11 +140,15 @@ class Completion(BaseModel):
 def create_app(directory=None):
     from .db import DATA
     hub=Coordinator(directory or DATA/'cluster');app=FastAPI(docs_url=None,redoc_url=None,openapi_url=None);app.state.hub=hub
+    from .runtime_identity import capture, save
+    runtime = capture('coordinator', Path(__file__).resolve().parents[1], {'acceptance':1,'erp':2,'compute':3})
+    app.state.runtime_identity = runtime
+    save(hub.directory, runtime)
     def bearer(authorization):
         if not authorization or not authorization.startswith('Bearer '):raise HTTPException(401,'Device token required')
         return authorization[7:]
     @app.get('/healthz')
-    def health():return {'ok':True,'mode':hub.mode(),'protocol':1,'erp_protocol':2,'compute_protocol':3}
+    def health():return {'ok':True,'mode':hub.mode(),'protocol':1,'erp_protocol':2,'compute_protocol':3,'runtime':runtime}
     @app.post('/v1/enroll')
     def enroll(body:Enrollment):return hub.enroll(body.code,body.platform)
     @app.post('/v1/claim')
@@ -157,6 +161,8 @@ def create_app(directory=None):
         return hub.complete(bearer(authorization),body.task_id,body.lease,{'challenge':body.challenge,'platform':body.platform})
     from .cluster_erp import install_routes
     install_routes(app, hub, bearer)
+    from .runtime_registry import install_routes as install_runtime
+    install_runtime(app, hub, bearer)
     from .cluster_compute import install_routes as install_compute
     install_compute(app,hub,bearer)
     return app

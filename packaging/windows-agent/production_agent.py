@@ -8,11 +8,13 @@ import os
 import sqlite3
 import sys
 import time
+import threading
 from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import Request
 from urllib.error import HTTPError, URLError
 from agent import Client, save
+from runtime_identity import capture, report_loop
 
 READS = {'/api.shop/lists', '/api.product.favorite/lists',
          '/api.product.import_logs/index', '/api.product.online/lists',
@@ -55,6 +57,7 @@ def execute(client, command):
 def main():
     p=argparse.ArgumentParser();p.add_argument('--config',type=Path,required=True)
     args=p.parse_args();config=json.loads(args.config.read_text(encoding='utf-8'))
+    runtime=capture('erp-agent',Path(__file__).resolve().parent,{'erp':2})
     # Same lock as phase 1, so both versions cannot run concurrently.
     handle=args.config.with_suffix('.lock').open('a+b')
     if os.name=='nt':
@@ -65,6 +68,7 @@ def main():
         import fcntl
         fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
     client=Client(config['url'],config['token'])
+    threading.Thread(target=report_loop,args=(Client(config['url'],config['token']),runtime,threading.Event()),daemon=True).start()
     ledger=sqlite3.connect(args.config.with_suffix('.commands.sqlite3'))
     ledger.execute('PRAGMA synchronous=FULL')
     ledger.execute('CREATE TABLE IF NOT EXISTS dispatched(id TEXT PRIMARY KEY)')

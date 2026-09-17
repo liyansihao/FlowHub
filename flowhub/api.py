@@ -17,6 +17,9 @@ from .modules import ModuleHost, public_endpoint
 
 def create_app(database=None):
     db = database or Database()
+    from .runtime_identity import capture, save
+    runtime = capture('web', ROOT)
+    save(db.directory, runtime)
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.state.db = db
 
@@ -673,7 +676,7 @@ def create_app(database=None):
 
     @app.get("/healthz")
     def health():
-        return {"service": "flowhub", "ok": True}
+        return {"service": "flowhub", "ok": True, "runtime": runtime}
 
     app.mount("/assets", StaticFiles(directory=ROOT / "web/assets", check_dir=False), name="assets")
 

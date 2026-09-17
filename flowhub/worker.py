@@ -8,6 +8,10 @@ import time
 
 from .db import Database
 from .modules import ModuleError, ModuleHost, candidate, image_url, number
+from .runtime_identity import capture as capture_runtime, save as save_runtime
+from pathlib import Path
+
+RUNTIME_IDENTITY = capture_runtime('worker', Path(__file__).resolve().parents[1])
 
 TERMINAL = ("selling", "rejected", "attention")
 
@@ -453,10 +457,12 @@ class Worker:
     async def run(self):
         lock = (self.db.directory / "worker.lock").open("w")
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        save_runtime(self.db.directory, RUNTIME_IDENTITY)
 
         async def heartbeat():
             while True:
                 self.db.health("worker")
+                save_runtime(self.db.directory, RUNTIME_IDENTITY)
                 await asyncio.sleep(5)
 
         async def refill():

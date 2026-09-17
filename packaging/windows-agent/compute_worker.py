@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from runtime_identity import capture
 
 
 async def execute(kind,payload,ranker):
@@ -44,6 +45,7 @@ async def execute(kind,payload,ranker):
 
 
 async def main():
+    runtime=capture('compute-worker',Path(__file__).resolve().parent,{'compute':3})
     os.environ['PYTHON_DOTENV_DISABLED']='1'
     os.environ.pop('DASHSCOPE_API_KEY',None)
     with contextlib.redirect_stdout(sys.stderr):
@@ -52,7 +54,8 @@ async def main():
         # Package dependencies and the pinned model must load before readiness.
         from comparebot.adapters.alibaba1688.image_search import Alibaba1688ImageSearchAdapter
         import search1688api
-    print(json.dumps({'ready':True,'accelerator':ranker.device,'cpu_count':os.cpu_count() or 1}),flush=True)
+    runtime.update(model_name=ranker._model_name,model_revision=ranker._model_revision)
+    print(json.dumps({'ready':True,'accelerator':ranker.device,'cpu_count':os.cpu_count() or 1,'runtime':runtime}),flush=True)
     while line:=await asyncio.to_thread(sys.stdin.readline):
         try:
             task=json.loads(line)
