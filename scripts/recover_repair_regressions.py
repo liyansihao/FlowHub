@@ -21,7 +21,7 @@ def recover(db, *, apply=False, limit=5):
             LEFT JOIN plugin_publications pub USING(owner,sku,seller)
             LEFT JOIN plugin_pipeline_leases l USING(owner,sku,seller)
             WHERE pub.body IS NULL AND (l.expires IS NULL OR l.expires<=?)
-            AND q.state IN ('needs_review','same_product_confirmed')
+            AND q.state IN ('needs_review','same_product_confirmed','needs_fields')
             AND json_extract(q.body,'$.backend')='official'
             ORDER BY CASE WHEN json_extract(q.body,'$.error') LIKE '%400 Bad Request%attribute/values/search%' THEN 0 ELSE 1 END,q.due""",(time.time(),)).fetchall()
         for row in rows:
@@ -35,17 +35,22 @@ def recover(db, *, apply=False, limit=5):
             if control['state']=='running':continue
             control_body=json.loads(control['body'])
             error=q.get('error','')
-            if '400 Bad Request' in error and 'attribute/values/search' in error:
+            bad_dictionary='400 Bad Request' in error and 'attribute/values/search' in error
+            expired_recovery=(review.get('state')=='matched' and time.time()-review.get('finished_at',time.time())>=21600
+                and (bad_dictionary or (q.get('repair_recovery') or {}).get('reason')=='single_character_dictionary_validation'))
+            if row['state']=='needs_fields' and not expired_recovery:continue
+            if bad_dictionary and not expired_recovery:
                 reason='single_character_dictionary_validation';new_review=None;state='needs_fields'
                 q.update(official_dossier_pending=True,repair_full_dossier=True,needs_dossier=True,phase='awaiting_dossier')
                 for field in ('error','reason','repair_retry'):q.pop(field,None)
-            elif q.get('repair_reason')=='complete_dossier' and 'result' not in review:
+            elif expired_recovery or (q.get('repair_reason')=='complete_dossier' and 'result' not in review):
                 receipt=c.execute('SELECT * FROM human_reviews WHERE owner=? AND sku=? AND seller=? ORDER BY at DESC,id DESC LIMIT 1',key).fetchone()
                 if not receipt:continue
                 try:new_review=restored_identity(receipt,json.loads(row['product']),review)
                 except (ValueError,KeyError,TypeError) as error:
                     counts['retained:'+str(error)[:100]]+=1;continue
-                reason='restore_original_human_approval';state='same_product_confirmed'
+                reason='revalue_expired_approval' if expired_recovery else 'restore_original_human_approval'
+                state='same_product_confirmed'
                 q.update(same_product_only=True,reason='original_human_approval_restored')
                 q.pop('error',None)
                 for field in ('phase','error','next_attempt_at'):control_body.pop(field,None)
