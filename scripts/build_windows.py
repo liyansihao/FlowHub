@@ -1,11 +1,11 @@
 """Build a credential-free Windows/Docker compatibility distribution from this workspace."""
 
-import hashlib, json, re, shutil, subprocess, sys, tempfile, zipfile
+import hashlib, json, re, shutil, subprocess, sys, tempfile, zipfile, os, sqlite3
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-WS = ROOT.parent
-OUT = WS / "deliverables/FlowHub-Windows"
+WS = Path(os.environ.get("FLOWHUB_WORKSPACE", ROOT.parent)).resolve()
+OUT = Path(os.environ.get("FLOWHUB_WINDOWS_OUT", WS / "deliverables/FlowHub-Windows-personal-54fbf19")).resolve()
 if OUT.exists():
     raise SystemExit("Output exists; choose a new release directory or move the previous release first.")
 OUT.mkdir(parents=True)
@@ -14,12 +14,14 @@ for f in (ROOT / "packaging/windows").iterdir():
         shutil.copy2(f, OUT / f.name)
 for p in subprocess.check_output(["git", "ls-files", "-z"], cwd=ROOT).decode().split("\0"):
     if not p or not p.startswith(
-        ("flowhub/", "flowhub_plugins/", "web/", "plugins/", "requirements.lock.txt", "pyproject.toml")
+        ("flowhub/", "flowhub_plugins/", "web/", "plugins/", "bridges/", "vendor/compareBot/", "requirements.lock.txt", "pyproject.toml")
     ):
         continue
     d = OUT / "app" / p
     d.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(ROOT / p, d)
+# Include the personal connection importer before it is committed.
+shutil.copy2(ROOT / "flowhub/connection_bundle.py", OUT / "app/flowhub/connection_bundle.py")
 legacy = OUT / "legacy"
 folders = [
     "flow_b_ef",
@@ -174,15 +176,16 @@ for f in legacy.rglob("*"):
         s = s.replace(str(WS), "/data/legacy")
         f.write_text(s)
 # Scan every outgoing file for actual configured account secrets and accidental JWTs.
-sys.path.insert(0, str(ROOT))
-from flowhub.db import Database
-
-D = Database()
+from cryptography.fernet import Fernet
+private = WS / "FlowHub/data"
+cipher = Fernet((private / "master.key").read_bytes())
 secrets = []
-with D.connect() as c:
+with sqlite3.connect((private / "flowhub.sqlite3").as_uri() + "?mode=ro", uri=True) as c:
     for col, table in [("secret", "stores"), ("secrets", "workflows")]:
         for row in c.execute(f"SELECT {col} FROM {table}"):
-            secrets.extend(v.encode() for v in D.open(row[0]).values() if isinstance(v, str) and len(v) > 12)
+            values = json.loads(cipher.decrypt(row[0].encode()))
+            secrets.extend(v.encode() for v in values.values() if isinstance(v, str) and len(v) > 12)
+(OUT / "VERSION.json").write_text(json.dumps({"base_commit": "54fbf191d154f010ea05e4aa248900e4d394f3e7", "edition": "personal", "patches": ["desktop store selection", "runtime packaging"]}, indent=2))
 for f in OUT.rglob("*"):
     if not f.is_file():
         continue

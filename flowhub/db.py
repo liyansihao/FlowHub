@@ -62,6 +62,8 @@ class Database:
             CREATE INDEX IF NOT EXISTS jobs_due ON jobs(phase,next_at,lease_until);
             CREATE INDEX IF NOT EXISTS events_owner ON events(owner,created);
             """)
+            if "selected_store_ids" not in {r[1] for r in db.execute("PRAGMA table_info(workflows)")}:
+                db.execute("ALTER TABLE workflows ADD COLUMN selected_store_ids TEXT")
             for kind, title in [
                 ("candidates", "示例候选池"),
                 ("matcher", "示例同款识别"),

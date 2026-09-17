@@ -22,6 +22,8 @@ let me = null,
   filter = "",
   search = "",
   production = null,
+  sourceMode = "account",
+  selectionDrafts = new Map(),
   rendering = false;
 const phase = {
   archived: "已归档",
@@ -126,7 +128,7 @@ async function api(path, method = "GET", body, scoped = true) {
 }
 function login(change = false) {
   $("#root").innerHTML =
-    `<div class="login"><section class="login-art"><div class="brand"><span class="mark">f</span>FlowHub</div><div class="orbit"></div><h1>从候选商品<br>到确认可售。</h1><p>模块可替换 · 工作区独立 · 任务可恢复</p></section><section class="login-form"><form class="login-inner" id="login"><h2>${change ? "设置你的新密码" : "登录工作台"}</h2><p class="muted">${change ? "首次登录需要更改初始密码。" : "使用管理员分配的账号登录。"}</p><label>${change ? "当前临时密码" : "账号"}</label><input id="username" ${change ? 'type="password"' : 'autocomplete="username"'} required><label>${change ? "新密码 · 至少 12 位" : "密码"}</label><input id="password" type="password" autocomplete="${change ? "new-password" : "current-password"}" required ${change ? 'minlength="12"' : ""}><button class="primary">${change ? "保存并重新登录" : "登录"}</button><p class="footnote">FlowHub Local / 0.1<br>店铺凭据仅保存在服务端，不向其他用户公开。</p></form></section></div>`;
+    `<div class="login"><section class="login-art"><div class="brand"><span class="mark">f</span>FlowHub</div><div class="orbit"></div><h1>从候选商品<br>到确认可售。</h1><p>模块可替换 · 工作区独立 · 任务可恢复</p></section><section class="login-form"><form class="login-inner" id="login"><h2>${change ? "设置你的新密码" : "登录工作台"}</h2><p class="muted">${change ? "首次登录需要更改初始密码。" : "使用管理员分配的账号登录。"}</p><label>${change ? "当前临时密码" : "账号"}</label><input id="username" ${change ? 'type="password"' : 'autocomplete="username"'} required><label>${change ? "新密码 · 至少 12 位" : "密码"}</label><input id="password" type="password" autocomplete="${change ? "new-password" : "current-password"}" required ${change ? 'minlength="12"' : ""}><button class="primary">${change ? "保存并重新登录" : "登录"}</button><p class="footnote">FlowHub Personal / 54fbf19<br>店铺凭据仅保存在服务端，不向其他用户公开。</p></form></section></div>`;
   $("#login").onsubmit = async (e) => {
     e.preventDefault();
     try {
@@ -177,15 +179,14 @@ async function shell() {
       : []),
   ];
   $("#root").innerHTML =
-    `<aside><div class="brand"><span class="mark">f</span><span>FlowHub<small>跨境上架工作台</small></span></div><nav>${groups.map(([label, ...items]) => `<div class="nav-group"><div class="workspace">${label}</div>${items.map(([id, name]) => `<button data-page="${id}">${icon(id)}<span>${name}</span></button>`).join("")}</div>`).join("")}</nav><footer><span class="avatar">${esc(me.username[0].toUpperCase())}</span><div><strong>${esc(me.username)}</strong><small>${me.role === "admin" ? "管理员" : "独立工作区"}</small></div><button id="logout" class="linkbutton">退出</button></footer></aside><main class="app"><header class="topbar"><span class="breadcrumb">工作空间 <span>/</span> <strong id="currentpage">运行概览</strong></span><div class="toolbar">${users.length ? `<select id="owner" aria-label="切换工作区">${users.map((u) => `<option value="${u.id}" ${owner === u.id ? "selected" : ""}>${esc(u.username)} 的工作区</option>`).join("")}</select>` : ""}<span class="version">本地验收版</span></div></header><div class="content" id="content"></div></main>`;
+    `<aside><div class="brand"><span class="mark">f</span><span>FlowHub<small>跨境上架工作台</small></span></div><nav>${groups.map(([label, ...items]) => `<div class="nav-group"><div class="workspace">${label}</div>${items.map(([id, name]) => `<button data-page="${id}">${icon(id)}<span>${name}</span></button>`).join("")}</div>`).join("")}</nav><footer><span class="avatar">${esc(me.username[0].toUpperCase())}</span><div><strong>${esc(me.username)}</strong><small>${me.role === "admin" ? "管理员" : "独立工作区"}</small></div><button id="logout" class="linkbutton">退出</button></footer></aside><main class="app"><header class="topbar"><span class="breadcrumb">工作空间 <span>/</span> <strong id="currentpage">运行概览</strong></span><div class="toolbar">${users.length ? `<select id="owner" aria-label="切换工作区">${users.map((u) => `<option value="${u.id}" ${owner === u.id ? "selected" : ""}>${esc(u.username)} 的工作区</option>`).join("")}</select>` : ""}<span class="version">个人版 · 54fbf19</span></div></header><div class="content" id="content"></div></main>`;
   document.querySelectorAll("[data-page]").forEach(
     (b) =>
       (b.onclick = async () => {
         page = b.dataset.page;
         filter = "";
-        search = "",
-  production = null,
-  rendering = false;
+        search = "";
+        production = null;
         await render();
         window.scrollTo(0, 0);
       }),
@@ -199,9 +200,9 @@ async function shell() {
   if ($("#owner"))
     $("#owner").onchange = (e) => {
       owner = e.target.value;
-      search = "",
-  production = null,
-  rendering = false;
+      search = "";
+      sourceMode = "account";
+      production = null;
       render();
     };
   await render();
@@ -404,12 +405,17 @@ async function render() {
         )
       ).sort((a, b) => b.updated - a.updated);
       production = me.role === "admin" ? await api("/production" + (filter ? "?phase=" + encodeURIComponent(filter) : "")) : null;
+      const hasProduction = production?.available;
+      if (sourceMode !== "production") production = null;
       if (production?.available) {
         jobs = production.jobs;
         overview = production.overview;
         wf = {...wf, enabled: production.active, rules: {...wf.rules, live: true, stock: 99, logistics: "ChinaPost"},
           notice: `数据来源：本地正式上架流程 · 当前店铺 ${production.shop_name} · 每 10 秒刷新 · 最近读取 ${new Date(production.fetched_at * 1000).toLocaleTimeString()}。此处展示已进入正式上架的任务。`};
       }
+      const selectionKey = `${owner || me.id}:${wf.rules.live}`;
+      const eligibleStores = stores.filter(s => s.enabled && s.verified && (wf.rules.live ? s.kind !== "demo" : s.kind === "demo"));
+      const selectedIds = wf.enabled ? (wf.selected_store_ids || eligibleStores.map(s => s.id)) : (selectionDrafts.get(selectionKey) || wf.selected_store_ids || eligibleStores.map(s => s.id));
       const processing = Object.entries(overview.phases)
         .filter(([k]) => !["selling", "rejected", "attention", "archived", "offline"].includes(k))
         .reduce((s, [, v]) => s + v, 0);
@@ -417,8 +423,9 @@ async function render() {
         head(
           page === "overview" ? "运行概览" : "上架商品",
           `${wf.rules.live ? "真实上架" : "模拟验收"} · ${wf.rules.logistics === "ChinaPost" ? "邮政物流" : esc(wf.rules.logistics)} · 目标库存 ${wf.rules.stock}`,
-          `<button id="refresh">刷新数据</button><button ${production?.available ? "disabled title=正式流程由本地发布服务管理" : ""} class="${wf.enabled ? "" : "primary"}" id="toggle">${production?.available ? "正式流程监控" : wf.enabled ? "暂停新增" : "启动工作流"}</button>`,
+          `${hasProduction ? `<select id="sourceview" aria-label="进度来源"><option value="account" ${sourceMode === "account" ? "selected" : ""}>本账号上架任务</option><option value="production" ${sourceMode === "production" ? "selected" : ""}>已有正式流程记录</option></select>` : ""}<button id="refresh">刷新数据</button>${production?.available ? "" : `<button class="${wf.enabled ? "" : "primary"}" id="toggle">${wf.enabled ? "暂停新增" : "启动上架"}</button>`}`,
         ) +
+        (!production?.available ? `<section class="panel store-selection"><div class="panel-title"><h2>上架店铺</h2><span class="muted tiny">${wf.enabled ? "运行中 · 暂停新增后可更改店铺" : "勾选店铺后启动 · 同账号共享任务与店铺"}</span></div><div class="store-options">${eligibleStores.map(s => `<label class="store-option"><input type="checkbox" data-target-store="${esc(s.id)}" ${selectedIds.includes(s.id) ? "checked" : ""} ${wf.enabled ? "disabled" : ""}><span><strong>${esc(s.name)}</strong><small>${s.kind === "demo" ? "模拟店铺" : esc(s.config.shop_id)}</small></span></label>`).join("") || '<p class="muted">尚无可用店铺，请先在「店铺连接」中添加并核验与当前模式对应的店铺。</p>'}</div><p class="muted tiny">只向勾选店铺分配新任务；已提交商品继续在原店回查。换电脑登录同一账号后可查看相同店铺和运行进度。</p></section>` : "") +
         (page === "overview"
           ? `<div class="metrics">${[
               [
@@ -495,12 +502,21 @@ async function render() {
       };
       if (focusedSearch) { $("#jobsearch").focus(); $("#jobsearch").setSelectionRange(...caret); }
       $("#refresh").onclick = render;
-      $("#toggle").onclick = async () => {
+      if ($("#sourceview")) $("#sourceview").onchange = (e) => { sourceMode = e.target.value; filter = ""; render(); };
+      document.querySelectorAll("[data-target-store]").forEach(input => input.onchange = () => {
+        selectionDrafts.set(selectionKey, [...document.querySelectorAll("[data-target-store]:checked")].map(el => el.dataset.targetStore));
+      });
+      if ($("#toggle")) $("#toggle").onclick = async () => {
         try {
-          await api("/workflow/" + (wf.enabled ? "pause" : "start"), "POST");
+          const ids = [...document.querySelectorAll("[data-target-store]:checked")].map(el => el.dataset.targetStore);
+          if (!wf.enabled && !ids.length) { toast("请至少勾选一家上架店铺"); return; }
+          $("#toggle").disabled = true;
+          await api("/workflow/" + (wf.enabled ? "pause" : "start"), "POST", wf.enabled ? undefined : {store_ids: ids});
+          selectionDrafts.delete(selectionKey);
           await render();
         } catch (e) {
           toast(e.message);
+          if ($("#toggle")) $("#toggle").disabled = false;
         }
       };
       document.querySelectorAll("[data-filter]").forEach(
@@ -512,7 +528,7 @@ async function render() {
       );
     } else if (page === "stores") {
       c.innerHTML =
-        head("店铺连接", "各店铺使用自己的账号与仓库；额度不足时按顺序切换。") +
+        head("店铺连接", "店铺绑定在当前 FlowHub 账号下；其他电脑登录同一服务和账号后自动显示。") +
         `<div class="grid2"><div class="panel"><div class="panel-title"><h2>已连接店铺</h2></div><table><thead><tr><th>顺序 / 店铺</th><th>连接</th><th>操作</th></tr></thead><tbody>${stores.map((s) => `<tr><td>${s.position + 1} · ${esc(s.name)}<br><small class="muted">${s.kind === "demo" ? "模拟店铺" : esc(s.config.shop_id)}</small></td><td>${s.verified ? "已核验" : "待核验"}<br><small class="muted">${overview.quotas.find((q) => q.store_id === s.id) ? "余 " + overview.quotas.find((q) => q.store_id === s.id).remaining + " 个额度" : ""}</small></td><td><button class="linkbutton" data-verify="${s.id}">核验</button><button class="linkbutton" data-enable="${s.id}">${s.enabled ? "停用" : "启用"}</button></td></tr>`).join("") || '<tr><td colspan="3" class="empty">还没有连接店铺</td></tr>'}</tbody></table></div><form id="storeform" class="formarea"><h2>连接新店铺</h2><label>店铺名称</label><input name="name" placeholder="例如：我的一号店" required><div class="row2"><div><label>连接方式</label><select name="kind"><option value="demo">模拟店铺</option><option value="maozi">毛子 ERP + Ozon</option><option value="ozon">Ozon 官方直连（无需 ERP）</option><option value="http">自定义上架 API</option></select></div><div><label>排序 · 0 为第一家</label><input name="position" type="number" min="0" value="${stores.length}"></div></div>${[
           ["shop_id", "毛子店铺 ID"],
           ["warehouse_id", "目标仓库 ID"],

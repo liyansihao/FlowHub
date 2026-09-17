@@ -1237,3 +1237,13 @@ td > small.muted {
 #action-review:not(:empty) { padding:14px; margin-top:16px; background:#fff3e8; border-radius:10px; }
 
 #guoo-fees[hidden] { display: none; }
+
+.store-selection { margin-bottom: 22px; padding: 20px 24px; }
+.store-options { display:flex; flex-wrap:wrap; gap:12px; margin:16px 0; }
+.store-option { display:flex; align-items:center; gap:12px; padding:12px 18px; border:1px solid #deded8; border-radius:8px; cursor:pointer; }
+.store-option input { width:18px; height:18px; accent-color:#252b22; }
+.store-option strong,.store-option small { display:block; }
+.store-option small { margin-top:4px; color:#74776e; }
+
+.pagehead .actions select {width:auto;max-width:210px;font-size:12px}
+.pagehead .actions button {white-space:nowrap;flex-shrink:0}

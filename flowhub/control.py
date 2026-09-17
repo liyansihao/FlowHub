@@ -54,7 +54,7 @@ def serve():
                         with Database().connect() as db:
                             beat = db.execute("SELECT heartbeat FROM health WHERE name='worker'").fetchone()
                         baseline = max(spawned.get(name, 0), beat[0] if beat else 0)
-                        if time.time() - baseline > 180:
+                        if time.time() - baseline > 420:
                             os.killpg(child.pid, signal.SIGKILL)
                     except Exception:
                         pass
@@ -83,7 +83,7 @@ def serve():
                 child.terminate()
         for child in children.values():
             try:
-                child.wait(timeout=45)
+                child.wait(timeout=150)
             except subprocess.TimeoutExpired:
                 os.killpg(child.pid, signal.SIGKILL)
         log.close()

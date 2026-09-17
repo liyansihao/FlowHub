@@ -6,6 +6,7 @@ RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && a
 WORKDIR /app
 COPY app/ /app/
 RUN pip install --no-cache-dir -r requirements.lock.txt && pip install --no-cache-dir requests Pillow search1688api aiohttp beautifulsoup4 lxml && pip install --no-cache-dir --no-deps .
+RUN pip install --no-cache-dir "./vendor/compareBot[search1688,dinov2]"
 COPY legacy/ /opt/legacy/
 RUN cd /opt/legacy && npm install --omit=dev --ignore-scripts && useradd -m -u 10001 flowhub && mkdir /data && chown -R flowhub:flowhub /data /app /opt/legacy
 COPY entrypoint.py /app/entrypoint.py

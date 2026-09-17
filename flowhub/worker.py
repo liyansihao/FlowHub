@@ -88,6 +88,10 @@ class Worker:
             active = db.execute(
                 "SELECT active_store FROM workflows WHERE owner=?", (job["owner"],)
             ).fetchone()[0]
+        with self.db.connect() as db:
+            selected = db.execute("SELECT selected_store_ids FROM workflows WHERE owner=?", (job["owner"],)).fetchone()[0]
+        if selected is not None:
+            stores = [store for store in stores if store["id"] in json.loads(selected)]
         if active in [s["id"] for s in stores]:
             i = next(i for i, s in enumerate(stores) if s["id"] == active)
             stores = stores[i:] + stores[:i]
@@ -146,6 +150,13 @@ class Worker:
         c = self.context(job)
         phase = job["phase"]
         data = json.loads(job["data"])
+        if phase in ("ready", "prepared"):
+            with self.db.connect() as db:
+                selected = db.execute("SELECT selected_store_ids FROM workflows WHERE owner=?", (job["owner"],)).fetchone()[0]
+                available = db.execute("SELECT 1 FROM stores WHERE id=? AND owner=? AND enabled=1 AND verified=1", (job["store_id"], job["owner"])).fetchone()
+            if not available or (selected is not None and job["store_id"] not in json.loads(selected)):
+                self.move(job, phase, "原绑定店铺未勾选或已停用；重新选择原店后继续", delay=30)
+                return
         if self.blocked(job):
             self.move(
                 job,

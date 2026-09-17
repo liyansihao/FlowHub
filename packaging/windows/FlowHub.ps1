@@ -1,4 +1,4 @@
-param([ValidateSet('Install','Start','Stop','Status','Backup','Admin','Feishu')][string]$Action='Start')
+param([ValidateSet('Install','Start','Stop','Status','Backup','Admin','Feishu','ImportStores')][string]$Action='Start')
 $ErrorActionPreference='Stop'
 Set-Location -LiteralPath $PSScriptRoot
 function Run-Docker { & docker @args; if ($LASTEXITCODE -ne 0) { throw 'Docker operation failed. See the message above.' } }
@@ -19,6 +19,23 @@ try {
   Run-Docker compose exec -T --user root flowhub chown 10001:10001 /data/private/feishu.json
   Run-Docker compose exec -T flowhub chmod 600 /data/private/feishu.json
   Write-Host 'Private delist guard configuration installed.'; exit
+ }
+ elseif ($Action -eq 'ImportStores') {
+  $file=Join-Path $PSScriptRoot 'stores.fhconfig'
+  if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { $file=Read-Host 'Full path of stores.fhconfig' }
+  if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw 'Connection bundle not found.' }
+  Run-Docker compose exec -T flowhub mkdir -p /data/private
+  Run-Docker compose cp "$file" 'flowhub:/data/private/stores.fhconfig'
+  Run-Docker compose exec -T --user root flowhub chown 10001:10001 /data/private/stores.fhconfig
+  Run-Docker compose exec -T flowhub chmod 600 /data/private/stores.fhconfig
+  $secure=Read-Host 'Connection unlock code (not your FlowHub password)' -AsSecureString
+  $ptr=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+  try {
+   $plain=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
+   $plain | & docker compose exec -T flowhub python -m flowhub.connection_bundle /data/private/stores.fhconfig
+   if ($LASTEXITCODE -ne 0) { throw 'Store import failed.' }
+  } finally { $plain=$null; [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr); $secure.Dispose() }
+  Write-Host 'Stores imported. Sign in to review, enable and select stores. No listing was started.'; exit
  }
  elseif ($Action -eq 'Backup') {
   $folder=Join-Path $PSScriptRoot 'backups'; New-Item -ItemType Directory -Force -Path $folder | Out-Null
