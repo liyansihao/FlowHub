@@ -2,13 +2,14 @@
 import {chromium} from 'playwright';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import {sourceNetworkArgs} from './source-network.mjs';
 const [sku,outDir,maxRoundsArg='8']=process.argv.slice(2);
 if(!/^\d+$/.test(sku||''))throw Error('numeric SKU required');
 const maxRounds=Math.min(40,Math.max(1,Number(maxRoundsArg)||8));
 const profile=process.env.FLOWHUB_SOURCE_PROFILE;
 if(!profile)throw Error('dedicated profile required');
 await fs.mkdir(outDir,{recursive:true});
-const c=await chromium.launchPersistentContext(profile,{channel:'chrome',headless:false,viewport:null,ignoreDefaultArgs:['--disable-extensions']});
+const c=await chromium.launchPersistentContext(profile,{channel:'chrome',headless:false,viewport:null,args:sourceNetworkArgs(),ignoreDefaultArgs:['--disable-extensions']});
 process.once('SIGTERM',()=>{void c.close().catch(()=>{});});
 process.once('SIGINT',()=>{void c.close().catch(()=>{});});
 let step='navigation',p;

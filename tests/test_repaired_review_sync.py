@@ -38,7 +38,8 @@ def test_changed_economics_identity_or_expiry_require_fresh_evaluation(change):
 
 
 @pytest.mark.asyncio
-async def test_repair_queue_moves_directly_to_publication_with_same_profit(tmp_path,monkeypatch):
+@pytest.mark.parametrize('manual',[False,True])
+async def test_repair_queue_preserves_approval_state_with_same_profit(tmp_path,monkeypatch,manual):
     import json,time
     from flowhub.db import Database
     from flowhub.source_library import SourceLibrary
@@ -46,6 +47,10 @@ async def test_repair_queue_moves_directly_to_publication_with_same_profit(tmp_p
     from flowhub.pipeline_modules.repair import PriceRepairModule
     db=Database(tmp_path);lib=SourceLibrary(db);pipeline.schema(db)
     review,p=fixture();now=time.time()
+    if manual:
+        review['state']='needs_review'
+        review['result'].update(manual_review=True,reason='qwen_match_outside_safe_band')
+        review['result']['evidence']['source']['comparebot']['decision']['outcome']='manual_review'
     review['finished_at']=now;p['collected_at']=now;p['plugin_detail']['observed_at']=now
     p['plugin_detail']['monthly_sales']['observed_at']=now
     review['candidate']['origin']['price_evidence']['observed_at']=now
@@ -60,6 +65,21 @@ async def test_repair_queue_moves_directly_to_publication_with_same_profit(tmp_p
     monkeypatch.setattr(PriceRepairModule,'run',repair);monkeypatch.setattr(pipeline,'evaluate',evaluate)
     await pipeline.tick(db,lane='seed_repair')
     with db.connect() as c:
-        assert c.execute('SELECT state FROM plugin_pipeline').fetchone()[0]=='publishing'
+        assert c.execute('SELECT state FROM plugin_pipeline').fetchone()[0]==('needs_review' if manual else 'publishing')
         saved=json.loads(c.execute('SELECT body FROM plugin_reviews').fetchone()[0])
         assert saved['result']==review['result'] and saved['finished_at']==now
+
+
+def test_manual_comparison_receives_dossier_without_approval_or_clock_refresh():
+    review,p=fixture();review['state']='needs_review'
+    review['result'].update(manual_review=True,reason='qwen_match_outside_safe_band')
+    review['result']['evidence']['source']['comparebot']['decision']['outcome']='manual_review'
+    original=copy.deepcopy(review)
+    assert repaired_review(review,p,now=101) is None
+    synced=repaired_review(review,p,now=101,allow_manual=True)
+    assert synced['state']=='needs_review' and synced['result']==original['result']
+    assert synced['finished_at']==100
+    assert 'publication_attributes_missing' not in synced['publication_blockers']
+    assert review==original
+    p['plugin_detail']['weight_g']=20
+    assert repaired_review(review,p,now=101,allow_manual=True) is None

@@ -139,10 +139,12 @@ async def session_detail(db,product,settings):
     process.kill();await process.wait()
 
 
-async def public_detail(db,product):
+async def public_detail(db,product,*,allow_browser=False):
  cfg=Path(db.directory)/'direct-first.json'
  settings=(json.loads(cfg.read_text()).get('browser_session') or {}) if cfg.exists() else {}
- if settings.get('enabled'):return await session_detail(db,product,settings)
+ if settings.get('enabled'):
+  if not allow_browser:return product,{'source':'ozon-session-page','fields':[],'reason':'browser_session_requires_explicit_authorization'}
+  return await session_detail(db,product,settings)
  path=Path(db.directory)/'public-detail-backoff.json';now=time.time()
  if path.exists():
   try:

@@ -1,0 +1,19 @@
+[build]
+  publish = "public"
+
+[functions]
+  directory = "functions"
+  node_bundler = "esbuild"
+  included_files = ["data/reviews.json"]
+
+[[redirects]]
+  from = "/api/reviews"
+  to = "/.netlify/functions/reviews"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/api/reviews/*"
+  to = "/.netlify/functions/reviews"
+  status = 200
+  force = true

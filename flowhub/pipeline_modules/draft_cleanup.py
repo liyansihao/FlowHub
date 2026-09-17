@@ -23,7 +23,7 @@ def config(db):
     p=Path(db.directory)/'draft-cleanup.json'
     d=DEFAULTS|json.loads(p.read_text()) if p.exists() else dict(DEFAULTS)
     if not 0<d['target_ratio']<d['threshold_ratio']<=1:raise ValueError('invalid cleanup thresholds')
-    if not 1<=d['batch_size']<=20 or d['minimum_age_seconds']<3600 or d['interval_seconds']<60:
+    if not 1<=d['batch_size']<=1000 or d['minimum_age_seconds']<0 or d['interval_seconds']<60:
         raise ValueError('invalid cleanup limits')
     return d
 
@@ -33,7 +33,7 @@ class Client:
     async def call(self,path,method='GET',params=None):
         # No automatic write retry. Every deletion is journaled first.
         try:return await self.api.erp(method,path,params=params)
-        finally:await asyncio.sleep(2.5)
+        finally:await asyncio.sleep(.2)
 
 
 def rows(data):return data if isinstance(data,list) else data.get('data',[])
@@ -77,7 +77,7 @@ def candidates(db,owner,settings):
         if not token:continue
         collector=SourceCollector(db,ctx);state,snapshot,updated=collector.load()
         if (state!='ready' or not snapshot.get('draft_id') or not snapshot.get('favorite_id')
-                or snapshot.get('recovery') or not snapshot.get('detail') or str(snapshot.get('source_key'))!=r['sku']
+                or (snapshot.get('recovery') and not settings.get('clear_completed')) or not snapshot.get('detail') or str(snapshot.get('source_key'))!=r['sku']
                 or time.time()-updated<settings['minimum_age_seconds']):continue
         account=hashlib.sha256((owner+':'+token).encode()).hexdigest()
         groups.setdefault(account,[]).append({'sku':r['sku'],'seller':r['seller'],'queue':json.loads(r['body']),
@@ -97,8 +97,8 @@ async def clean_account(db,owner,account,items,settings,client=None):
             journal(db,account,r['draft_id'],owner,r['sku'],'deleted',body)
     used=int(header.get('used',header.get('total',0)));limit=int(header.get('limit',0))
     summary={'used_before':used,'limit':limit,'deleted':0,'skipped':0}
-    if limit<=0 or used<limit*settings['threshold_ratio']:return summary|{'state':'below_threshold'}
-    count=min(settings['batch_size'],max(0,used-int(limit*settings['target_ratio'])))
+    if not settings.get('clear_completed') and (limit<=0 or used<limit*settings['threshold_ratio']):return summary|{'state':'below_threshold'}
+    count=min(settings['batch_size'],len(items) if settings.get('clear_completed') else max(0,used-int(limit*settings['target_ratio'])))
     touched=[];seen=set()
     for item in items:
         draft=str(item['snapshot']['draft_id']);sku=item['sku'];row=present.get(draft)
@@ -112,11 +112,17 @@ async def clean_account(db,owner,account,items,settings,client=None):
         current=client
         shop=item['context']['store']['config']['shop_id'];offer=item['queue'].get('offer_id')
         if not offer:continue
-        data=await current.call('/api.product.online/lists',params={'page':1,'page_size':100,'shop_id':shop,'offer_id':offer})
+        try:
+            data=await current.call('/api.product.online/lists',params={'page':1,'page_size':100,'shop_id':shop,'offer_id':offer})
+        except Exception:
+            summary['skipped']+=1;continue
         exact=[r for r in rows(data) if str(r.get('shop_id'))==str(shop) and str(r.get('offer_id'))==str(offer)]
         if len(exact)!=1 or exact[0].get('online_status')!='selling' or float(exact[0].get('stock') or 0)<=0:
             summary['skipped']+=1;continue
-        detail=await current.call('/api.product.collect/detail',params={'id':int(draft),'is_online':0})
+        try:
+            detail=await current.call('/api.product.collect/detail',params={'id':int(draft),'is_online':0})
+        except Exception:
+            summary['skipped']+=1;continue
         if not isinstance(detail,dict) or not detail.get('skus'):continue
         backup={'source_snapshot':item['snapshot'],'fresh_detail':detail,'draft_row':row,'online':exact[0],
                 'at':time.time(),'source_record':item['source_record'],'scope':'source draft only'}

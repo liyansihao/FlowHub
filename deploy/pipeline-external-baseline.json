@@ -1,9 +1,9 @@
 {
-  "description": "2026-09-13 tested external entrypoints; not a complete vendored dependency lock",
+  "description": "2026-09-17 captured external entrypoints; source freeze, not a full runtime dependency lock",
   "files": {
-    "ozon-runtime/lib/maozi-transport.mjs": "0621324f0bb26d36120c263df97dc040bfbe2480b9d13fb8ba5937ab6ddd0bea",
+    "ozon-runtime/lib/maozi-transport.mjs": "3df2318e7204ad8924f87acf57a4c1a382812a5010d5936ca2a205ee2e05df30",
     "ozon-runtime/lib/maozi-credentials.mjs": "5ea97a9557503bb0a16493f2422a3a03377d1a6d6c7b01efaa9e4e5b36b447e6",
-    "ozon-runtime/lib/plugin-source-policy.mjs": "8a5abac160d15ec8d295a5511b16b953c2f7f22aeb9c9a931a93925b84e1527a",
+    "ozon-runtime/lib/plugin-source-policy.mjs": "7d4fb9cbd8b8493da5e0a67050595a115b4153c3e31cff256ee1dd18f752f90b",
     "maozi_direct_new_method/maozi_new_method_direct.mjs": "b5e35470d2d7f27ffb59f2ee9ab37cb0c12404354d697d582840938d9651a9ed",
     "maozi_direct_new_method/lib/match-feedback.mjs": "47433d0826207bc691a6987d051954b3293cc1608b29d8eff7b8ecb3b585edcd",
     "maozi_direct_new_method/lib/portable-support/maozi-client.mjs": "c675862bfc42bb559fae39e8486ab2d6c0ad62bee701b75f3aab828f0df00f49",

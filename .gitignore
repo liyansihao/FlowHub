@@ -22,3 +22,11 @@ playwright-profile/
 .playwright-cli/
 
 node_modules/
+
+# Machine-local deployment metadata and credential tool configuration.
+.DS_Store
+.netlify/
+.vercel/
+.wrangler/
+tools/maozi-credential-refresh/config.json
+vercel-review/.agents/

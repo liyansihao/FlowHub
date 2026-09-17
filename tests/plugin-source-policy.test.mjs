@@ -38,3 +38,40 @@ test('asking-price intent permits old reference price without changing the obser
  assert.equal(p.price_evidence.observed_at,-30000);
  p.approved_listing_price.sku='9';assert.equal(Boolean(verifiedPluginPublication(p,101)),false);
 });
+
+test('direct dossiers require complete fresh exact field evidence',async()=>{
+ const {verifiedPluginPublication}=await import('../../ozon-runtime/lib/plugin-source-policy.mjs');
+ const p=product();p.profit_evaluation_only=true;p.allow_unknown_publication=true;p.price_evidence={value:40,currency:'CNY',observed_at:100};
+ p.plugin_detail={...p.plugin_detail,contract:'direct-field-dossier-v1',weight_g:20,dimensions_mm:[10,20,30],attributes:[{id:1}],field_observations:Object.fromEntries(['weight_g','dimensions_mm','attributes'].map(k=>[k,{sku:'1',source:'maozi-erp-draft',observed_at:100}]))};
+ assert.equal(verifiedPluginPublication(p,101),true);
+ for(const change of [x=>x.plugin_detail.attributes=[],x=>x.plugin_detail.field_observations.attributes.sku='9',x=>x.plugin_detail.field_observations.attributes.observed_at=-30000,x=>x.plugin_detail.field_observations.attributes.source='unverified',x=>x.allow_unknown_publication=false]){
+  const x=structuredClone(p);change(x);assert.equal(Boolean(verifiedPluginPublication(x,101)),false);
+ }
+});
+
+test('website native import keeps identity and restrictions while allowing platform-managed attributes',async()=>{
+ const {verifiedPluginPublication}=await import('../../ozon-runtime/lib/plugin-source-policy.mjs');
+ const p=product();p.allow_unknown_publication=true;
+ Object.assign(p.plugin_detail,{observed_at:1,weight_g:20,dimensions_mm:[10,20,30],attributes:[]});
+ p.website_listing_authorization={id:'user-order-12345',sku:'1',at:30000,same_product_confirmed:true};
+ p.approved_listing_price={kind:'approved_listing_price',sku:'1',currency:'CNY',value:40,decided_at:30000};
+ assert.equal(Boolean(verifiedPluginPublication(p,30001)),true);
+ for(const change of [x=>x.plugin_detail.monthly_sales.blocked_by_seller=true,x=>x.website_listing_authorization.sku='9',x=>x.plugin_detail.dimensions_mm=[],x=>delete x.approved_listing_price]){
+  const x=structuredClone(p);change(x);assert.equal(Boolean(verifiedPluginPublication(x,30001)),false);
+ }
+});
+
+test('authorized publication reuses static facts but not expired prices or changed bindings',async()=>{
+ const {verifiedPluginPublication}=await import('../../ozon-runtime/lib/plugin-source-policy.mjs');
+ const now=100+15*3600,p=product();
+ p.profit_evaluation_only=true;p.allow_unknown_publication=true;
+ p.approved_listing_price={kind:'approved_listing_price',sku:'1',currency:'CNY',value:40,decided_at:now};
+ p.plugin_detail={...p.plugin_detail,contract:'direct-field-dossier-v1',weight_g:20,dimensions_mm:[10,20,30],attributes:[{id:1}],field_observations:Object.fromEntries(['weight_g','dimensions_mm','attributes'].map(k=>[k,{sku:'1',source:'maozi-erp-draft',observed_at:100}]))};
+ assert.equal(Boolean(verifiedPluginPublication(p,now)),true);
+ assert.equal(p.plugin_detail.observed_at,100);
+ for(const change of [x=>x.approved_listing_price.decided_at=100,x=>x.allow_unknown_publication=false,x=>x.source_relation.seller_id='99',x=>x.plugin_detail.field_observations.attributes.source='unverified',x=>x.plugin_detail.monthly_sales.blocked_by_seller=true,x=>x.plugin_detail.monthly_sales.sales_schema='FBO']){
+  const x=structuredClone(p);change(x);assert.equal(Boolean(verifiedPluginPublication(x,now)),false);
+ }
+ p.approved_listing_price.decided_at=100+7*86400;
+ assert.equal(Boolean(verifiedPluginPublication(p,100+7*86400)),false);
+});

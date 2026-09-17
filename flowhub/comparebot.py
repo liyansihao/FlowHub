@@ -43,6 +43,30 @@ def manifest(candidate):
 
 
 async def screen(candidate, api_key="", *, ranking=None):
+    from .cluster_compute import remote
+    remote_allowed=ranking is None or os.environ.get('DASHSCOPE_BASE_URL','https://dashscope.aliyuncs.com/compatible-mode/v1')=='https://dashscope.aliyuncs.com/compatible-mode/v1'
+    remote_output=await remote('screen' if ranking is not None else 'rank',{
+        'manifest':manifest(candidate),'ranking':ranking,'api_key':api_key,
+        'qwen_model':os.environ.get('QWEN_VL_MODEL','qwen3-vl-plus')}) if remote_allowed else None
+    if remote_output is not None:
+        query=(remote_output.get('search_and_rank',remote_output).get('query') or {})
+        if str(query.get('product_id'))!=str(candidate['source_key']):
+            raise ModuleError('Windows compute product binding mismatch')
+        if ranking is not None:
+            # The worker may review, but cannot replace the ranked supplier set.
+            received=remote_output.get('search_and_rank',{}).get('candidates')
+            if received!=ranking.get('candidates'):
+                raise ModuleError('Windows compute supplier binding mismatch')
+            return remote_output
+        if remote_output.get('no_candidates'):
+            return {'search_and_rank':{'query':manifest(candidate),'candidates':[]},
+                    'decision':{'outcome':'manual_review','reason':'no_supplier_candidates','selected_offer_id':None}}
+        rows=remote_output['candidates'];top=rows[0] if rows else None
+        low=top is None or number(top['dinov2_similarity'],-1,1)<.63
+        return {'search_and_rank':remote_output,'decision':{
+            'outcome':'rejected' if low else 'manual_review',
+            'reason':'dinov2_low_similarity' if low else 'awaiting_erp_facts',
+            'selected_offer_id':top['candidate']['offer_id'] if top else None}}
     module_root = ROOT / "vendor/compareBot"
     env = os.environ.copy()
     env["PYTHONPATH"] = str(module_root / "src")
@@ -96,10 +120,15 @@ async def screen(candidate, api_key="", *, ranking=None):
                                              'selected_offer_id': None}}
                     raise
             else:
-                process = await asyncio.create_subprocess_exec(
-                    *args, cwd=folder, env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-                await asyncio.wait_for(process.wait(), 70 if ranking is not None else 90)
+                with (folder/'screen-error.log').open('wb') as error_log:
+                    process = await asyncio.create_subprocess_exec(
+                        *args, cwd=folder, env=env, stdout=asyncio.subprocess.DEVNULL, stderr=error_log)
+                    await asyncio.wait_for(process.wait(), 70 if ranking is not None else 90)
             if (process and process.returncode) or not output.is_file():
+                diagnostic=folder/'screen-error.log'
+                if ranking is None and diagnostic.is_file() and 'RuntimeError: 1688 image search returned no candidates' in diagnostic.read_text(errors='replace'):
+                    return {'search_and_rank':{'query':manifest(candidate),'candidates':[]},
+                            'decision':{'outcome':'manual_review','reason':'no_supplier_candidates','selected_offer_id':None}}
                 raise ModuleError(
                     "compareBot failed: check its Python environment, model and image-search connection"
                 )

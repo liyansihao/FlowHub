@@ -84,9 +84,7 @@ async def test_local_completed_draft_precedes_all_remote_reads(tmp_path,monkeypa
     async def unexpected(*args,**kwargs):pytest.fail('completed local draft must avoid network')
     monkeypatch.setattr(MaoziPublisher,'erp',unexpected)
     monkeypatch.setattr(SourceCollector,'collect',unexpected)
-    with db.connect() as c:
-        c.execute('INSERT INTO plugin_reviews VALUES(?,?,?,?)',(owner,'1','2',json.dumps({'state':'matched'})))
-    result=await PriceRepairModule().run(db,owner,'1','2')
+    result=await PriceRepairModule().run(db,owner,'1','2',full_dossier=True)
     assert result['state']=='ready' and result['missing_fields']==[]
     with db.connect() as c:
         event=json.loads(c.execute('SELECT body FROM plugin_repair_events').fetchone()[0])

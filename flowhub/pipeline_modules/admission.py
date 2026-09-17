@@ -57,18 +57,21 @@ def admit_one(db, owner, now=None):
         active=c.execute("SELECT count(*) FROM plugin_pipeline WHERE owner=? AND state IN ('queued','evaluating','publishing') AND NOT ("+remote_sql+")",(owner,)).fetchone()[0]
         if remote>=policy.get('max_remote_pending',40):return {'state':'backpressure','remote_pending':remote}
         repairs=c.execute("SELECT count(*) FROM plugin_pipeline WHERE owner=? AND state='needs_fields'",(owner,)).fetchone()[0]
-        if repairs>=policy.get('max_repair_pending',48):return {'state':'backpressure','repair_pending':repairs}
         active+=c.execute("SELECT count(*) FROM plugin_pipeline q JOIN plugin_pipeline_leases l USING(owner,sku,seller) WHERE q.owner=? AND q.state='needs_fields' AND l.expires>?",(owner,now)).fetchone()[0]
-        if active>=policy.get('max_inflight',12):return {'state':'backpressure','active':active}
+        if active>=max(1,policy.get('max_inflight',12)-(1 if repairs else 0)):return {'state':'backpressure','active':active}
+        promoted=promote_ready_candidate(c,db,owner,now)
+        if promoted:return promoted
         total=c.execute('SELECT count(*) FROM pipeline_admissions WHERE owner=? AND json_extract(body,\'$.run_id\')=?',(owner,policy['run_id'])).fetchone()[0]
         if policy.get('max_admissions') and total>=policy['max_admissions']:return {'state':'admission_limit'}
+        from .store_capacity import schema as capacity_schema
+        capacity_schema(c)
         stores=[]
         for sid in policy['store_ids']:
             store=c.execute('SELECT id,config FROM stores WHERE owner=? AND id=? AND verified=1',(owner,sid)).fetchone()
-            if store:
+            if store and not c.execute("SELECT 1 FROM store_publication_capacity WHERE owner=? AND store_id=? AND state='blocked'",(owner,sid)).fetchone():
                 config=json.loads(store['config'])
                 if all(config.get(k) for k in ('shop_id','warehouse_id','watermark_id')):stores.append(store)
-        if not stores:return {'state':'blocked','reason':'no_verified_target_store'}
+        if not stores:return {'state':'blocked','reason':'no_available_target_store'}
         # Alternate fresh discoveries and oldest backlog without starving either.
         order='DESC' if policy.get('mix_fresh_sources') and total%2==0 else 'ASC'
         # A bounded acceptance cohort must not get trapped between a growing
@@ -84,7 +87,7 @@ def admit_one(db, owner, now=None):
           AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.owner=p.owner AND j.source_key=p.sku)
           AND NOT EXISTS(SELECT 1 FROM blocks b WHERE b.owner=p.owner AND b.source_key=p.sku)
           ORDER BY CASE WHEN p.sku IN (SELECT value FROM json_each(?)) THEN 0 ELSE 1 END,
-          p.id '''+order+' LIMIT 200',(owner,cohort)).fetchall()
+          p.id '''+order,(owner,cohort))
         for row in rows:
             p=json.loads(row['body']);relation=p.get('source_relation') or {}
             if relation.get('seller_id')!=p.get('seller_id') or not relation.get('root_seeds'):continue
@@ -95,15 +98,48 @@ def admit_one(db, owner, now=None):
             if quote:
                 p.setdefault('price_intent_history',[]).append({'at':now,'previous':p.get('proposed_sale_price'),'reference_observed_at':p.get('collected_at')})
                 p['proposed_sale_price']={**quote,'observed_at':now,'source':'campaign-asking-price-decision','run_id':policy['run_id'],'reference_observed_at':p.get('collected_at')}
+            from .repair import valuation_ready
+            ready=valuation_ready(p)
+            if not ready and repairs>=policy.get('max_repair_pending',48):continue
             expires=min(now+policy.get('write_window_seconds',21600),policy.get('until') or float('inf'))
             c.execute('INSERT INTO pipeline_admissions VALUES(?,?,?,?,?)',(*key,now,json.dumps(stamp)))
             c.execute('INSERT INTO plugin_routes VALUES(?,?,?,?,?,?)',(*key,target['id'],expires,policy['run_id']))
             if policy.get('allow_unknown'):
                 c.execute('INSERT INTO plugin_publication_permissions VALUES(?,?,?,?,?)',(*key,expires,'campaign explicit unknown shipping/follow permission'))
-            c.execute("INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)",(*key,'needs_fields',json.dumps({'requested_at':now,'submitted':False,'campaign_run_id':policy['run_id']}),now,0))
+            c.execute("INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)",(*key,'queued' if ready else 'needs_fields',json.dumps({'requested_at':now,'submitted':False,'campaign_run_id':policy['run_id']}),now,0))
             SourceLibrary(db).put(owner,p,{'channel':'continuous-admission','run_id':policy['run_id']},connection=c)
             return {'state':'admitted','sku':row['sku'],'seller':row['seller']}
+        if repairs>=policy.get('max_repair_pending',48):return {'state':'backpressure','repair_pending':repairs}
         return {'state':'source_exhausted','reason':'no_new_bound_source_candidate'}
+
+
+
+def promote_ready_candidate(c, db, owner, now):
+    """New source facts can release an unmeasured candidate during repair backoff.
+
+    Called in admission's capacity-checked write transaction. Existing decisions,
+    publication repair and live repair leases stay with their respective lanes.
+    """
+    from .repair import valuation_ready
+    has_reviews=c.execute("SELECT 1 FROM sqlite_master WHERE name='plugin_reviews'").fetchone()
+    rows=c.execute("""SELECT q.*,p.body product FROM plugin_pipeline q
+        JOIN sourcing_products p USING(owner,sku,seller)
+        LEFT JOIN plugin_pipeline_leases l USING(owner,sku,seller)
+        WHERE q.owner=? AND q.state='needs_fields' AND (l.expires IS NULL OR l.expires<=?)
+        ORDER BY q.due""",(owner,now)).fetchall()
+    for row in rows:
+        key=(owner,row['sku'],row['seller']);body=json.loads(row['body'])
+        if body.get('submitted') or body.get('evaluation_state') or body.get('pending_publication_fields'):continue
+        if has_reviews and c.execute('SELECT 1 FROM plugin_reviews WHERE owner=? AND sku=? AND seller=?',key).fetchone():continue
+        product=json.loads(row['product'])
+        if not valuation_ready(product):continue
+        if body.get('repair_retry'):body.setdefault('repair_history',[]).append(body.pop('repair_retry'))
+        body.pop('error',None);body.pop('reason',None)
+        body.update(repair_reason='valuation_inputs_ready',updated_at=now)
+        c.execute("UPDATE plugin_pipeline SET state='queued',body=?,due=? WHERE owner=? AND sku=? AND seller=?",(json.dumps(body),now,*key))
+        product.setdefault('listing_review',{})['pipeline']={'state':'queued',**body}
+        SourceLibrary(db).put(owner,product,{'channel':'valuation-ready-promotion'},connection=c)
+        return {'state':'promoted','sku':row['sku'],'seller':row['seller']}
 
 
 

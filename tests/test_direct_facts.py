@@ -99,7 +99,7 @@ async def test_session_rendered_identity_decides_after_initial_403(tmp_path,monk
    return json.dumps({'initial_status':403,'html':html,'url':'https://www.ozon.ru/product/123/'}).encode(),b''
  async def spawn(*args,**kwargs):return Process()
  monkeypatch.setattr(direct_facts.asyncio,'create_subprocess_exec',spawn)
- p,step=await direct_facts.public_detail(db,{'sku':'123'})
+ p,step=await direct_facts.public_detail(db,{'sku':'123'},allow_browser=True)
  if exact:
   assert p['title']=='title' and step['initial_http_status']==403 and step['reason']=='exact_product_read'
  else:
@@ -117,3 +117,16 @@ def test_category_read_binds_exact_sku_and_converts_cm_without_inventing_attribu
  assert from_category({'sku':'999'},response,100)[1]['reason']=='sku_mismatch'
  empty,step=from_category(p,{'sku':'123','product_info':{}},100)
  assert not step['fields'] and not empty['plugin_detail'].get('weight_g')
+
+
+@pytest.mark.asyncio
+async def test_configured_browser_is_not_implicit_authorization(tmp_path,monkeypatch):
+ from flowhub.db import Database
+ import json
+ from flowhub.pipeline_modules import direct_facts
+ db=Database(tmp_path)
+ (tmp_path/'direct-first.json').write_text(json.dumps({'browser_session':{'enabled':True,'session':'existing'}}))
+ async def forbidden(*args):pytest.fail('browser requires explicit per-call authorization')
+ monkeypatch.setattr(direct_facts,'session_detail',forbidden)
+ p,step=await direct_facts.public_detail(db,{'sku':'123'})
+ assert step['reason']=='browser_session_requires_explicit_authorization'

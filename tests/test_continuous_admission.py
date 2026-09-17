@@ -55,7 +55,7 @@ async def test_late_readback_retains_queue_and_can_finish_after_restart(tmp_path
         c.execute('UPDATE plugin_pipeline SET due=0')
     async def sold(*args):return {'phase':'stock_verified','verified':True}
     monkeypatch.setattr(pipeline,'advance',sold)
-    await pipeline.tick(Database(tmp_path),lane='reconcile')
+    await pipeline.tick(Database(tmp_path),lane='reconcile_history')
     with db.connect() as c:assert c.execute('SELECT state FROM plugin_pipeline').fetchone()[0]=='selling'
 
 
@@ -182,3 +182,89 @@ def test_running_repair_reserves_a_main_slot(tmp_path):
         c.execute("UPDATE plugin_pipeline SET state='needs_fields'")
         c.execute('INSERT INTO plugin_pipeline_leases VALUES(?,?,?,?,?)',(owner,'1','3','lease',time.time()+120))
     assert admit_one(db,owner)['state']=='backpressure'
+
+
+def make_ready(db,owner,sku='2'):
+    with db.connect() as c:
+        p=json.loads(c.execute('SELECT body FROM sourcing_products WHERE sku=?',(sku,)).fetchone()[0])
+    p.update(image='https://example.com/a.jpg',url='https://www.ozon.ru/product/'+sku,
+             plugin_detail={'sku':sku,'weight_g':100},
+             proposed_sale_price={'value':20,'currency':'CNY','observed_at':time.time()})
+    SourceLibrary(db).put(owner,p,{'channel':'test'})
+
+
+def test_ready_admission_bypasses_full_repairs_but_respects_main_capacity(tmp_path):
+    db,owner=setup(tmp_path);admit_one(db,owner);make_ready(db,owner)
+    with db.connect() as c:c.execute("UPDATE pipeline_campaigns SET body=json_set(body,'$.max_repair_pending',1)")
+    assert admit_one(db,owner)['sku']=='2'
+    with db.connect() as c:
+        assert c.execute("SELECT state FROM plugin_pipeline WHERE sku='2'").fetchone()[0]=='queued'
+        assert c.execute("SELECT count(*) FROM plugin_pipeline WHERE state='needs_fields'").fetchone()[0]==1
+    assert admit_one(db,owner)['state']=='backpressure'
+
+
+def test_new_facts_promote_during_backoff_without_re_admission(tmp_path):
+    db,owner=setup(tmp_path);admit_one(db,owner);make_ready(db,owner,'1')
+    with db.connect() as c:
+        c.execute("UPDATE plugin_pipeline SET due=?,body=json_set(body,'$.repair_retry',json(?))",(time.time()+3600,json.dumps({'attempts':3})))
+    assert admit_one(db,owner)=={'state':'promoted','sku':'1','seller':'3'}
+    with db.connect() as c:
+        row=c.execute('SELECT * FROM plugin_pipeline').fetchone();body=json.loads(row['body'])
+        assert row['state']=='queued' and row['due']<=time.time()
+        assert body['repair_history']==[{'attempts':3}] and 'repair_retry' not in body
+        assert c.execute('SELECT count(*) FROM pipeline_admissions').fetchone()[0]==1
+
+
+@pytest.mark.parametrize('guard',['pause','lease','review','capacity'])
+def test_promotion_preserves_guards(tmp_path,guard):
+    db,owner=setup(tmp_path);admit_one(db,owner);make_ready(db,owner,'1')
+    with db.connect() as c:
+        if guard=='lease':c.execute('INSERT INTO plugin_pipeline_leases VALUES(?,?,?,?,?)',(owner,'1','3','live',time.time()+120))
+        if guard=='review':
+            c.execute('CREATE TABLE plugin_reviews(owner TEXT,sku TEXT,seller TEXT,body TEXT)')
+            c.execute('INSERT INTO plugin_reviews VALUES(?,?,?,?)',(owner,'1','3','{"state":"matched"}'))
+        if guard=='capacity':c.execute("INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)",(owner,'99','3','queued','{}',0,0))
+    if guard=='pause':set_paused(db,'seed',True)
+    assert admit_one(db,owner)['state']!='promoted'
+    with db.connect() as c:assert c.execute("SELECT state FROM plugin_pipeline WHERE sku='1'").fetchone()[0]=='needs_fields'
+
+
+@pytest.mark.asyncio
+async def test_first_repair_precedes_older_publication_retry(tmp_path,monkeypatch):
+    from flowhub import plugin_pipeline as pipeline
+    from flowhub.pipeline_modules.repair import PriceRepairModule
+    db,owner=setup(tmp_path);admit_one(db,owner);admit_one(db,owner)
+    with db.connect() as c:
+        c.execute("UPDATE plugin_pipeline SET due=0,body=json_set(body,'$.evaluation_state','matched','$.repair_retry',json('{\"attempts\":3}')) WHERE sku='1'")
+        c.execute("UPDATE plugin_pipeline SET due=1 WHERE sku='2'")
+    seen=[]
+    async def repair(*args):seen.append(args[-2]);return {'state':'waiting','reason':'missing:weight_g'}
+    monkeypatch.setattr(PriceRepairModule,'run',repair)
+    assert await pipeline.tick(db,lane='seed_repair')
+    assert seen==['2']
+
+
+@pytest.mark.asyncio
+async def test_second_repair_cannot_take_reserved_main_slot(tmp_path,monkeypatch):
+    from flowhub import plugin_pipeline as pipeline
+    from flowhub.pipeline_modules.repair import PriceRepairModule
+    db,owner=setup(tmp_path);admit_one(db,owner);admit_one(db,owner)
+    with db.connect() as c:c.execute('INSERT INTO plugin_pipeline_leases VALUES(?,?,?,?,?)',(owner,'1','3','live',time.time()+120))
+    async def repair(*args):pytest.fail('active repair already reserved only slot')
+    monkeypatch.setattr(PriceRepairModule,'run',repair)
+    assert not await pipeline.tick(db,lane='seed_repair')
+
+
+@pytest.mark.asyncio
+async def test_explicit_single_repair_runs_without_resuming_campaign(tmp_path,monkeypatch):
+    from flowhub import plugin_pipeline as pipeline
+    from flowhub.pipeline_modules.repair import PriceRepairModule
+    db,owner=setup(tmp_path);admit_one(db,owner);admit_one(db,owner)
+    set_paused(db,'seed',True);seen=[]
+    async def repair(*args):seen.append(args[-2]);return {'state':'ready','reason':'valuation_inputs_ready'}
+    monkeypatch.setattr(PriceRepairModule,'run',repair)
+    assert not await pipeline.tick(db,lane='seed_repair',target=(owner,'2','3'))
+    assert await pipeline.tick(db,lane='seed_repair',target=(owner,'2','3'),run_paused=True)
+    assert seen==['2'] and admit_one(db,owner)['state']=='paused'
+    with pytest.raises(ValueError):await pipeline.tick(db,lane='seed_repair',run_paused=True)
+    with pytest.raises(ValueError):await pipeline.tick(db,lane='submit',target=(owner,'2','3'),run_paused=True)

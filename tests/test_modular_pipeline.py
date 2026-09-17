@@ -92,7 +92,8 @@ def test_packet_reuse_requires_identity_freshness_and_complete_package():
     r={'candidate':{'source_key':'1','title':'a','image':'https://example.com/a.jpg','origin':{'plugin_detail':p}}}
     s=reviewed_snapshot(r,101)
     assert s['detail']['package_length']==150 and s['source']=='reviewed-plugin-packet'
-    assert reviewed_snapshot(r,30000) is None
+    assert reviewed_snapshot(r,30000) is not None
+    assert reviewed_snapshot(r,100+7*86400) is None
     for change in ({'sku':'2'},{'weight_g':float('nan')},{'attributes':[]}):
         r['candidate']['origin']['plugin_detail']=p|change
         assert reviewed_snapshot(r,101) is None
@@ -113,6 +114,8 @@ async def test_publication_locks_allow_different_stores_but_not_same_sku_or_stor
         if args[-2]=='1':started.set();await release.wait()
         return {}
     monkeypatch.setattr(publication,'_advance',advance)
+    from unittest.mock import AsyncMock
+    monkeypatch.setattr('flowhub.official_publication.advance_if_selected',AsyncMock(return_value=None))
     task=asyncio.create_task(publication.advance(db,owner,'1','2'));await started.wait()
     for sku in ('1','2'):
         with pytest.raises(BlockingIOError):await publication.advance(db,owner,sku,'2')
@@ -132,7 +135,7 @@ async def test_runtime_starts_configured_independent_worker_counts(tmp_path,monk
     monkeypatch.setattr(pipeline,'tick',tick)
     task=asyncio.create_task(run(db))
     await asyncio.wait_for(started.wait(),2)
-    assert counts=={'seed_repair':1,'review':2,'submit':2,'reconcile':2}
+    assert counts=={'seed_repair':1,'review':2,'submit':2,'reconcile':2,'reconcile_history':1}
     task.cancel()
     with pytest.raises(asyncio.CancelledError):await task
 
@@ -216,3 +219,18 @@ def test_refreshed_review_cannot_silently_change_prepared_economics():
     changed=copy.deepcopy(latest);changed['result']['purchase']=4
     with pytest.raises(ValueError,match='prepared_plan_repricing_required'):refresh_unchanged_plan(record,changed)
     assert record['review']=={'old':True}
+
+
+@pytest.mark.asyncio
+async def test_manual_history_cannot_occupy_normal_reconcile_lane(tmp_path,monkeypatch):
+    from unittest.mock import AsyncMock
+    db,_=setup(tmp_path)
+    with db.connect() as c:c.execute("UPDATE plugin_pipeline SET state='awaiting_remote',body=json_set(body,'$.phase','manual_review')")
+    advance=AsyncMock(return_value={'phase':'stock_pending','verified':False})
+    monkeypatch.setattr(pipeline,'advance',advance)
+    assert not await pipeline.tick(db,lane='reconcile')
+    advance.assert_not_awaited()
+    assert await pipeline.tick(db,lane='reconcile_history')
+    with db.connect() as c:c.execute('UPDATE plugin_pipeline SET due=0')
+    advance.return_value={'phase':'stock_verified','verified':True}
+    assert await pipeline.tick(db,lane='reconcile')

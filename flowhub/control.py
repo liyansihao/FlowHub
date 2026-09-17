@@ -12,6 +12,20 @@ import threading
 from .db import DATA, ROOT, Database
 
 
+def load_runtime_env():
+    """Load private runtime overrides without putting credentials in source or CLI args."""
+    path = DATA / "review-sync.env"
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.startswith("FLOWHUB_REVIEW_"):
+            os.environ.setdefault(key, value)
+
+
 
 def terminate_group(pid, sig):
     try:
@@ -22,6 +36,7 @@ def terminate_group(pid, sig):
 
 
 def serve():
+    load_runtime_env()
     Database()
     lock = (DATA / "supervisor.lock").open("w")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

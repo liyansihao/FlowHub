@@ -21,7 +21,7 @@ async def test_collection_cache_and_exact_source_no_publishing(tmp_path, context
     async def call(path, method="GET", query=None, body=None):
         calls.append((path, method, query, body))
         if path.endswith("/lists"):
-            return [{"id": 9, "sku": "wrong"}, {"id": 7, "sku": "123"}]
+            return {"data": [{"id": 9, "sku": "wrong"}, {"id": 7, "sku": "123"}], "total": 2}
         if path.endswith("/edit_import"):
             assert body == {"id": 7}
             return {"jump_id": 88}
@@ -33,7 +33,7 @@ async def test_collection_cache_and_exact_source_no_publishing(tmp_path, context
     second = SourceCollector(db, context)
     second.call = call
     assert await second.collect() == result
-    assert len(calls) == 3
+    assert len(calls) == 4
     assert all("/import_ozon" not in c[0] and "/stocks" not in c[0] for c in calls)
     assert b"test" not in db.path.read_bytes()
 
@@ -45,7 +45,7 @@ async def test_lost_draft_response_not_replayed(tmp_path, context):
     async def call(path, method="GET", query=None, body=None):
         nonlocal writes
         if path.endswith("/lists"):
-            return [{"id": 7, "sku": "123"}]
+            return {"data": [{"id": 7, "sku": "123"}], "total": 1}
         writes += 1
         raise TimeoutError()
 
@@ -209,7 +209,7 @@ async def test_existing_favorite_only_never_creates_unpriced_favorite(tmp_path, 
     collector.call = call
     with pytest.raises(Pending, match='real price'):
         await collector.collect()
-    assert calls == [('/api.product.favorite/lists', 'GET')]
+    assert calls == [('/api.product.favorite/lists', 'GET')] * 2
 
 
 async def test_capacity_refusal_can_retry_but_unknown_write_still_cannot(tmp_path,context):
@@ -217,7 +217,7 @@ async def test_capacity_refusal_can_retry_but_unknown_write_still_cannot(tmp_pat
     from flowhub.source_detail import SourceAcquisitionFailure
     db=Database(tmp_path);one=SourceCollector(db,context);writes=[]
     async def full(path,method='GET',query=None,body=None):
-        if path.endswith('/lists'):return [{'id':7,'sku':'123'}]
+        if path.endswith('/lists'):return {'data':[{'id':7,'sku':'123'}],'total':1}
         writes.append(path)
         raise SourceAcquisitionFailure('ERP_SOURCE_REJECTED',{'api_code':0,'api_message':'采集箱已满，上限1000个','operation':path})
     one.call=full
@@ -225,7 +225,7 @@ async def test_capacity_refusal_can_retry_but_unknown_write_still_cannot(tmp_pat
     assert one.load()[0]=='draft_rejected'
     with db.connect() as c:c.execute('UPDATE source_details SET updated=?',(time.time()-121,))
     async def freed(path,method='GET',query=None,body=None):
-        if path.endswith('/lists'):return [{'id':7,'sku':'123'}]
+        if path.endswith('/lists'):return {'data':[{'id':7,'sku':'123'}],'total':1}
         if path.endswith('/edit_import'):writes.append(path);return {'jump_id':88}
         return {'skus':[{}]}
     two=SourceCollector(db,context);two.call=freed
@@ -255,3 +255,227 @@ async def test_unknown_draft_is_recovered_by_exact_listing_without_writes(tmp_pa
     else:
         assert (await one.collect())['draft_id']==88
         assert one.load()[0]=='ready'
+
+
+async def test_explicit_favorite_capacity_refusal_is_retryable_after_backoff(tmp_path,context):
+    import time
+    from flowhub.source_detail import SourceAcquisitionFailure
+    db=Database(tmp_path);one=SourceCollector(db,context);writes=[]
+    async def call(path,method='GET',query=None,body=None):
+        if path.endswith('/lists'):return []
+        writes.append(path)
+        raise SourceAcquisitionFailure('ERP_SOURCE_REJECTED',{'api_code':0,'operation':path,'write_outcome_unknown':False,'api_message':'收藏数量已达上限（3000个），请先删除部分收藏'})
+    one.call=call
+    with pytest.raises(SourceAcquisitionFailure):await one.collect()
+    state,data,_=one.load()
+    assert state=='favorite_rejected' and not data.get('favorite_attempted')
+    with pytest.raises(Pending):await one.collect()
+    assert len(writes)==1
+    with db.connect() as c:c.execute('UPDATE source_details SET updated=?',(time.time()-121,))
+    with pytest.raises(SourceAcquisitionFailure):await one.collect()
+    assert len(writes)==2
+
+
+def age_collection(collector):
+    import time
+    with collector.db.connect() as connection:
+        connection.execute('UPDATE source_details SET updated=? WHERE key=?',
+                           (time.time() - 121, collector.key))
+
+
+async def test_favorite_lookup_reads_both_groups_and_server_capped_pages(tmp_path, context):
+    collector = SourceCollector(Database(tmp_path), context)
+    calls = []
+
+    async def read(path, method='GET', query=None, body=None):
+        assert method == 'GET'
+        assert query['sku'] == '123' and query['page_size'] == 100
+        group, page = query['is_imported'], query['page']
+        calls.append((group, page))
+        if group == 0:
+            return {'data': [], 'total': 0}
+        # The server caps pages at one row and ignores the SKU filter.
+        row = {'id': 8, 'sku': '999'} if page == 1 else {'id': 7, 'sku': '123'}
+        return {'data': [row], 'total': '2', 'per_page': 1}
+
+    collector.call = read
+    assert (await collector.find_favorite())['id'] == 7
+    assert calls == [(0, 1), (1, 1), (1, 2)]
+
+
+@pytest.mark.parametrize('field', ['data', 'list', 'rows', 'items', None])
+async def test_favorite_lookup_without_total_requires_empty_terminal_page(tmp_path, context, field):
+    collector = SourceCollector(Database(tmp_path), context)
+
+    async def read(path, method='GET', query=None, body=None):
+        rows = [{'id': 7, 'sku': '123'}] if query['page'] == 1 else []
+        return {field: rows} if field else rows
+
+    collector.call = read
+    assert (await collector.find_favorite())['id'] == 7  # Same ID across groups is one favorite.
+
+
+@pytest.mark.parametrize('response', [None, {}, {'data': {}}, {'data': [None]},
+                                     {'data': [{'sku': '123'}]}, {'data': [], 'total': 'bad'},
+                                     {'data': [], 'total': 1}, {'data': [], 'total': True}])
+async def test_invalid_listing_never_authorizes_creation(tmp_path, context, response):
+    collector = SourceCollector(Database(tmp_path), context)
+
+    async def read(path, method='GET', query=None, body=None):
+        assert method == 'GET'
+        return response
+
+    collector.call = read
+    with pytest.raises(Pending):
+        await collector.collect()
+    assert collector.load()[0] == 'new'
+
+
+async def test_repeated_page_and_duplicate_sku_do_not_authorize_write(tmp_path, context):
+    collector = SourceCollector(Database(tmp_path), context)
+
+    async def repeated(path, method='GET', query=None, body=None):
+        assert method == 'GET'
+        return {'data': [{'id': 7, 'sku': '123'}], 'total': 2}
+
+    collector.call = repeated
+    with pytest.raises(Pending, match='repeated'):
+        await collector.collect()
+
+    async def ambiguous(path, method='GET', query=None, body=None):
+        assert method == 'GET'
+        return {'data': [{'id': 7 + query['is_imported'], 'sku': '123'}], 'total': 1}
+
+    collector.call = ambiguous
+    with pytest.raises(ModuleError, match='ambiguous'):
+        await collector.collect()
+
+
+@pytest.mark.parametrize('existing_only', [False, True])
+async def test_legacy_unknown_is_not_reset_by_missing_favorite_or_old_rejection(tmp_path, context, existing_only):
+    context['existing_favorite_only'] = existing_only
+    collector = SourceCollector(Database(tmp_path), context)
+    collector.save('favorite_started', {'favorite_attempted': True})
+    # Historical events are owner/SKU scoped, not bound to this account/write attempt.
+    with collector.db.connect() as connection:
+        connection.execute('CREATE TABLE plugin_repair_events(owner TEXT,sku TEXT,body TEXT)')
+        connection.execute('INSERT INTO plugin_repair_events VALUES(?,?,?)',
+                           ('a', '123', '{"api_code":0,"api_message":"收藏数量已达上限","write_outcome_unknown":false}'))
+
+    async def read(path, method='GET', query=None, body=None):
+        assert method == 'GET'
+        return {'data': [], 'total': 0}
+
+    collector.call = read
+    for _ in range(2):
+        age_collection(collector)
+        with pytest.raises(Pending, match='favorite creation not confirmed'):
+            await collector.collect()
+        assert collector.load()[0] == 'favorite_started'
+        assert collector.load()[1]['favorite_attempted'] is True
+
+
+@pytest.mark.parametrize('override', [ {'write_outcome_unknown': True}, {'write_outcome_unknown': None},
+                                      {'api_code': 1}, {'operation': '/other'}, {'api_message': 'timeout'}])
+async def test_inexact_capacity_failure_remains_unknown(tmp_path, context, override):
+    from flowhub.source_detail import SourceAcquisitionFailure
+    collector = SourceCollector(Database(tmp_path), context)
+    writes = []
+
+    async def call(path, method='GET', query=None, body=None):
+        if method == 'GET':
+            return []
+        writes.append(path)
+        raise SourceAcquisitionFailure('ERP_SOURCE_REJECTED', {
+            'api_code': 0, 'operation': path, 'write_outcome_unknown': False,
+            'api_message': '收藏数量已达上限', **override,
+        })
+
+    collector.call = call
+    with pytest.raises(SourceAcquisitionFailure):
+        await collector.collect()
+    assert collector.load()[0] == 'favorite_started'
+    age_collection(collector)
+    with pytest.raises(Pending, match='not confirmed'):
+        await collector.collect()
+    assert len(writes) == 1
+
+
+async def test_lost_favorite_acknowledgement_is_not_replayed_after_read_failure(tmp_path, context):
+    collector = SourceCollector(Database(tmp_path), context)
+    writes = []
+
+    async def call(path, method='GET', query=None, body=None):
+        if method == 'GET':
+            return []
+        writes.append(path)
+        raise TimeoutError()
+
+    collector.call = call
+    with pytest.raises(TimeoutError):
+        await collector.collect()
+    age_collection(collector)
+
+    async def failed_read(path, method='GET', query=None, body=None):
+        assert method == 'GET'
+        raise TimeoutError()
+
+    collector.call = failed_read
+    with pytest.raises(TimeoutError):
+        await collector.collect()
+    assert collector.load()[0] == 'favorite_started'
+    age_collection(collector)
+    collector.call = call
+    with pytest.raises(Pending):
+        await collector.collect()
+    assert len(writes) == 1
+
+
+async def test_imported_favorite_recovers_existing_draft_without_import(tmp_path, context):
+    collector = SourceCollector(Database(tmp_path), context)
+    collector.recovery_pages.clear()
+    collector.save('favorite_started', {'favorite_attempted': True})
+    age_collection(collector)
+
+    async def read(path, method='GET', query=None, body=None):
+        assert method == 'GET'
+        if path == '/api.product.favorite/lists':
+            rows = [{'id': 7, 'sku': '123', 'is_imported': 1}] if query['is_imported'] else []
+            return {'data': rows, 'total': len(rows)}
+        if path == '/api.product.collect/lists':
+            return {'data': [{'id': 88, 'goods_id': '123', 'collect_from': 'ozon'}], 'total': 1}
+        assert query == {'id': 88, 'is_online': 0}
+        return {'skus': [{}]}
+
+    collector.call = read
+    assert (await collector.collect())['draft_id'] == 88
+
+
+@pytest.mark.parametrize('unknown', [False, True])
+async def test_lost_claim_during_lookup_does_not_overwrite_new_owner(tmp_path, context, unknown):
+    collector = SourceCollector(Database(tmp_path), context)
+    collector.save('favorite_started' if unknown else 'claimed', {'favorite_attempted': unknown})
+    age_collection(collector)
+
+    async def read(path, method='GET', query=None, body=None):
+        assert method == 'GET'
+        collector.save('draft_started', {'favorite_id': 99})
+        return {'data': [], 'total': 0}
+
+    collector.call = read
+    with pytest.raises(Pending, match='claim changed'):
+        await collector.collect()
+    assert collector.load()[:2] == ('draft_started', {'favorite_id': 99})
+
+async def test_recent_cache_write_does_not_renew_old_draft_observation(tmp_path,context):
+    import time
+    db=Database(tmp_path);collector=SourceCollector(db,context)
+    collector.save('ready',{'source_key':'123','draft_id':88,'observed_at':time.time()-21601,'detail':{'title':'old'}})
+    calls=[]
+    async def call(path,method='GET',query=None,body=None):
+        calls.append((path,method));assert query=={'id':88,'is_online':0}
+        return {'title':'fresh'}
+    collector.call=call
+    result=await collector.collect()
+    assert calls==[('/api.product.collect/detail','GET')]
+    assert result['detail']['title']=='fresh' and time.time()-result['observed_at']<2

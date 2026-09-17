@@ -1,17 +1,28 @@
 """Reuse the exact reviewed source packet; never create another ERP draft for it."""
 import time
 
+STATIC_DOSSIER_MAX_AGE = 7 * 86400
+
 
 def reviewed_snapshot(review, now=None):
     now=time.time() if now is None else now
     candidate=review['candidate'];origin=candidate['origin'];detail=origin.get('plugin_detail') or {}
     observed=detail.get('observed_at',0)
+    website=bool(review.get('website_listing_authorization',{}).get('id') and review.get('identity_review',{}).get('verdict')=='match' and (review.get('identity_review',{}).get('human_review') or review.get('identity_review',{}).get('automatic_review')))
     if detail.get('contract') not in ('maozi-plugin-sku-detail-v1','maozi-erp-draft-detail-v1','direct-field-dossier-v1') or str(detail.get('sku'))!=str(candidate['source_key']):
         return None
-    if not isinstance(observed,(int,float)) or not 0<=now-observed<21600:
+    if not isinstance(observed,(int,float)) or observed<=0 or not 0<=now-observed or (not website and now-observed>=STATIC_DOSSIER_MAX_AGE):
         return None
+    if detail.get('contract')=='direct-field-dossier-v1' and not website:
+        for field in ('weight_g','dimensions_mm','attributes'):
+            evidence=(detail.get('field_observations') or {}).get(field) or {}
+            stamp=evidence.get('observed_at')
+            if (str(evidence.get('sku'))!=str(candidate['source_key'])
+                or evidence.get('source') not in ('maozi-erp-draft','maozi-category-by-sku','ozon-product-page')
+                or not isinstance(stamp,(int,float)) or stamp<=0 or not 0<=now-stamp<STATIC_DOSSIER_MAX_AGE):
+                return None
     dims=detail.get('dimensions_mm') or []
-    if len(dims)!=3 or not detail.get('attributes') or not candidate.get('title') or not candidate.get('image'):
+    if len(dims)!=3 or (not website and not detail.get('attributes')) or not candidate.get('title') or not candidate.get('image'):
         return None
     try:
         values=[float(v) for v in [*dims,detail.get('weight_g')]]
@@ -22,7 +33,24 @@ def reviewed_snapshot(review, now=None):
             'source':'reviewed-plugin-packet','detail':{
                 'title':candidate['title'],'package_length':values[0],
                 'package_width':values[1],'package_height':values[2],'package_weight':values[3],
-                'attributes':detail['attributes'],'variant_id':detail.get('variant_id')}}
+                'attributes':detail.get('attributes') or [],'variant_id':detail.get('variant_id')}}
+
+
+def require_unchanged_source(review, latest):
+    """Older static facts are reusable only while newer known facts agree."""
+    candidate=review['candidate'];origin=candidate['origin']
+    if str(latest.get('sku'))!=str(candidate['source_key']) or str(latest.get('seller_id'))!=str(origin.get('seller_id')):
+        raise ValueError('source_identity_changed')
+    for field in ('title','image'):
+        if latest.get(field) and latest[field]!=candidate.get(field):
+            raise ValueError('source_comparison_changed')
+    before=origin.get('plugin_detail') or {};after=latest.get('plugin_detail') or {}
+    for field in ('weight_g','dimensions_mm','attributes','variant_id'):
+        if after.get(field) and after[field]!=before.get(field):
+            raise ValueError('source_package_or_attributes_changed')
+    monthly=after.get('monthly_sales') or {}
+    if monthly.get('blocked_by_seller') is True or monthly.get('sales_schema') not in (None,'','FBS'):
+        raise ValueError('explicit_source_restriction')
 
 
 def refresh_unchanged_plan(record, latest):
@@ -72,14 +100,31 @@ def refresh_procurement_plan(connection, journal_path, record, latest):
     return revised
 
 
-def repaired_review(review, product, now=None):
+def repaired_review(review, product, now=None, *, allow_manual=False):
     """Attach complete new facts to an unchanged, still-valid approved valuation."""
     import copy
     from ..plugin_comparebot import candidate
     from .pricing import approved_price_intent
     from ..plugin_publication import same_postal_package
     now=time.time() if now is None else now
-    if approved_price_intent(review,now) is None:return None
+    if approved_price_intent(review,now) is None:
+        # Supplement a still-current human comparison without turning it into approval.
+        # The automatic repair-to-publication path does not enable this option.
+        if not allow_manual:return None
+        try:
+            import math
+            result=review['result'];source=result['evidence']['source'];profit=result['evidence']['profit']
+            decision=source['comparebot']['decision']
+            price=float(profit['sell_price_cny']);cost=float(source['selected_cost_cny'])
+            if (review['state']!='needs_review' or not result.get('manual_review')
+                or not str(result.get('reason','')).startswith('qwen_')
+                or decision.get('outcome')!='manual_review'
+                or not source.get('selected_offer_id')
+                or not 0<=now-review['finished_at']<21600
+                or not math.isfinite(price) or price<=0 or not math.isfinite(cost) or cost<=0
+                or price!=float(profit['input']['sell_price'])
+                or cost!=float(profit['input']['purchase_price'])):return None
+        except (KeyError,ValueError,TypeError):return None
     try:
         latest=candidate(product,now=now)
         old=review['candidate']
@@ -99,13 +144,13 @@ def repaired_review(review, product, now=None):
     except (ValueError,KeyError,TypeError):return None
 
 
-def synchronize_repaired_review(connection, key):
+def synchronize_repaired_review(connection, key, *, allow_manual=False):
     """Caller owns the queue lease and transaction; never overwrite a newer review."""
     import json
     row=connection.execute('SELECT body FROM plugin_reviews WHERE owner=? AND sku=? AND seller=?',key).fetchone()
     product=connection.execute('SELECT body FROM sourcing_products WHERE owner=? AND sku=? AND seller=?',key).fetchone()
     if not row or not product:return False
-    updated=repaired_review(json.loads(row[0]),json.loads(product[0]))
+    updated=repaired_review(json.loads(row[0]),json.loads(product[0]),allow_manual=allow_manual)
     if updated is None:return False
     connection.execute('UPDATE plugin_reviews SET body=? WHERE owner=? AND sku=? AND seller=?',(json.dumps(updated),*key))
     return True

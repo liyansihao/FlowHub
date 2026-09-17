@@ -68,7 +68,9 @@ async function main(){
   const review=d?.qwen_review||{};
   const row=rows.find(r=>String(r.candidate.offer_id)===String(d?.selected_offer_id));
   const provisional=source.evaluation_only===true&&d?.outcome==='manual_review';
-  const qualified=d?.outcome==='approved'&&!review.brand_or_model_conflict&&((Number(row?.dinov2_similarity)>=0.86&&source.comparebot.search_and_rank.query.size==='small')||(Number(row?.dinov2_similarity)>=0.82&&review.verdict==='match'));
+  const website=product.website_listing_authorization;
+  const humanConfirmed=website?.same_product_confirmed===true&&String(website.sku)===String(product.sku)&&typeof website.id==='string'&&website.id.length>10&&Date.now()/1000-website.at>=0&&Date.now()/1000-website.at<86400&&d?.human_review?.actor&&!review.brand_or_model_conflict;
+  const qualified=humanConfirmed||d?.outcome==='approved'&&!review.brand_or_model_conflict&&((Number(row?.dinov2_similarity)>=0.86&&source.comparebot.search_and_rank.query.size==='small')||(Number(row?.dinov2_similarity)>=0.82&&review.verdict==='match'));
   if((!provisional&&!qualified)||!row||!Number.isFinite(Number(row.dinov2_similarity))||Number(row.dinov2_similarity)<0.63||Number(row.dinov2_similarity)>1||String(source.selected_offer_id)!==String(d.selected_offer_id)
    ||!/^\d+$/.test(String(source.selected_offer_id))
    ||source.selected_offer_url!==`https://detail.1688.com/offer/${source.selected_offer_id}.html`

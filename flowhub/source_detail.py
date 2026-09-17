@@ -113,6 +113,76 @@ class SourceCollector:
                 (self.key, state, self.db.seal(data), time.time()),
             )
 
+    def renew_claim(self):
+        # A paginated lookup can outlive the lease. Only its current owner may continue.
+        now = time.time()
+        with self.db.connect() as db:
+            changed = db.execute(
+                "UPDATE source_details SET updated=? WHERE key=? AND state='claimed' AND updated=?",
+                (now, self.key, self.claim_updated),
+            ).rowcount
+        if changed != 1:
+            raise Pending("source acquisition claim changed; no write repeated")
+        self.claim_updated = now
+
+    async def find_favorite(self, *, claimed=False):
+        # Legacy Maozi uses separate imported/unimported listings. Do not assume SKU
+        # filtering or a requested page size is honored, and never treat malformed or
+        # truncated data as proof that a favorite does not exist.
+        matches = {}
+        for imported in (0, 1):
+            seen = set()
+            total_seen = 0
+            for page in range(1, 101):
+                if claimed:
+                    self.renew_claim()
+                response = await self.call(
+                    "/api.product.favorite/lists",
+                    query={"sku": self.sku, "is_imported": imported, "page": page, "page_size": 100},
+                )
+                if isinstance(response, list):
+                    rows, total = response, None
+                elif isinstance(response, dict):
+                    rows = next((response[k] for k in ("data", "list", "rows", "items")
+                                 if isinstance(response.get(k), list)), None)
+                    total = response.get("total")
+                else:
+                    rows, total = None, None
+                if rows is None or any(not isinstance(row, dict) for row in rows):
+                    raise Pending("invalid favorite recovery listing")
+                if total is not None:
+                    if isinstance(total, bool) or not str(total).isdigit():
+                        raise Pending("invalid favorite recovery total")
+                    total = int(total)
+                ids = []
+                for row in rows:
+                    identifier = str(row.get("id", ""))
+                    if not identifier.isdigit() or int(identifier) <= 0:
+                        raise Pending("invalid favorite recovery identity")
+                    identifier = int(identifier)
+                    if identifier in seen or identifier in ids:
+                        raise Pending("favorite recovery pagination repeated; listing incomplete")
+                    ids.append(identifier)
+                    if str(row.get("sku")) == self.sku:
+                        matches[identifier] = row
+                seen.update(ids)
+                total_seen += len(rows)
+                if total is not None:
+                    if total_seen > total:
+                        raise Pending("favorite recovery listing changed; lookup again later")
+                    if total_seen == total:
+                        break
+                    if not rows:
+                        raise Pending("favorite recovery listing incomplete")
+                elif not rows:
+                    break
+                # Without a total, even a short page can be a server-side size cap.
+            else:
+                raise Pending("favorite recovery listing incomplete")
+        if len(matches) > 1:
+            raise ModuleError("ambiguous source favorite")
+        return next(iter(matches.values()), None)
+
     async def recover_draft(self, data):
         # Read-only full listing, cached per owner/account. Never infer success from a favorite.
         account=self.c['owner']+':'+hashlib.sha256(self.keys.get('erp_token','').encode()).hexdigest()
@@ -150,7 +220,10 @@ class SourceCollector:
                 == 1
             )
         state, data, updated = self.load()
-        if state == "ready" and time.time() - updated < 21600:
+        observed = data.get('observed_at')
+        if (state == "ready" and 0 <= time.time() - updated < 21600
+                and isinstance(observed, (int, float)) and not isinstance(observed, bool)
+                and 0 <= time.time() - observed < 21600):
             return data
         if data.get("draft_id"):
             detail = await self.call(
@@ -163,7 +236,7 @@ class SourceCollector:
             return data
         if not inserted and state=="draft_started" and time.time()-updated>120:
             return await self.recover_draft(data)
-        if not inserted and state in ("claimed", "favorite_started", "draft_rejected") and time.time() - updated > 120:
+        if not inserted and state in ("claimed", "favorite_started", "favorite_rejected", "draft_rejected") and time.time() - updated > 120:
             # A read may be retried after its bounded subprocess timeout. A favorite write
             # is recovered by lookup only; the write itself is never replayed.
             if state == "favorite_started":
@@ -178,52 +251,67 @@ class SourceCollector:
                 )
         if not inserted:
             raise Pending("source draft outcome unresolved; not creating another draft")
+        self.claim_updated = self.load()[2]
         try:
-            favorites = await self.call(
-                "/api.product.favorite/lists", query={"sku": self.sku, "page": 1, "page_size": 100}
-            )
+            favorite = await self.find_favorite(claimed=True)
+            self.renew_claim()
         except BaseException:
             if data.get("favorite_attempted"):
-                self.save("favorite_started", data)
+                with self.db.connect() as db:
+                    db.execute(
+                        "UPDATE source_details SET state='favorite_started',body=?,updated=? "
+                        "WHERE key=? AND state='claimed' AND updated=?",
+                        (self.db.seal(data), time.time(), self.key, self.claim_updated),
+                    )
             else:
                 with self.db.connect() as db:
-                    db.execute("DELETE FROM source_details WHERE key=? AND state='claimed'", (self.key,))
+                    db.execute(
+                        "DELETE FROM source_details WHERE key=? AND state='claimed' AND updated=?",
+                        (self.key, self.claim_updated),
+                    )
             raise
-        rows = favorites if isinstance(favorites, list) else favorites.get("data", [])
-        matches = [r for r in rows if str(r.get("sku")) == self.sku]
-        if len(matches) > 1:
-            raise ModuleError("ambiguous source favorite")
-        if not matches:
-            if self.c.get("existing_favorite_only"):
-                self.save("claimed", data)
-                raise Pending("source favorite missing; a real price is required before creating one")
+        if favorite is None:
             if data.get("favorite_attempted"):
                 self.save("favorite_started", data)
                 raise Pending("favorite creation not confirmed; lookup again later")
-            self.save("favorite_started", {"favorite_attempted": True})
+            if self.c.get("existing_favorite_only"):
+                self.save("claimed", data)
+                raise Pending("source favorite missing; a real price is required before creating one")
+            self.save("favorite_started", {"source_key": self.sku, "favorite_attempted": True})
             p = self.c["candidate"]
-            await self.call(
-                "/api.product.favorite/toggle",
-                "POST",
-                body={
-                    "status": True,
-                    "productInfo": {
-                        "sku": self.sku,
-                        "title": p.get("title", ""),
-                        "coverImage": p.get("image", ""),
-                        "price_info": {"sell_price": p["price"], "currency": "CNY"},
+            try:
+                await self.call(
+                    "/api.product.favorite/toggle",
+                    "POST",
+                    body={
+                        "status": True,
+                        "productInfo": {
+                            "sku": self.sku,
+                            "title": p.get("title", ""),
+                            "coverImage": p.get("image", ""),
+                            "price_info": {"sell_price": p["price"], "currency": "CNY"},
+                        },
                     },
-                },
-            )
-            favorites = await self.call(
-                "/api.product.favorite/lists", query={"sku": self.sku, "page": 1, "page_size": 100}
-            )
-            rows = favorites if isinstance(favorites, list) else favorites.get("data", [])
-            matches = [r for r in rows if str(r.get("sku")) == self.sku]
-        if len(matches) != 1:
-            raise ModuleError("source favorite not confirmed")
-        data = {"source_key": self.sku, "favorite_id": int(matches[0]["id"])}
+                )
+            except SourceAcquisitionFailure as error:
+                diagnostic=error.diagnostic
+                if (diagnostic.get('api_code')==0
+                        and diagnostic.get('operation')=='/api.product.favorite/toggle'
+                        and diagnostic.get('write_outcome_unknown') is False
+                        and '收藏数量已达上限' in str(diagnostic.get('api_message',''))):
+                    self.save('favorite_rejected',{'source_key':self.sku,'last_rejection':diagnostic})
+                raise
+            # Keep the unknown marker while renewing the lease for a long lookup.
+            self.save("claimed", {"source_key": self.sku, "favorite_attempted": True})
+            self.claim_updated = self.load()[2]
+            favorite = await self.find_favorite(claimed=True)
+            self.renew_claim()
+        if favorite is None:
+            raise Pending("favorite creation not confirmed; lookup again later")
+        data = {"source_key": self.sku, "favorite_id": int(favorite["id"])}
         self.save("draft_started", data)
+        if str(favorite.get("is_imported")) == "1":
+            return await self.recover_draft(data)
         try:
             draft = await self.call("/api.product.favorite/edit_import", "POST", body={"id": data["favorite_id"]})
         except SourceAcquisitionFailure as error:

@@ -501,7 +501,8 @@ class Worker:
                     os.environ['FLOWHUB_COMPAREBOT_WARM']='1'
                     from .pipeline_modules.runtime import run
                     return await run(self.db,review_workers=config.get('review_workers',2),
-                                     submit_workers=config.get('submit_workers',2),reconcile_workers=config.get('reconcile_workers',2))
+                                     submit_workers=config.get('submit_workers',2),reconcile_workers=config.get('reconcile_workers',2),
+                                     seed_workers=config.get('seed_workers',1))
             while True:
                 try:
                     await tick(self.db)
@@ -509,8 +510,13 @@ class Worker:
                     self.db.health('plugin-pipeline-error')
                 await asyncio.sleep(2)
 
+        async def remote_review_sync():
+            from .remote_reviews import run
+            await run(self.db)
+
         tasks = [asyncio.create_task(heartbeat()), asyncio.create_task(refill()),
-                 asyncio.create_task(collect_sources()), asyncio.create_task(plugin_publications())]
+                 asyncio.create_task(collect_sources()), asyncio.create_task(plugin_publications()),
+                 asyncio.create_task(remote_review_sync())]
         try:
             while True:
                 for task in tasks:

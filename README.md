@@ -1,3 +1,5 @@
+> 2026-09-17：当前固定源码基线、校验与运行边界见[固定版本说明](docs/FIXED_RUNTIME_20260917.md)。下文较早的版本和测试数字为历史记录。
+
 # FlowHub · 开发预览版
 
 开发状态与已知限制见 [开发状态](docs/DEVELOPMENT_STATUS.md)，参与开发先看 [当前协作交接](docs/COLLABORATOR_HANDOFF.md) 和 [协作指南](CONTRIBUTING.md)。当前真实链路仍有本机外部依赖；克隆源码不等于已配置可用的生产服务。

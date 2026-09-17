@@ -3,6 +3,50 @@ import re,time
 from .plugin_detail import positive
 
 
+def review_sale_price(product,now=None):
+ """Available asking quote: minimum follow price, then ordinary asking price.
+
+ Historical observations are allowed for review per owner policy. Keep their
+ actual timestamp; publication freshness checks remain a separate concern.
+ Monthly sales averages and procurement costs are not asking prices.
+ """
+ now=time.time() if now is None else now
+ def quote(raw,source,kind):
+  if not isinstance(raw,dict):return None
+  value=positive(raw.get('value'));stamp=raw.get('observed_at')
+  if not value or raw.get('currency') not in ('CNY','RUB'):return None
+  if not isinstance(stamp,(int,float)) or stamp<=0 or stamp>now:return None
+  return dict(raw,value=value,source=raw.get('source') or source,kind=kind,
+              historical=now-stamp>=21600)
+ detail=product.get('plugin_detail') or {}
+ for raw in (product.get('minimum_follow_price'),detail.get('minimum_follow_price')):
+  found=quote(raw,'maozi-minimum-follow-price','minimum_follow_price')
+  if found:return found
+ # This field is written only from a bound, observed follow-seller offer list.
+ for raw in (product.get('ordinary_sale_price'),product.get('proposed_sale_price')):
+  found=quote(raw,'observed-asking-price','ordinary_sale_price')
+  if found:return found
+ stamp=product.get('collected_at')
+ relation=product.get('source_relation') or {}
+ bound=relation.get('seller_id')==product.get('seller_id') and relation.get('root_seeds')
+ if bound:
+  found=quote({'value':product.get('current_price_rub'),'currency':'RUB','observed_at':stamp},'ozon-storefront-price','ordinary_sale_price')
+  if found:return found
+  text=str(product.get('current_price_display') or '').replace('\\u2009','').replace('\u2009','').strip()
+  match=re.fullmatch(r'([0-9]+(?:[.,][0-9]{1,2})?)\s*[¥￥]',text)
+  if match:
+   found=quote({'value':match[1].replace(',','.'),'currency':'CNY','observed_at':stamp,'raw':product['current_price_display']},'ozon-china-storefront-display','ordinary_sale_price')
+   if found:return found
+ # Previous collection repair retained a real asking price with its original
+ # observation time. It was excluded solely by the former freshness policy.
+ steps=((product.get('collection_evidence') or {}).get('last_repair') or {}).get('steps') or []
+ for step in steps:
+  if step.get('source')=='acquisition_reference_only':
+   found=quote(step,'acquisition_reference_only','ordinary_sale_price')
+   if found:return found
+ return None
+
+
 def sale_price(product,now=None):
  now=time.time() if now is None else now
  sales=product.get('plugin_detail',{}).get('monthly_sales') or {}

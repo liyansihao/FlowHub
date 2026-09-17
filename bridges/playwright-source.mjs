@@ -4,6 +4,7 @@ import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import {sourceNetworkArgs} from './source-network.mjs';
 const exec=promisify(execFile);
 const root=path.resolve(import.meta.dirname,'..');
 const [owner,runId,seller,maxPagesArg='3']=process.argv.slice(2);
@@ -19,7 +20,7 @@ async function api(action,args=[]){
 }
 const context=await chromium.launchPersistentContext(path.resolve(profile),{
  channel:'chrome',headless:false,viewport:null,
- args:['--no-first-run','--no-default-browser-check'],
+ args:['--no-first-run','--no-default-browser-check',...sourceNetworkArgs()],
  ignoreDefaultArgs:['--disable-extensions'],
 });
 const page=await context.newPage();

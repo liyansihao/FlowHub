@@ -25,7 +25,7 @@ try:
         if not active:break
         if time.monotonic()>=deadline:raise TimeoutError('worker retained: active pipeline lease')
         time.sleep(.25)
-    for name in ('plugin-publication.lock','source-loop.lock'):
+    for name in ('plugin-publication.lock','source-loop.lock','draft-cleanup.lock','favorite-cleanup.lock'):
         lock=(db.directory/name).open('a');locks.append(lock)
         while True:
             try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB);break

@@ -161,3 +161,77 @@ async def test_category_fast_path_avoids_price_page_and_draft_requests(tmp_path,
     assert calls==['/api.tool/get_category_by_sku']
     calls.clear();assert (await PriceRepairModule().run(db,owner,'1','2'))['state']=='ready'
     assert calls==[]
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', ['explicit', 'manual_review', 'queue_request'])
+async def test_human_repair_fetches_full_dossier_even_when_valuation_ready(tmp_path,monkeypatch,mode):
+    from flowhub.source_detail import SourceCollector
+    db,owner=setup(tmp_path)
+    with db.connect() as c:
+        p=json.loads(c.execute('SELECT body FROM sourcing_products').fetchone()[0])
+        p['plugin_detail'].pop('attributes')
+        p['source_relation']={'seller_id':'2','root_seeds':[{'sku':'3'}]}
+        p['proposed_sale_price']={'value':30,'currency':'CNY','observed_at':time.time()}
+        c.execute('UPDATE sourcing_products SET body=?',(json.dumps(p),))
+        if mode=='manual_review':
+            c.execute('INSERT INTO plugin_reviews VALUES(?,?,?,?)',(owner,'1','2',json.dumps({'state':'needs_review'})))
+        if mode=='queue_request':
+            c.execute('CREATE TABLE plugin_pipeline(owner TEXT,sku TEXT,seller TEXT,body TEXT)')
+            c.execute('INSERT INTO plugin_pipeline VALUES(?,?,?,?)',(owner,'1','2','{"repair_full_dossier":true}'))
+    calls=[]
+    async def collect(self):
+        calls.append(self.sku)
+        return {'source_key':'1','observed_at':time.time(),'draft_id':5,'detail':{'skus':[{}],'package_weight':25,'package_length':100,'package_width':80,'package_height':10,'common_attributes':[{'id':1}]}}
+    monkeypatch.setattr(SourceCollector,'collect',collect)
+    result=await PriceRepairModule().run(db,owner,'1','2',full_dossier=mode=='explicit')
+    assert calls==['1'] and result['state']=='ready' and result['missing_fields']==[]
+
+@pytest.mark.asyncio
+async def test_full_dossier_repair_cannot_claim_ready_when_attributes_still_missing(tmp_path,monkeypatch):
+    from flowhub.source_detail import SourceCollector
+    from flowhub.modules import Pending
+    db,owner=setup(tmp_path)
+    with db.connect() as c:
+        p=json.loads(c.execute('SELECT body FROM sourcing_products').fetchone()[0])
+        p['plugin_detail'].pop('attributes')
+        p['source_relation']={'seller_id':'2','root_seeds':[{'sku':'3'}]}
+        p['proposed_sale_price']={'value':30,'currency':'CNY','observed_at':time.time()}
+        c.execute('UPDATE sourcing_products SET body=?',(json.dumps(p),))
+    async def collect(self):raise Pending('favorite creation not confirmed; lookup again later')
+    monkeypatch.setattr(SourceCollector,'collect',collect)
+    result=await PriceRepairModule().run(db,owner,'1','2',full_dossier=True)
+    assert result['state']=='waiting' and 'attributes' in result['missing_fields']
+
+@pytest.mark.asyncio
+async def test_old_captured_price_can_seed_acquisition_but_never_refreshes_valuation(tmp_path,monkeypatch):
+    from flowhub.source_detail import SourceCollector
+    db,owner=setup(tmp_path)
+    with db.connect() as c:
+        p=json.loads(c.execute('SELECT body FROM sourcing_products').fetchone()[0])
+        p['plugin_detail']={};p['current_price_display']='25,65 ¥';p['collected_at']=1
+        c.execute('UPDATE sourcing_products SET body=?',(json.dumps(p),))
+    async def erp(self,*args,**kwargs):return {'status':{'update_sales':True},'data':{'sku':'1'}}
+    async def collect(self):
+        assert self.c['candidate']['price']==25.65 and not self.c['existing_favorite_only']
+        return {'source_key':'1','observed_at':time.time(),'draft_id':5,'detail':{'skus':[{}],'package_weight':25,'package_length':100,'package_width':80,'package_height':10,'common_attributes':[{'id':1}]}}
+    monkeypatch.setattr(MaoziPublisher,'erp',erp);monkeypatch.setattr(SourceCollector,'collect',collect)
+    result=await PriceRepairModule().run(db,owner,'1','2',full_dossier=True)
+    assert result['state']=='waiting' and result['missing_fields']==['sale_price']
+    with db.connect() as c:
+        saved=json.loads(c.execute('SELECT body FROM sourcing_products').fetchone()[0])
+    assert saved['collected_at']==1 and not saved.get('proposed_sale_price')
+    assert any(s.get('source')=='acquisition_reference_only' and s['usable_for_valuation'] is False for s in saved['collection_evidence']['last_repair']['steps'])
+
+
+def test_cached_draft_refreshes_fields_stale_now_using_real_observation_time():
+    now=100000
+    p={'sku':'1','plugin_detail':{'observed_at':now-22000,'weight_g':25,'dimensions_mm':[100,80,10],'attributes':[{'id':1}]}}
+    packet={'source_key':'1','observed_at':now-10000,'detail':{'skus':[{}],'package_weight':30,'package_length':100,'package_width':80,'package_height':10,'common_attributes':[{'id':2}]}}
+    result=merge_draft(p,packet,now=now)
+    assert result['plugin_detail']['observed_at']==now-10000
+    assert result['plugin_detail']['weight_g']==30
+    assert all(o['observed_at']==now-10000 for o in result['plugin_detail']['field_observations'].values())
+    packet['observed_at']=now-23000
+    unchanged=merge_draft(p,packet,now=now)
+    assert unchanged['plugin_detail']['observed_at']==now-22000
+    assert unchanged['plugin_detail']['weight_g']==25

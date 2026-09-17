@@ -1,0 +1,1 @@
+{"name":"flowhub-vercel-review","private":true,"type":"module","scripts":{"build":"node scripts/build.mjs","test":"node --test tests/*.test.mjs"},"engines":{"node":"22.x"},"dependencies":{"pg":"^8.16.3"}}

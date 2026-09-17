@@ -21,7 +21,13 @@ def missing_fields(product):
     if len(dims)!=3 or not all(positive(v) for v in dims):missing.append('dimensions_mm')
     if not detail.get('attributes'):missing.append('attributes')
     observed=detail.get('observed_at')
-    if not isinstance(observed,(int,float)) or not 0<=time.time()-observed<21600:missing.append('fresh_dossier')
+    if not isinstance(observed,(int,float)) or not 0<=time.time()-observed<21600:
+        # Match publication's existing static-fact policy; keep original timestamps.
+        # reviewed_snapshot also requires the exact SKU, complete fields and provenance.
+        from .dossier import reviewed_snapshot
+        snapshot=reviewed_snapshot({'candidate':{'source_key':str(product.get('sku','')),
+            'title':product.get('title'),'image':product.get('image'),'origin':product}})
+        if snapshot is None:missing.append('fresh_dossier')
     if sale_price(product) is None:missing.append('sale_price')
     return missing
 
@@ -35,14 +41,15 @@ def valuation_ready(product):
         return False
 
 
-def merge_draft(product, snapshot, *, now=None):
+def merge_draft(product, snapshot, *, now=None, packet=None):
     if str(snapshot.get('source_key'))!=str(product['sku']):raise ValueError('draft_source_mismatch')
     detail=snapshot.get('detail') or {}
     if len(detail.get('skus') or [])!=1:raise ValueError('ambiguous_draft_variant')
     p=json.loads(json.dumps(product))
-    fields={'weight_g':detail.get('package_weight'),
-            'dimensions_mm':[detail.get(k) for k in ('package_length','package_width','package_height')],
-            'attributes':detail.get('common_attributes')}
+    from ..dossier_packet import extract
+    observed=extract({'sku':str(product['sku']),'snapshot':snapshot})
+    if packet is not None and packet!=observed:raise ValueError('remote_dossier_evidence_mismatch')
+    fields=(packet or observed)['fields']
     from .direct_facts import merge_fields
     p,applied=merge_fields(p,fields,'maozi-erp-draft',snapshot['observed_at'],now=now)
     merged=p['plugin_detail'];merged['erp_draft_id']=snapshot.get('draft_id')
@@ -81,18 +88,22 @@ async def direct_identity_fields(product, context):
 class PriceRepairModule:
     name='seed'
 
-    async def run(self, db, owner, sku, seller):
+    async def run(self, db, owner, sku, seller, *, full_dossier=False):
         with db.connect() as c:
             route=c.execute('SELECT * FROM plugin_routes WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()
             if not route:return {'state':'waiting','reason':'route_missing'}
             store=c.execute('SELECT config,secret FROM stores WHERE owner=? AND id=?',(owner,route['store_id'])).fetchone()
             product=c.execute('SELECT body FROM sourcing_products WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()
             row=c.execute('SELECT body FROM plugin_reviews WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()
+            if c.execute("SELECT 1 FROM sqlite_master WHERE name='plugin_pipeline'").fetchone():
+                queued=c.execute('SELECT body FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()
+                full_dossier=full_dossier or bool(queued and json.loads(queued[0]).get('repair_full_dossier'))
         if not store or not product:return {'state':'waiting','reason':'source_or_store_missing'}
         p=json.loads(product[0]);review=json.loads(row[0]) if row else {};before=missing_fields(p)
         # Measurement can proceed without the full publishing dossier.
         can_value=valuation_ready(p)
-        if can_value and review.get('state')!='matched':
+        require_dossier=full_dossier or review.get('state') in ('matched','needs_review')
+        if can_value and not require_dossier:
             return {'state':'ready','reason':'valuation_inputs_ready','missing_fields':before}
         evidence={'at':time.time(),'before':before,'steps':[]};context={'store':{'config':json.loads(store['config']),'credentials':db.open(store['secret'])}}
         # Read completed local drafts before spending any remote request or conversion.
@@ -162,11 +173,20 @@ class PriceRepairModule:
                 p.setdefault('plugin_detail',{}).setdefault('monthly_sales',{})
                 p['plugin_detail']['monthly_sales']=(p['plugin_detail']['monthly_sales'] or {})|monthly
         can_value=valuation_ready(p)
-        if direct_enabled and (not can_value or review.get('state')=='matched') and any(k in missing_fields(p) for k in ('weight_g','dimensions_mm','title','image','url')):
+        if direct_enabled and (not can_value or require_dossier) and any(k in missing_fields(p) for k in ('weight_g','dimensions_mm','title','image','url')):
             p,step=await direct_facts.public_detail(db,p);evidence['steps'].append(step)
         can_value=valuation_ready(p)
-        if (not can_value or review.get('state')=='matched') and any(k in missing_fields(p) for k in ('weight_g','dimensions_mm','attributes','title','image','url','fresh_dossier')):
+        if (not can_value or require_dossier) and any(k in missing_fields(p) for k in ('weight_g','dimensions_mm','attributes','title','image','url','fresh_dossier')):
             quote=sale_price(p)
+            if quote is None:
+                # A stored real reference price may seed acquisition metadata only.
+                # It never refreshes sale_price evidence or authorizes publication.
+                from .admission import asking_quote
+                quote=asking_quote(p)
+                if quote:
+                    evidence['steps'].append({'source':'acquisition_reference_only',
+                        'value':quote['value'],'currency':quote['currency'],
+                        'observed_at':p.get('collected_at'),'usable_for_valuation':False})
             draft_price=intent['value'] if intent else None
             if draft_price is None and quote:
                 if quote['currency']=='CNY':draft_price=quote['value']
@@ -184,7 +204,9 @@ class PriceRepairModule:
                 'candidate':{'source_key':sku,'title':p.get('title',''),'image':p.get('image',''),'price':draft_price}}
             try:
                 snapshot=await SourceCollector(db,draft_context).collect()
-                p=merge_draft(p,snapshot)
+                from ..cluster_compute import remote
+                packet=await remote('dossier',{'sku':str(p['sku']),'snapshot':snapshot})
+                p=merge_draft(p,snapshot,now=time.time(),packet=packet)
                 evidence['steps'].append({'source':'maozi-erp-draft','draft_id':snapshot.get('draft_id'),'observed_at':snapshot['observed_at']})
             except Pending as error:
                 evidence['steps'].append({'source':'maozi-draft','reason':str(error)})
@@ -200,5 +222,7 @@ class PriceRepairModule:
         if missing and any('采集箱已满' in str((step.get('diagnostic') or {}).get('api_message','')) for step in evidence['steps']):
             reason='maozi_collection_box_full: '+reason
         can_value=valuation_ready(p)
-        ready=not missing or (can_value and review.get('state')!='matched')
-        return {'state':'ready' if ready else 'waiting','reason':'valuation_inputs_ready' if ready and missing else reason,'missing_fields':missing}
+        ready=not missing or (can_value and not require_dossier)
+        from .repair_retry import classify
+        return {'state':'ready' if ready else 'waiting','reason':'valuation_inputs_ready' if ready and missing else reason,
+                'missing_fields':missing,'failure_class':None if ready else classify(evidence)}

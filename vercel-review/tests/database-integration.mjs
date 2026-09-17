@@ -1,0 +1,47 @@
+import pg from 'pg';
+import assert from 'node:assert/strict';
+import {gzipSync} from 'node:zlib';
+import {schema as createSchema} from '../lib/schema.mjs';
+const name='flowhub_test_'+Date.now(),admin=new pg.Client({connectionString:process.env.DATABASE_URL});await admin.connect();
+let bytes=0,queries=0,failBump=false;
+try{
+ await admin.query(`CREATE SCHEMA ${name}`);await admin.query('BEGIN');await admin.query(`SET LOCAL search_path TO ${name}`);await createSchema(admin);await admin.query('COMMIT');
+ const OriginalPool=pg.Pool;pg.Pool=class extends OriginalPool{async connect(){const c=await super.connect();if(!c.__testWrapped){const original=c.query.bind(c);c.query=async(...args)=>{if(args[0]?.startsWith('UPDATE flowhub_review_meta SET viewer_at=now()'))return {rows:[],rowCount:0};if(failBump&&args[0]==='UPDATE flowhub_review_meta SET version=version+1 WHERE id=1')throw Error('synthetic failure');const r=await original(...args);queries++;bytes+=Buffer.byteLength(JSON.stringify(r.rows??[]));if(typeof args[0]==='string'&&args[0].startsWith('BEGIN'))await original(`SET LOCAL search_path TO ${name}`);return r;};c.__testWrapped=true;}return c;}};
+ process.env.REVIEW_SYNC_TOKEN='synthetic-test';const {default:handler}=await import('../api/reviews.mjs');
+ const call=async(query,body,token='synthetic-test',headers={})=>{
+  bytes=0;queries=0;let result;const collected={};const req={method:body?'POST':'GET',url:'/api/reviews?'+query,headers:{'content-type':'application/json','x-sync-token':token,...headers},body};
+  const res={setHeader(k,v){collected[k.toLowerCase()]=v;return this;},status(code){this.code=code;return this;},json(data){result={code:this.code,data};return this;},send(data){result={code:this.code,data:JSON.parse(data)};return this;},end(){result={code:this.code};return this;}};
+  await handler(req,res);return {...result,headers:collected,dbBytes:bytes,queries};
+ };
+ const item={sku:'00000',seller:'test',revision:'b'.repeat(64),pipeline_state:'needs_review',can_approve:true,can_repair:true,allowed_actions:['approve','reject','repair'],title:'搜索测试',description:'x'.repeat(6000)};
+ const items=Array.from({length:1500},(_,i)=>({...item,sku:String(i).padStart(5,'0'),pipeline_state:i%2?'selling':'needs_review'}));
+ const snap={owner:'test',cursor:'initial',items,generated_at:'2026-09-16T00:00:00Z'};
+ const packed={encoding:'gzip-base64',payload:gzipSync(JSON.stringify(snap)).toString('base64')};
+ assert.equal((await call('mode=refresh',packed,'wrong')).code,401);assert.equal((await call('mode=refresh',packed)).code,200);
+ const page=await call('view=queue&page=0&page_size=12');assert.equal(page.data.items.length,12);assert.equal(page.data.queue_total,750);assert.ok(page.dbBytes<100000);assert.ok(page.data.items.every(x=>x.pipeline_state==='needs_review'));
+ const unchanged=await call('view=queue&page=0&page_size=12',undefined,'synthetic-test',{'if-none-match':page.headers.etag});assert.equal(unchanged.code,304);assert.ok(unchanged.dbBytes<1000);
+ assert.equal((await call('view=queue&q=01498')).data.items[0].sku,'01498');assert.equal((await call('view=queue&q=不存在')).data.filtered_total,0);
+ assert.equal((await call('view=products&state=selling')).data.filtered_total,750);
+ const last=await call('view=queue&page=999&page_size=12');assert.equal(last.data.items.length,6);assert.equal(last.data.page,62);
+ const cmd={sku:item.sku,seller:item.seller,revision:item.revision,action:'reject',note:'synthetic'};
+ assert.equal((await call('',{...cmd,revision:'0'.repeat(64)})).code,409);
+ const outcomes=await Promise.all([call('',cmd),call('',cmd)]);assert.deepEqual(outcomes.map(x=>x.code).sort(),[200,409]);
+ const pending=await call('mode=sync');assert.equal(pending.data.items.length,1);assert.ok(pending.dbBytes<2000);
+ const id=pending.data.items[0].id;assert.equal((await call('mode=ack',{id,status:'applied'})).code,200);await call('mode=ack',{id,status:'error'});assert.equal((await call('mode=sync')).data.items.length,0);
+ assert.equal((await call('view=queue')).data.queue_total,749);
+ const next={...items[2],title:'changed'};
+ const delta={owner:'test',base_cursor:'initial',cursor:'next',generated_at:'2026-09-16T00:01:00Z',upserts:[next],removed:[{sku:'00004',seller:'test'}],history:[]};
+ const changed=await call('mode=delta',delta);assert.equal(changed.code,200);assert.equal(changed.data.changed,2);assert.ok(changed.dbBytes<2000);
+ assert.equal((await call('mode=delta',delta)).data.replayed,true);
+ assert.equal((await call('mode=delta',{...delta,cursor:'third',base_cursor:'wrong'})).code,409);
+ assert.equal((await call('view=products&q=00002')).data.items[0].title,'changed');assert.equal((await call('view=products&q=00004')).data.filtered_total,0);
+ const history=Array.from({length:1500},(_,i)=>({...pending.data.items[0],id:'history-'+i,sku:'history-'+i,status:'applied'}));
+ for(let i=0;i<history.length;i+=500)assert.equal((await call('mode=import-history',{owner:'test',items:history.slice(i,i+500)})).code,200);
+ const hist=await call('view=history&page_size=12');assert.equal(hist.data.history.length,12);assert.ok(hist.dbBytes<20000);
+ const e=await call('view=queue');const noop=await call('mode=delta',{owner:'test',base_cursor:'next',cursor:'noop',upserts:[],removed:[],history:[]});assert.equal(noop.data.changed,0);assert.equal((await call('view=queue',undefined,'synthetic-test',{'if-none-match':e.headers.etag})).code,304);
+ failBump=true;assert.equal((await call('',{...cmd,sku:'00006'})).code,503);failBump=false;assert.equal((await call('mode=sync')).data.items.length,0);
+ assert.equal((await call('mode=delta',{...delta,owner:'other'})).code,409);
+ assert.equal((await call('mode=delta',{...delta,cursor:'bad',base_cursor:'noop',upserts:[next,next]})).code,422);
+ assert.equal((await call('mode=delta',{...delta,cursor:'bad',base_cursor:'noop',removed:[{sku:null}]})).code,422);
+ console.log(JSON.stringify({passed:true,products:1500,history:1500,fullSnapshotBytes:Buffer.byteLength(JSON.stringify(snap)),pageDbBytes:page.dbBytes,notModifiedDbBytes:unchanged.dbBytes,deltaDbBytes:changed.dbBytes,historyPageDbBytes:hist.dbBytes,concurrency:true,rollback:true,real_product_mutations:0}));
+}finally{await admin.query(`DROP SCHEMA ${name} CASCADE`);await admin.end();}

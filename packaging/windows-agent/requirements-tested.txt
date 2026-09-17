@@ -1,0 +1,10 @@
+# Versions used by the existing Mac compareBot runtime. Windows installs its
+# platform wheels and verifies the model before advertising readiness.
+torch==2.14.0
+transformers==4.57.6
+numpy==2.5.3
+Pillow==12.3.0
+httpx==0.28.1
+pydantic==2.13.5
+python-dotenv==1.2.3
+search1688api==2.0.0

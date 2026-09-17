@@ -93,3 +93,16 @@ async def test_unstable_pagination_cannot_prove_absence():
   async def call(self,path,method='GET',params=None):
    return {'total':101,'data':[{'id':i} for i in range(100)] if params['page']==1 else [{'id':99}]}
  with pytest.raises(ValueError,match='unstable'):await cleanup.listing(Moving())
+
+
+@pytest.mark.asyncio
+async def test_clear_completed_does_not_stop_at_capacity_target(tmp_path):
+ db,owner,item=setup(tmp_path)
+ class Low(Fake):
+  async def call(self,*args,**kwargs):
+   r=await super().call(*args,**kwargs)
+   if args[0].endswith('collect/lists'):r['used']=100
+   return r
+ api=Low()
+ result=await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db)|{'clear_completed':True,'batch_size':1000},api)
+ assert result['deleted']==1 and api.writes==1

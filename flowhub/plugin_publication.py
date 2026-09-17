@@ -27,6 +27,7 @@ from flowef.adapters.persistence.test_listing_journal import TestListingJournal
 from flowef.adapters.persistence.production_ownership import ProductionOwnership
 from flowef.application.ports.test_listing import ZeroStockListingPlan
 from flowef.application.services.test_listing import ProductionListingService
+from flowef.domain.rules.platform_issues import classify_product_issues
 
 
 def require_quota(q):
@@ -65,7 +66,9 @@ def approved(review, rules, now=None, allow_unknown=False):
         stamp=quote.get('observed_at')
         if not isinstance(stamp,(int,float)) or not 0<=now-stamp<21600:
             if approved_price_intent(review,now) is None:raise ValueError('price_evidence_stale')
+    website=bool(review.get('website_listing_authorization',{}).get('id') and review.get('identity_review',{}).get('verdict')=='match' and (review.get('identity_review',{}).get('human_review') or review.get('identity_review',{}).get('automatic_review')))
     blockers=list(review.get('publication_blockers') or [])
+    if website:blockers=[b for b in blockers if b!='publication_attributes_missing']
     if allow_unknown:
         if not unknown_restrictions_allowed(review):raise ValueError('explicit_source_restriction')
         blockers=[b for b in blockers if b not in ('fresh_pure_fbs_required','follow_permission_unverified_or_blocked')]
@@ -75,7 +78,7 @@ def approved(review, rules, now=None, allow_unknown=False):
     if source['comparebot']['decision']['outcome']!='approved':
         raise ValueError('comparebot_not_approved')
     rate=float(profit['assessment']['erp_profit_rate_pct'])
-    if not math.isfinite(rate) or rate <= float(rules.get('profit_min',30)):
+    if not math.isfinite(rate) or (not website and rate <= float(rules.get('profit_min',30))):
         raise ValueError('profit_below_workflow_threshold')
     if str(source['selected_offer_id'])!=str(match['supplier_id']) or float(source['selected_cost_cny'])!=float(match['purchase']):
         raise ValueError('supplier_cost_binding_mismatch')
@@ -99,6 +102,9 @@ async def advance(db, owner, sku, seller):
         for key in ('sku:'+sku,'store:'+str(target)):
             handle=(directory/(hashlib.sha256(key.encode()).hexdigest()+'.lock')).open('a');locks.append(handle)
             fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        from .official_publication import advance_if_selected
+        official = await advance_if_selected(db,owner,sku,seller)
+        if official is not None:return official
         return await _advance(db,owner,sku,seller)
     finally:
         for handle in reversed(locks):handle.close()
@@ -121,7 +127,7 @@ async def _advance(db, owner, sku, seller):
         allow_unknown=bool(permission and time.time()<permission['expires'] and route and time.time()<route['expires'])
         if record and fingerprint(json.loads(row[0]))!=fingerprint(review):
             phase=TestListingJournal(DATA/'plugin-production.sqlite3').read(record['offer_id'])['phase']
-            if phase in ('prepared','ready','favorite_pending','reconciling','sync_pending','stock_ready','stock_pending') or (phase=='manual_review' and TestListingJournal(DATA/'plugin-production.sqlite3').read(record['offer_id'])['details'].get('reason')=='reconciliation_timeout'):
+            if phase in ('prepared','ready','favorite_pending','reconciling','sync_pending','stock_ready','stock_pending') or (phase=='manual_review' and TestListingJournal(DATA/'plugin-production.sqlite3').read(record['offer_id'])['details'].get('reason') in ('reconciliation_timeout','platform_issue_requires_review')):
                 latest=json.loads(row[0]);approved(latest,rules,allow_unknown=allow_unknown)
                 from .pipeline_modules.dossier import refresh_unchanged_plan
                 try:
@@ -147,13 +153,17 @@ async def _advance(db, owner, sku, seller):
     shop=str(config['shop_id']);warehouse=str(config['warehouse_id']);watermark=str(config['watermark_id'])
     journal=TestListingJournal(DATA/'plugin-production.sqlite3')
     ownership=ProductionOwnership(journal,ROOT/'maozi_direct_new_method/state/global-sku-claims','flowhub-plugin-production-v1')
-    bridge=FlowBBridge(ROOT,execute=True,token=keys['erp_token'])
+    from .pipeline_modules.request_bridge import PublicationBridge, MeasuredTransport
+    bridge=PublicationBridge(ROOT,execute=True,token=keys['erp_token'])
+    from .cluster_routing import route_bridge
+    route_bridge(bridge, DATA, (owner, sku, seller))
     def save():
         with db.connect() as c:c.execute('INSERT OR REPLACE INTO plugin_publications VALUES(?,?,?,?,?)',(owner,sku,seller,json.dumps(record),time.time()))
     from .pipeline_modules.transport import StepTransport
-    transport=StepTransport(FlowBHttpTransport(bridge),ttl=15,namespace=fingerprint({'token':keys['erp_token']}))
+    transport=StepTransport(MeasuredTransport(bridge),ttl=15,namespace=fingerprint({'token':keys['erp_token']}))
     async with httpx.AsyncClient(base_url='https://api.maozierp.com',transport=transport) as client, AsyncExitStack() as observation_clients:
-        base=MaoziZeroStockAdapter(client)
+        from .pipeline_modules.favorite_lookup import PublicationSourceAdapter, PublicationAdapter
+        base=PublicationSourceAdapter(client)
         async def exclusions():
             blocks=await read_delists();offers={tuple(v) for v in blocks['offers']}
             if sku in blocks['skus']:raise ValueError('explicit_delist')
@@ -167,9 +177,15 @@ async def _advance(db, owner, sku, seller):
                 raise ValueError('postal_warehouse_unavailable')
         async def quota(plan,offer):
             if record and record.get('write_deadline') and time.time()>=record['write_deadline']:raise ValueError('hour_window_closed')
-            q=await MaoziPublisher({'store':{'config':config,'credentials':keys}}).erp('POST','/api.shop/sync_single_product_limit',body={'id':int(plan.shop_id)})
+            if keys.get('client_id') and keys.get('api_key') and config.get('official_observations',True):
+                from .official_api import client as seller_client, capacity
+                async with seller_client(db,keys) as seller_api:q=await capacity(seller_api)
+            else:
+                q=await MaoziPublisher({'store':{'config':config,'credentials':keys}}).erp('POST','/api.shop/sync_single_product_limit',body={'id':int(plan.shop_id)})
             if record is not None:
                 record['quota']={'at':time.time(),'data':q};save()
+            from .pipeline_modules.store_capacity import observe
+            observe(db,owner,target_id,q)
             require_quota(q)
         if not record:
             if route and time.time()>=route['expires']:raise ValueError('hour_window_closed')
@@ -181,6 +197,11 @@ async def _advance(db, owner, sku, seller):
             context={'owner':owner,'candidate':c,'match':match,'rules':rules,'store':{'id':store['id'],'config':config,'credentials':keys},'idempotency_key':'plugin-'+sku}
             from .pipeline_modules.dossier import reviewed_snapshot
             snapshot=reviewed_snapshot(review)
+            if snapshot is None and review.get('website_listing_authorization'):
+                original=review['candidate'];physical=original['origin'].get('plugin_detail') or {}
+                dims=physical.get('dimensions_mm') or []
+                if len(dims)==3 and all(isinstance(v,(int,float)) and math.isfinite(v) and v>0 for v in [*dims,physical.get('weight_g')]):
+                    snapshot={'source_key':sku,'source':'user-confirmed-maozi-native-import','observed_at':physical.get('observed_at'),'detail':{'title':original['title'],'package_length':dims[0],'package_width':dims[1],'package_height':dims[2],'package_weight':physical['weight_g'],'attributes':physical.get('attributes') or []}}
             if snapshot is None:snapshot=await SourceCollector(db,context).collect()
             detail=snapshot['detail'];facts=profit['input']
             if str(snapshot['source_key'])!=sku:raise ValueError('draft_source_mismatch')
@@ -199,7 +220,12 @@ async def _advance(db, owner, sku, seller):
             blocks,offers=await exclusions()
             if not ownership.owns(plan.shop_id,offer,sku):raise ValueError('ownership_changed')
             if product.sku in blocks['skus'] or (plan.shop_id,offer) in offers or ('*',offer) in offers:raise ValueError('explicit_delist')
-            feedback=await bridge.call('feedback',product=review['candidate']['origin']|{'allow_unknown_publication':allow_unknown,'approved_listing_price':approved_price_intent(review)},source=source)
+            from .pipeline_modules.dossier import require_unchanged_source
+            with db.connect() as c:
+                current=c.execute('SELECT body FROM sourcing_products WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()
+            if current is None:raise ValueError('current_source_packet_missing')
+            require_unchanged_source(review,json.loads(current[0]))
+            feedback=await bridge.call('feedback',product=review['candidate']['origin']|{'allow_unknown_publication':allow_unknown,'approved_listing_price':approved_price_intent(review),'website_listing_authorization':review.get('candidate',{}).get('origin',{}).get('website_listing_authorization')},source=source)
             if feedback.get('blocked'):raise ValueError('human_feedback_blocked')
             if feedback.get('rejected'):raise ValueError('publication_source_policy_required')
         async def preflight(plan,offer):
@@ -213,17 +239,29 @@ async def _advance(db, owner, sku, seller):
             # Affirmative restrictions in the existing evidence remain blocking.
             modes=() if allow_unknown and monthly.get('sales_schema') in (None,'') else await base.source_modes(sku)
             require_source_modes(modes,monthly,allow_unknown)
-        observations=None
-        if config.get('official_observations') and keys.get('client_id') and keys.get('api_key'):
-            from flowef.adapters.ozon.seller_status import OzonSellerStatusAdapter
-            official_client=await observation_clients.enter_async_context(httpx.AsyncClient(
-                base_url='https://api-seller.ozon.ru',headers={'Client-Id':keys['client_id'],'Api-Key':keys['api_key']},
-                timeout=25,trust_env=False,follow_redirects=False))
+        observations=None;inventory=None
+        if config.get('official_observations',True) and keys.get('client_id') and keys.get('api_key'):
+            from .official_status import OzonSellerStatusAdapter
+            from .official_api import client as seller_client
+            official_client=await observation_clients.enter_async_context(seller_client(db,keys))
             observations=OzonSellerStatusAdapter(official_client,shop_id=shop,warehouse_id=warehouse)
             await observations.verify_identity()
-        port=MaoziProductionAdapter(client,journal,stock_guard,verify_target,publish_guard=quota,observations=observations)
+            if config.get('official_inventory',True):
+                from .official_inventory import ScheduledInventoryAdapter
+                inventory=ScheduledInventoryAdapter(official_client,shop_id=shop,warehouse_id=warehouse,journal=journal,stock_guard=stock_guard)
+                inventory.identity_verified=True
+        port=PublicationAdapter(client,journal,stock_guard,verify_target,publish_guard=quota,observations=observations,inventory=inventory)
         service=ProductionListingService(port,journal,preflight,stock_guard=stock_guard)
         before=journal.read(offer)['phase']
+        from .pipeline_modules.favorite_recovery import recover_favorite
+        try:
+            favorite_handled=await recover_favorite(port,journal,offer,plan,preflight,record['events'])
+        except Exception as error:
+            cause=error.__cause__ or error
+            record['phase']=journal.read(offer)['phase']
+            record.setdefault('api_timings',[]).append({'at':time.time(),'calls':transport.timings[:]})
+            record['events'].append({'at':time.time(),'from':before,'error':type(error).__name__,'reason':str(cause)[:250]});save()
+            raise
         # Official Maozi UI uses repair_images({ids:[ERP record id]}).
         # Persist intent before dispatch; an unknown outcome is never replayed.
         current=journal.read(offer)
@@ -234,6 +272,9 @@ async def _advance(db, owner, sku, seller):
             await verify_target(plan)
             product=await port.find_product(plan.shop_id,offer)
             if product and product.offer_id==offer and product.shop_id==plan.shop_id:
+                if observations:
+                    from .official_inventory import exact_erp_product
+                    product=await exact_erp_product(base,product)
                 if journal.move(offer,'manual_review','manual_review',image_repair_dispatched_at=time.time(),image_repair_record_id=product.record_id):
                     try:
                         await MaoziPublisher({'store':{'config':config,'credentials':keys}}).erp('POST','/api.product.online/repair_images',body={'ids':[int(product.record_id)]})
@@ -242,9 +283,12 @@ async def _advance(db, owner, sku, seller):
                         journal.move(offer,'manual_review','manual_review',image_repair_error=type(error).__name__)
                     record['phase']='manual_review';save()
                     return {'sku':sku,'offer_id':offer,'phase':'manual_review','verified':False,'retryable_readback':True,'reason':'image_repair_waiting_for_platform'}
+        from .pipeline_modules.platform_recovery import recover_platform_warning
+        if not favorite_handled and await recover_platform_warning(port,journal,offer,plan,preflight):
+            before=journal.read(offer)['phase']
         # Late platform visibility is a read-only reconciliation concern, not a
         # reason to replay a possibly accepted publication request.
-        if before=='manual_review' and (journal.read(offer)['details'].get('reason')=='reconciliation_timeout' or journal.read(offer)['details'].get('image_repair_dispatched_at')):
+        if not favorite_handled and before=='manual_review' and (journal.read(offer)['details'].get('reason')=='reconciliation_timeout' or journal.read(offer)['details'].get('image_repair_dispatched_at')):
             product=await port.find_product(plan.shop_id,offer)
             stocks=await port.read_stocks(product) if product else []
             if product and product.status=='selling' and any(s.warehouse_id==warehouse and s.present==99 for s in stocks):
@@ -257,8 +301,17 @@ async def _advance(db, owner, sku, seller):
                 record['phase']='manual_review';record['last_reconciliation_at']=time.time();save()
                 return {'sku':sku,'offer_id':offer,'phase':'manual_review','verified':False,'retryable_readback':True,'reason':'awaiting_exact_remote_outcome'}
             before=journal.read(offer)['phase']
-        if before not in ('stock_verified','failed','manual_review'):
-            try:await service.advance(offer)
+        if (not favorite_handled and before not in ('stock_verified','failed','manual_review')) or (favorite_handled and journal.read(offer)['phase']=='ready'):
+            try:
+                await service.advance(offer)
+                if before=='prepared' and journal.read(offer)['phase']=='favorite_pending':
+                    # Verify a successful favorite creation in this same operation.
+                    # Some favorites disappear before a later queue turn can see them.
+                    await recover_favorite(port,journal,offer,plan,preflight,record['events'])
+                    if journal.read(offer)['phase']=='ready':
+                        # Consume the confirmed favorite without another queue wait;
+                        # advance still runs the original preflight and import CAS.
+                        await service.advance(offer)
             except Exception as error:
                 cause=error.__cause__ or error
                 record['phase']=journal.read(offer)['phase']
@@ -283,5 +336,6 @@ async def _advance(db, owner, sku, seller):
                 c.execute('INSERT OR IGNORE INTO jobs(id,owner,source_key,store_id,phase,data,modules,next_at,created,updated,note) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
                           (offer,owner,sku,store['id'],'selling',json.dumps({'candidate':review['candidate'],'match':match,'external_publication':record,'product_id':record['product']['product_id']}),json.dumps(modules),0,record['started_at'],time.time(),'插件→compareBot→毛子已回查可售：'+record['product']['sku']+'，库存99'))
         return {'sku':sku,'offer_id':offer,'phase':final['phase'],'verified':record.get('verified',False),'product':record.get('product'),
-                'retryable_readback':final['phase']=='manual_review' and (final['details'].get('reason')=='reconciliation_timeout' or bool(final['details'].get('image_repair_dispatched_at'))),
-                'reason':final['details'].get('reason'), 'platform_issue_codes':final['details'].get('platform_issue_codes',[])}
+                'retryable_readback':final['phase']=='manual_review' and (final['details'].get('reason') in ('reconciliation_timeout','favorite_visibility_exhausted') or bool(final['details'].get('image_repair_dispatched_at'))),
+                'reason':final['details'].get('reason'), 'favorite_recovery':final['details'].get('favorite_recovery'),
+                'platform_issue_codes':final['details'].get('platform_issue_codes',[])}

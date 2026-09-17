@@ -1,0 +1,161 @@
+import json,time,hashlib
+from pathlib import Path
+import pytest
+from flowhub.db import Database
+from flowhub.source_library import SourceLibrary
+from flowhub.pipeline_modules.admission import schema as pipeline_schema
+from flowhub.pipeline_modules import favorite_cleanup as cleanup
+
+
+def setup(tmp_path):
+    db=Database(tmp_path);SourceLibrary(db);pipeline_schema(db);cleanup.schema(db)
+    (tmp_path/'favorite-cleanup.json').write_text(json.dumps({'enabled':True}))
+    with db.connect() as c:
+        owner=c.execute('SELECT id FROM users').fetchone()[0]
+        c.execute('INSERT INTO pipeline_campaigns VALUES(?,?,?,?)',(owner,1,'{}',0))
+        c.execute('INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)',(owner,'123','2','selling',json.dumps({'offer_id':'offer'}),time.time()-7200,0))
+        c.execute('CREATE TABLE plugin_publications(owner TEXT,sku TEXT,seller TEXT,body TEXT)')
+        c.execute('INSERT INTO plugin_publications VALUES(?,?,?,?)',(owner,'123','2',json.dumps({'offer_id':'offer','phase':'stock_verified'})))
+    SourceLibrary(db).put(owner,{'sku':'123','seller_id':'2','title':'source','collected_at':100,'source_relation':{'seller_id':'2','root_seeds':[{'sku':'9','shop':'4','offer':'root'}]}},{'channel':'test'})
+    return db,owner,{'owner':owner,'sku':'123','seller':'2','offer_id':'offer','context':{'store':{'config':{'shop_id':'4'},'credentials':{'erp_token':'test'}}}}
+
+
+class Fake:
+    def __init__(self,mode='ok',db=None):self.present=True;self.writes=0;self.mode=mode;self.db=db
+    async def call(self,path,method='GET',params=None,body=None):
+        if path.endswith('favorite/lists'):
+            return {'used':3000 if self.present else 2999,'limit':3000,'total':int(self.present),'data':[{'id':7,'sku':'123','is_imported':1,'title':'source','sell_price':10}] if self.present else []}
+        if path.endswith('online/lists'):
+            return {'data':[{'shop_id':'4','offer_id':'other' if self.mode=='wrong_offer' else 'offer','online_status':'selling','stock':0 if self.mode=='no_stock' else 99}]}
+        assert path=='/api.product.favorite/toggle' and method=='POST' and body['status'] is False
+        assert body['productInfo']['sku']=='123'
+        if self.db:
+            with self.db.connect() as c:r=c.execute('SELECT * FROM favorite_cleanup_receipts').fetchone()
+            assert r['state']=='intent'
+            b=self.db.open(r['body']);assert Path(b['archive_path']).exists()
+        self.writes+=1
+        if self.mode=='unknown_present':raise TimeoutError()
+        self.present=False
+        if self.mode=='lost_ack':raise TimeoutError()
+        return {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode',['ok','lost_ack','unknown_present','no_stock','wrong_offer'])
+async def test_archive_before_delete_retains_seed_graph_and_does_not_replay(tmp_path,mode):
+    db,owner,item=setup(tmp_path);api=Fake(mode,db)
+    with db.connect() as c:
+        before=c.execute('SELECT body FROM sourcing_products').fetchone()[0]
+        evidence=c.execute('SELECT count(*) FROM sourcing_evidence').fetchone()[0]
+    await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
+    with db.connect() as c:
+        r=c.execute('SELECT * FROM favorite_cleanup_receipts').fetchone()
+        assert c.execute('SELECT body FROM sourcing_products').fetchone()[0]==before
+        assert c.execute('SELECT count(*) FROM sourcing_evidence').fetchone()[0]==evidence
+        assert c.execute('SELECT state FROM plugin_pipeline').fetchone()[0]=='selling'
+    if mode in ('no_stock','wrong_offer'):assert r is None
+    else:
+        b=db.open(r['body']);assert b['root_seeds'][0]['sku']=='9'
+        raw=Path(b['archive_path']).read_bytes()
+        assert hashlib.sha256(raw).hexdigest()==b['archive_sha256']
+        assert json.loads(raw)['favorite']['id']==7
+        assert r['state']==('unconfirmed' if mode=='unknown_present' else 'deleted')
+    await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
+    assert api.writes==(0 if mode in ('no_stock','wrong_offer') else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('guard',['pause','disabled','lease','missing_roots','wrong_seller','not_sold','archive_failure'])
+async def test_missing_provenance_and_inflight_work_never_deleted(tmp_path,guard,monkeypatch):
+    from flowhub.pipeline_modules.control import set_paused
+    db,owner,item=setup(tmp_path);api=Fake()
+    if guard=='pause':set_paused(db,'seed',True)
+    if guard=='disabled':(tmp_path/'favorite-cleanup.json').write_text(json.dumps({'enabled':False}))
+    with db.connect() as c:
+        if guard=='lease':c.execute('INSERT INTO plugin_pipeline_leases VALUES(?,?,?,?,?)',(owner,'123','2','live',time.time()+60))
+        if guard=='not_sold':c.execute("UPDATE plugin_pipeline SET state='needs_fields'")
+        if guard=='missing_roots':c.execute("UPDATE sourcing_products SET body=json_set(body,'$.source_relation.root_seeds',json('[]'))")
+        if guard=='wrong_seller':c.execute("UPDATE sourcing_products SET body=json_set(body,'$.source_relation.seller_id','999')")
+    if guard=='archive_failure':
+        def broken(*args):raise OSError('disk full')
+        monkeypatch.setattr(cleanup,'archive',broken)
+        with pytest.raises(OSError):await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
+    else:await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
+    assert api.writes==0
+
+
+@pytest.mark.asyncio
+async def test_unstable_full_listing_never_proves_absence():
+    class Moving:
+        async def call(self,path,method='GET',params=None):
+            return {'total':101,'data':[{'id':i} for i in range(100)] if params['page']==1 else [{'id':99}]}
+    with pytest.raises(ValueError):await cleanup.listing(Moving())
+
+
+@pytest.mark.asyncio
+async def test_capacity_below_threshold_does_not_delete(tmp_path):
+    db,owner,item=setup(tmp_path)
+    class Low(Fake):
+        async def call(self,*args,**kwargs):
+            response=await super().call(*args,**kwargs)
+            if args[0].endswith('favorite/lists'):response['used']=2000
+            return response
+    api=Low();result=await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
+    assert result['state']=='below_threshold' and api.writes==0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode',['not_imported','duplicate_sku'])
+async def test_unimported_or_ambiguous_favorites_are_retained(tmp_path,mode):
+    db,owner,item=setup(tmp_path)
+    class Unsafe(Fake):
+        async def call(self,*args,**kwargs):
+            r=await super().call(*args,**kwargs)
+            if args[0].endswith('favorite/lists'):
+                if mode=='not_imported':r['data'][0]['is_imported']=0
+                else:r['data'].append(r['data'][0]|{'id':8});r['total']=2
+            return r
+    api=Unsafe();await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
+    assert api.writes==0
+
+
+@pytest.mark.asyncio
+async def test_only_reads_retry_transient_connection_failure(monkeypatch):
+    async def immediate(*args):pass
+    monkeypatch.setattr(cleanup.asyncio,'sleep',immediate)
+    class API:
+        def __init__(self):self.calls=0
+        async def erp(self,*args,**kwargs):
+            self.calls+=1
+            if self.calls==1:raise TimeoutError()
+            return {}
+    client=cleanup.Client.__new__(cleanup.Client);client.api=API()
+    assert await client.call('/read')=={} and client.api.calls==2
+    client.api=API()
+    with pytest.raises(TimeoutError):await client.call('/write',method='POST')
+    assert client.api.calls==1
+
+
+def test_large_batch_and_short_interval_require_valid_bounds(tmp_path):
+    db=Database(tmp_path)
+    p=tmp_path/'favorite-cleanup.json'
+    p.write_text(json.dumps({'batch_size':1000,'interval_seconds':60,'target_ratio':2/3}))
+    settings=cleanup.config(db)
+    assert settings['batch_size']==1000 and settings['interval_seconds']==60
+    assert min(settings['batch_size'],3000-int(3000*settings['target_ratio']))==1000
+    for patch in ({'batch_size':1001},{'interval_seconds':59}):
+        p.write_text(json.dumps(settings|patch))
+        with pytest.raises(ValueError):cleanup.config(db)
+
+
+@pytest.mark.asyncio
+async def test_clear_completed_favorites_do_not_stop_below_threshold(tmp_path):
+    db,owner,item=setup(tmp_path)
+    class Low(Fake):
+        async def call(self,*args,**kwargs):
+            r=await super().call(*args,**kwargs)
+            if args[0].endswith('favorite/lists'):r['used']=100
+            return r
+    api=Low()
+    result=await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db)|{'clear_completed':True},api)
+    assert result['deleted']==1
