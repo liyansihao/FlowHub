@@ -108,7 +108,7 @@ def classify(error, write=False):
     if isinstance(error, TimeoutError):
         return "operation_timeout"
     if any(
-        x in code for x in ("timeout", "connect", "fetch failed", "econn", "readerror", "bridge_read_failure")
+        x in code for x in ("timeout", "timedout", "connect", "fetch failed", "econn", "enotfound", "eai_again", "enetunreach", "ehostunreach", "readerror", "bridge_read_failure")
     ):
         return "network"
     return "contract_invalid"

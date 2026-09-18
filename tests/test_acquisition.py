@@ -430,3 +430,18 @@ async def test_credential_rotation_cannot_escape_unknown_source_intent(setup):
     with pytest.raises(AcquisitionPending, match="credential_binding_changed"):
         fresh.claim()
     assert work(db)["unknown_draft"]
+
+
+@pytest.mark.parametrize('code',['ETIMEDOUT','ECONNRESET','ENOTFOUND','EAI_AGAIN','ENETUNREACH','EHOSTUNREACH'])
+async def test_node_network_failures_remain_retryable_reads(setup,code):
+    from flowhub.acquisition import classify
+    db,context=setup
+    error=SourceAcquisitionFailure(code,{'not_sent':False})
+    assert classify(error)=='network'
+    assert classify(error,write=True)=='write_unknown'
+    async def call(*args,**kwargs):raise error
+    await step(db,context,call)
+    w=work(db)
+    assert w['category']=='network' and not w.get('manual')
+    assert w['due']>time.time()
+    assert not w['unknown_favorite'] and not w['unknown_draft']
