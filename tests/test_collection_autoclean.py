@@ -42,6 +42,19 @@ async def test_pause_and_persistent_failure_backoff(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_database_lock_retries_only_local_observation(tmp_path,monkeypatch):
+    import sqlite3
+    from unittest.mock import Mock
+    from flowhub import collection_autoclean
+    db=configured(tmp_path);client=AsyncMock();client.call.return_value={'used':850,'limit':1000}
+    run=AsyncMock(return_value={'state':'complete','result':{'used':0}})
+    observe=Mock(side_effect=[sqlite3.OperationalError('database is locked'),None])
+    monkeypatch.setattr(collection_autoclean,'observe',observe)
+    await tick(db,client_factory=lambda _:client,run_maintenance=run)
+    assert observe.call_count==2 and client.call.await_count==1 and run.await_count==1
+
+
+@pytest.mark.asyncio
 async def test_maintenance_rechecks_manual_pause_atomically(tmp_path):
     db=configured(tmp_path);control.set_paused(db,'review',True)
     ctx={'owner':'test','store':{'credentials':{'erp_token':'test'}}}

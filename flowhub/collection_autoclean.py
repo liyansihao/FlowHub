@@ -4,6 +4,7 @@ import asyncio
 import fcntl
 import json
 import os
+import sqlite3
 import time
 from pathlib import Path
 
@@ -49,8 +50,14 @@ async def tick(db, *, client_factory=Client, run_maintenance=maintenance):
             if any(isinstance(v,bool) or not str(v).isdigit() for v in (used,limit)) or int(limit)<=0:
                 raise ValueError('invalid capacity observation')
             used,limit=int(used),int(limit)
-            observe(db,scope,header,status['checked_at'])
             status.update(used=used,limit=limit)
+            for attempt in range(3):
+                try:
+                    await asyncio.to_thread(observe,db,scope,header,status['checked_at'])
+                    break
+                except sqlite3.OperationalError as error:
+                    if 'locked' not in str(error).lower() or attempt==2:raise
+                    await asyncio.sleep(1)
             if used<limit*threshold:
                 status['state']='below_threshold'
             else:
