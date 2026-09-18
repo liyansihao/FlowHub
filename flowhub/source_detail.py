@@ -183,24 +183,30 @@ class SourceCollector:
             raise ModuleError("ambiguous source favorite")
         return next(iter(matches.values()), None)
 
-    async def recover_draft(self, data):
+    async def recover_draft(self, data, *, allow_missing=False):
         # Read-only full listing, cached per owner/account. Never infer success from a favorite.
         account=self.c['owner']+':'+hashlib.sha256(self.keys.get('erp_token','').encode()).hexdigest()
         cached=self.recovery_pages.get(account)
-        if not cached or time.time()-cached[0]>60:
-            rows=[];complete=False
+        if allow_missing or not cached or time.time()-cached[0]>60:
+            rows=[];complete=False;expected=None
             for page in range(1,21):
                 response=await self.call('/api.product.collect/lists',query={'page':page,'page_size':100})
                 batch=response if isinstance(response,list) else response.get('data',[])
                 if not isinstance(batch,list):raise Pending('invalid draft recovery listing')
                 rows.extend(batch)
                 total=response.get('total') if isinstance(response,dict) else None
+                if total is not None:
+                    if expected is None:expected=int(total)
+                    elif int(total)!=expected:raise Pending('draft recovery listing changed')
                 if len(batch)<100 or (total is not None and len(rows)>=int(total)):
                     complete=True;break
             if not complete:raise Pending('draft recovery listing incomplete')
+            if expected is not None and len({str(r['id']) for r in rows})!=expected:
+                raise Pending('draft recovery listing unstable')
             self.recovery_pages[account]=(time.time(),rows)
         else:rows=cached[1]
         matches={str(r['id']):r for r in rows if str(r.get('goods_id'))==self.sku and r.get('collect_from')=='ozon' and r.get('id')}
+        if not matches and allow_missing:return None
         if len(matches)!=1:raise Pending('source draft recovery missing or ambiguous; no creation repeated')
         draft_id=int(next(iter(matches)))
         detail=await self.call('/api.product.collect/detail',query={'id':draft_id,'is_online':0})
@@ -227,6 +233,18 @@ class SourceCollector:
                 and isinstance(observed, (int, float)) and not isinstance(observed, bool)
                 and 0 <= time.time() - observed < 21600):
             return data
+        if data.get('draft_id'):
+            from .collection_capacity import account
+            with self.db.connect() as db:
+                exists=db.execute("SELECT 1 FROM sqlite_master WHERE name='draft_cleanup_receipts'").fetchone()
+                deleted=db.execute("SELECT 1 FROM draft_cleanup_receipts WHERE account=? AND draft_id=? AND sku=? AND state='deleted'",
+                    (account(self.c),str(data['draft_id']),self.sku)).fetchone() if exists else None
+                if deleted:
+                    replacement={'source_key':self.sku,'replaces_deleted_draft_id':data['draft_id']}
+                    inserted=db.execute("UPDATE source_details SET state='claimed',body=?,updated=? WHERE key=? AND state=? AND updated=?",
+                        (self.db.seal(replacement),time.time(),self.key,state,updated)).rowcount==1
+                    if not inserted:raise Pending('source acquisition changed during draft reclamation')
+                    state,data='claimed',replacement
         if data.get("draft_id"):
             detail = await self.call(
                 "/api.product.collect/detail", query={"id": data["draft_id"], "is_online": 0}
@@ -265,7 +283,7 @@ class SourceCollector:
                         "WHERE key=? AND state='claimed' AND updated=?",
                         (self.db.seal(data), time.time(), self.key, self.claim_updated),
                     )
-            else:
+            elif not data.get('replaces_deleted_draft_id'):
                 with self.db.connect() as db:
                     db.execute(
                         "DELETE FROM source_details WHERE key=? AND state='claimed' AND updated=?",
@@ -312,8 +330,13 @@ class SourceCollector:
             self.renew_claim()
         if favorite is None:
             raise Pending("favorite creation not confirmed; lookup again later")
+        replacement=data.get('replaces_deleted_draft_id')
         data = {"source_key": self.sku, "favorite_id": int(favorite["id"])}
-        if str(favorite.get("is_imported")) == "1":
+        if replacement:
+            data['replaces_deleted_draft_id']=replacement
+            recovered=await self.recover_draft(data,allow_missing=True)
+            if recovered:return recovered
+        if str(favorite.get("is_imported")) == "1" and not replacement:
             self.save("draft_started", data)
             return await self.recover_draft(data)
         from .collection_capacity import guard, finish
