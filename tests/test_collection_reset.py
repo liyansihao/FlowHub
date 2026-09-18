@@ -1,7 +1,7 @@
 import time
 import pytest
 from flowhub.db import Database
-from flowhub.collection_reset import clear
+from flowhub.collection_reset import clear, retry_authorized
 from flowhub.collection_capacity import account
 from flowhub.pipeline_modules import control
 from flowhub.pipeline_modules.draft_cleanup import schema, journal
@@ -29,6 +29,20 @@ class API:
         self.present=False
         if self.mode=='lost_ack':raise TimeoutError()
         return {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode',['ok','unknown'])
+async def test_explicit_retry_preserves_receipt_and_approval_cannot_repeat(tmp_path,mode):
+    db,ctx=setup(tmp_path);schema(db);api=API(mode)
+    journal(db,account(ctx),'8','a','123','unconfirmed',{'error_type':'RemoteProtocolError','original':'preserve'})
+    result=await retry_authorized(db,ctx,['8'],'one-explicit-approval',api)
+    assert result['complete']==(mode=='ok')
+    with db.connect() as c:
+        old=c.execute('SELECT previous_receipt FROM collection_reset_overrides').fetchone()[0]
+    assert db.open(db.open(old)['body'])['original']=='preserve'
+    await retry_authorized(db,ctx,['8'],'one-explicit-approval',api)
+    assert api.writes==1
 
 
 @pytest.mark.asyncio

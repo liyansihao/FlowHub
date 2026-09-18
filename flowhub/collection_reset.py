@@ -87,6 +87,55 @@ async def clear(db, context, client=None, progress=print):
             'complete':len(remaining)==0 and int(header.get('used', -1))==0, 'finished_at':time.time()}
 
 
+async def retry_authorized(db, context, identifiers, authorization_id, client=None):
+    """One additional attempt on exact IDs only after a separate explicit approval.
+
+    Caller holds the same maintenance locks as clear(). An approval cannot be
+    reused to replay an uncertain result. Every original receipt is preserved.
+    """
+    if not authorization_id or not identifiers:raise ValueError('explicit approval and exact IDs required')
+    schema(db)
+    with db.connect() as c:
+        c.execute('''CREATE TABLE IF NOT EXISTS collection_reset_overrides(
+            authorization TEXT,account TEXT,draft_id TEXT,previous_receipt TEXT,created REAL,
+            PRIMARY KEY(authorization,account,draft_id))''')
+    scope=account(context);client=client or Client(context)
+    _,remote=await reconcile(db,scope,client)
+    present={str(r['id']):r for r in remote}
+    for identifier in dict.fromkeys(str(i) for i in identifiers):
+        if identifier not in present:continue
+        with db.connect() as c:
+            old=c.execute('SELECT * FROM draft_cleanup_receipts WHERE account=? AND draft_id=?',(scope,identifier)).fetchone()
+            used=c.execute('SELECT 1 FROM collection_reset_overrides WHERE authorization=? AND account=? AND draft_id=?',
+                           (authorization_id,scope,identifier)).fetchone()
+        if used:continue
+        if (not old or old['state']!='unconfirmed' or old['owner']!=context['owner']
+                or old['sku']!=str(present[identifier].get('goods_id'))):
+            raise ValueError('authorized receipt identity/state mismatch')
+        detail=await read(lambda:client.call('/api.product.collect/detail',params={'id':int(identifier),'is_online':0}))
+        if not isinstance(detail,dict) or not detail.get('skus'):raise ValueError('incomplete source backup')
+        backup={'draft_row':present[identifier],'fresh_detail':detail,'at':time.time(),
+                'scope':'explicit-authorized-retry','authorization_id':authorization_id,'previous_receipt':dict(old)}
+        with db.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            if any(not c.execute('SELECT paused FROM pipeline_module_control WHERE module=?',(m,)).fetchone()[0] for m in control.MODULES):
+                raise RuntimeError('maintenance pause changed')
+            inserted=c.execute('INSERT OR IGNORE INTO collection_reset_overrides VALUES(?,?,?,?,?)',
+                (authorization_id,scope,identifier,db.seal(dict(old)),time.time())).rowcount
+            if not inserted:continue
+            c.execute("UPDATE draft_cleanup_receipts SET state='intent',body=?,updated=? WHERE account=? AND draft_id=?",
+                      (db.seal(backup),time.time(),scope,identifier))
+        try:
+            backup['response']=await client.call('/api.product.collect/del','DELETE',{'ids':identifier})
+            state='acknowledged'
+        except Exception as error:
+            backup['error_type']=type(error).__name__;state='unconfirmed'
+        journal(db,scope,identifier,context['owner'],old['sku'],state,backup)
+    header,remaining=await reconcile(db,scope,client)
+    return {'remaining':len(remaining),'used':header.get('used'),
+            'complete':not remaining and int(header.get('used',-1))==0,'finished_at':time.time()}
+
+
 async def maintenance(db, context):
     locks=[]
     control.schema(db)
