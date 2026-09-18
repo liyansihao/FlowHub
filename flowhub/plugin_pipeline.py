@@ -91,6 +91,7 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
               WHEN json_extract(q.body,'$.phase')='ready' THEN 2
               WHEN q.state='publishing' THEN 3
               ELSE 4 END,
+              CASE WHEN q.state='needs_fields' AND json_extract(q.body,'$.repair_workflow.stage')='validate' THEN 0 ELSE 1 END,
               CASE WHEN q.state='needs_fields' AND json_extract(q.body,'$.pending_publication_fields') IS NOT NULL THEN 0 WHEN q.state='needs_fields' AND json_extract(q.body,'$.evaluation_state') IS NULL AND json_extract(q.body,'$.repair_retry') IS NULL THEN 1 ELSE 2 END,q.due LIMIT 1""", (now, now, *(RECONCILE if lane in ('submit','reconcile') else ()),*(target or ()))).fetchone()
         if not r:return False
         if r['state']=='needs_fields' and not (staged_repairs and repair_kind=='publication'):

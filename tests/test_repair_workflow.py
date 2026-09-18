@@ -112,3 +112,17 @@ def test_publication_backlog_does_not_lower_valuation_budget(tmp_path):
         for i in range(9):c.execute('INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)',(owner,str(100+i),'3','needs_fields','{}',0,0))
         c.execute('INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)',(owner,'200','3','needs_fields','{"official_dossier_pending":true}',0,0))
     assert admit_one(db,owner)['state']=='admitted'
+
+
+@pytest.mark.asyncio
+async def test_completed_source_validation_is_not_starved_by_older_source_backlog(tmp_path,monkeypatch):
+    db,owner=configured(tmp_path);seen=[]
+    with db.connect() as c:
+        c.execute("UPDATE plugin_pipeline SET body=json_set(body,'$.repair_workflow.stage','source'),due=0")
+        c.execute('INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)',(owner,'3','2','needs_fields',json.dumps({'official_dossier_pending':True,'repair_workflow':{'stage':'validate'}}),time.time()-1,0))
+        c.execute('INSERT INTO plugin_routes VALUES(?,?,?,?,?,?)',(owner,'3','2','test',0,'expired-publication'))
+    async def run(self,db,owner,sku,seller,**kwargs):
+        seen.append(sku);return {'state':'waiting','reason':'test','failure_class':'network'}
+    monkeypatch.setattr(PriceRepairModule,'run',run)
+    assert await pipeline.tick(db,lane='seed_repair',repair_kind='publication')
+    assert seen==['3']
