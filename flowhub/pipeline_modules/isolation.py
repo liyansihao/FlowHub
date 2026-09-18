@@ -39,6 +39,10 @@ def classify(state, body, now):
     if body.get('isolation_recovery_until', 0) > now:
         return None
     if state == 'needs_fields':
+        if body.get('repair_workflow'):
+            # Stage failures and dependency waits have distinct durable counters.
+            # Do not quarantine a restarted staged task using legacy attempt totals.
+            return None
         retry = body.get('repair_retry') or {}
         count = max(retry.get('total_attempts', 0), retry.get('attempts', 0))
         since = body.get('repair_wait_started_at', body.get('updated_at', body.get('requested_at', now)))
@@ -76,7 +80,7 @@ def cleanup(db, *, now=None):
                 continue
             body = json.loads(row['body'])
             reason = classify(row['state'], body, now)
-            if not reason and row['state']=='needs_fields':
+            if not reason and row['state']=='needs_fields' and not body.get('repair_workflow'):
                 from .lifecycle import config as lifecycle_config, reason as lifecycle_reason
                 reason=lifecycle_reason(body,now,lifecycle_config(db))
             if not reason:

@@ -20,9 +20,11 @@ async def run(db, *, review_workers=2, submit_workers=2, reconcile_workers=2, se
         raise ValueError('each lane requires 1..4 workers')
     if seed_workers not in (1,2):raise ValueError('seed workers must be 1 or a guarded trial of 2')
     control.schema(db)
+    from . import repair_workflow
+    repair_policy=repair_workflow.config(db)
 
     async def lane(name, index=0):
-        module = 'seed' if name == 'seed_repair' else 'review' if name in ('review','remote_review') else 'publication'
+        module = 'seed' if name in ('seed_repair','repair_valuation','repair_publication') else 'review' if name in ('review','remote_review') else 'publication'
         while True:
             if name=='remote_review':
                 from ..cluster_compute import extra_review_workers
@@ -38,7 +40,9 @@ async def run(db, *, review_workers=2, submit_workers=2, reconcile_workers=2, se
                     await asyncio.sleep(5)
                     continue
             try:
-                if name=='seed_repair' and seed_workers==2:
+                if name in ('repair_valuation','repair_publication'):
+                    worked=await tick(db,lane='seed_repair',repair_kind=name.removeprefix('repair_'))
+                elif name=='seed_repair' and seed_workers==2:
                     from .repair_queue import tick_repair
                     worked=await tick_repair(db,index,tick)
                 elif name in ('submit','reconcile'):
@@ -68,8 +72,9 @@ async def run(db, *, review_workers=2, submit_workers=2, reconcile_workers=2, se
                 db.health("queue-isolation-read-error")
             await asyncio.sleep(15)
 
+    repairs=[('repair_valuation',repair_policy['valuation_workers']),('repair_publication',repair_policy['publication_workers'])] if repair_policy['enabled'] else [('seed_repair',seed_workers)]
     tasks = [asyncio.create_task(lane(name,index)) for name, count in
-             [('seed_repair',seed_workers), ('review', review_workers), ('submit', submit_workers), ('reconcile', reconcile_workers), ('reconcile_history',1)] for index in range(count)]
+             repairs+[('review', review_workers), ('submit', submit_workers), ('reconcile', reconcile_workers), ('reconcile_history',1)] for index in range(count)]
     tasks.extend(asyncio.create_task(lane('remote_review',index)) for index in range(2))
     tasks.append(asyncio.create_task(repair_maintenance()))
     tasks.append(asyncio.create_task(isolated_readback()))

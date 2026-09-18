@@ -5,7 +5,7 @@ import json
 def classify(evidence):
     steps=evidence.get('steps',[])
     text=json.dumps(steps,ensure_ascii=False).lower()
-    if any(x in text for x in ('connecttimeout','connecterror','connect_timeout','readtimeout','econnreset','enotfound','fetch failed','maozi_api_pacing_wait','maozi_pacing_lock_timeout','timeout_error','timeouterror','etimedout','rate_limited')):
+    if any(x in text for x in ('connecttimeout','connecterror','connect_timeout','readtimeout','remoteprotocolerror','readerror','writeerror','pooltimeout','econnreset','enotfound','fetch failed','maozi_api_pacing_wait','maozi_pacing_lock_timeout','timeout_error','timeouterror','etimedout','rate_limited')):
         return 'network'
     if any(x in text for x in ('write_outcome_unknown": true','claim changed','outcome unknown','source request pending','source acquisition pending','draft outcome unresolved','favorite creation not confirmed','recovery listing incomplete')):
         return 'remote_pending'

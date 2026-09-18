@@ -57,12 +57,15 @@ def admit_one(db, owner, now=None):
         active=c.execute("SELECT count(*) FROM plugin_pipeline WHERE owner=? AND state IN ('queued','evaluating','publishing') AND NOT ("+remote_sql+")",(owner,)).fetchone()[0]
         if remote>=policy.get('max_remote_pending',40):return {'state':'backpressure','remote_pending':remote}
         repairs=c.execute("SELECT count(*) FROM plugin_pipeline WHERE owner=? AND state='needs_fields'",(owner,)).fetchone()[0]
-        publication_repairs=c.execute("SELECT count(*) FROM plugin_pipeline WHERE owner=? AND state='needs_fields' AND json_extract(body,'$.official_dossier_pending')=1",(owner,)).fetchone()[0]
+        from . import repair_workflow
+        repair_policy=repair_workflow.config(db)
+        publication_repairs=c.execute("SELECT count(*) FROM plugin_pipeline q WHERE owner=? AND state='needs_fields' AND "+(repair_workflow.PUBLICATION_SQL if repair_policy['enabled'] else "json_extract(body,'$.official_dossier_pending')=1"),(owner,)).fetchone()[0]
         valuation_repairs=repairs-publication_repairs
         # Existing post-review dossier backlog has its own lane. Admit a small,
         # bounded fresh cohort instead of letting it stop all new acquisition.
         repair_limit=min(policy.get('max_repair_pending',48),8) if publication_repairs else policy.get('max_repair_pending',48)
-        active+=c.execute("SELECT count(*) FROM plugin_pipeline q JOIN plugin_pipeline_leases l USING(owner,sku,seller) WHERE q.owner=? AND q.state='needs_fields' AND l.expires>?",(owner,now)).fetchone()[0]
+        if repair_policy['enabled']:repair_limit=repair_policy['valuation_queue_limit']
+        active+=c.execute("SELECT count(*) FROM plugin_pipeline q JOIN plugin_pipeline_leases l USING(owner,sku,seller) WHERE q.owner=? AND q.state='needs_fields' AND l.expires>?"+(' AND NOT '+repair_workflow.PUBLICATION_SQL if repair_policy['enabled'] else ''),(owner,now)).fetchone()[0]
         if active>=max(1,policy.get('max_inflight',12)-(1 if repairs else 0)):return {'state':'backpressure','active':active}
         promoted=promote_ready_candidate(c,db,owner,now)
         if promoted:return promoted
@@ -178,7 +181,7 @@ async def run(db):
         for owner in owners:
             started=time.time()
             try:
-                result=admit_one(db,owner)
+                result=await asyncio.to_thread(admit_one,db,owner)
             except Exception as error:
                 result={'state':'error','reason':type(error).__name__}
             control.record(db,'seed',owner,'',started,result['state'],result)

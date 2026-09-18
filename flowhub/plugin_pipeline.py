@@ -53,6 +53,8 @@ def readback_delay(body, phase, verified=False, submission_priority=False):
 
 
 async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None):
+    from .pipeline_modules import repair_workflow
+    staged_repairs=repair_workflow.enabled(db)
     if repair_kind not in (None,'publication','valuation') or (repair_kind and lane!='seed_repair'):
         raise ValueError('invalid_repair_kind')
     if target is not None and (len(target)!=3 or not all(isinstance(v,str) and v for v in target)):
@@ -76,7 +78,8 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
             'reconcile': " AND COALESCE(json_extract(q.body,'$.phase'),'')!='manual_review' AND q.state IN ('publishing','awaiting_remote') AND json_extract(q.body,'$.phase') IN (" + ','.join('?' for _ in RECONCILE) + ')',
         }[lane]
         if repair_kind:
-            lane_sql += " AND COALESCE(json_extract(q.body,'$.official_dossier_pending'),0)" + ('=1' if repair_kind=='publication' else '!=1')
+            if staged_repairs:lane_sql+=' AND '+('' if repair_kind=='publication' else 'NOT ')+repair_workflow.PUBLICATION_SQL
+            else:lane_sql += " AND COALESCE(json_extract(q.body,'$.official_dossier_pending'),0)" + ('=1' if repair_kind=='publication' else '!=1')
         now = time.time()
         r=c.execute("""SELECT q.* FROM plugin_pipeline q JOIN users u ON u.id=q.owner
             LEFT JOIN plugin_pipeline_leases l ON l.owner=q.owner AND l.sku=q.sku AND l.seller=q.seller
@@ -90,11 +93,11 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
               ELSE 4 END,
               CASE WHEN q.state='needs_fields' AND json_extract(q.body,'$.pending_publication_fields') IS NOT NULL THEN 0 WHEN q.state='needs_fields' AND json_extract(q.body,'$.evaluation_state') IS NULL AND json_extract(q.body,'$.repair_retry') IS NULL THEN 1 ELSE 2 END,q.due LIMIT 1""", (now, now, *(RECONCILE if lane in ('submit','reconcile') else ()),*(target or ()))).fetchone()
         if not r:return False
-        if r['state']=='needs_fields':
+        if r['state']=='needs_fields' and not (staged_repairs and repair_kind=='publication'):
             campaign=c.execute('SELECT body FROM pipeline_campaigns WHERE owner=? AND enabled=1',(r['owner'],)).fetchone() if c.execute("SELECT 1 FROM sqlite_master WHERE name='pipeline_campaigns'").fetchone() else None
             limit=json.loads(campaign[0]).get('max_inflight',12) if campaign else 12
             active=c.execute("SELECT count(*) FROM plugin_pipeline WHERE owner=? AND state IN ('queued','evaluating','publishing') AND COALESCE(json_extract(body,'$.phase'),'') NOT IN ('submitting','reconciling','sync_pending','stock_ready','stock_pending','manual_review')",(r['owner'],)).fetchone()[0]
-            active+=c.execute("SELECT count(*) FROM plugin_pipeline q JOIN plugin_pipeline_leases l USING(owner,sku,seller) WHERE q.owner=? AND q.state='needs_fields' AND l.expires>?",(r['owner'],now)).fetchone()[0]
+            active+=c.execute("SELECT count(*) FROM plugin_pipeline q JOIN plugin_pipeline_leases l USING(owner,sku,seller) WHERE q.owner=? AND q.state='needs_fields' AND l.expires>?"+(' AND NOT '+repair_workflow.PUBLICATION_SQL if staged_repairs else ''),(r['owner'],now)).fetchone()[0]
             if active>=limit:return False
         row=dict(r);key=(row['owner'],row['sku'],row['seller']);token=secrets.token_hex(16)
         c.execute('INSERT OR REPLACE INTO plugin_pipeline_leases VALUES(?,?,?,?,?)',(*key,token,now+120))
@@ -106,14 +109,16 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
                           (time.time()+120,*key,token))
     heartbeat=asyncio.create_task(renew())
     started=time.time()
-    state=row['state'];body=json.loads(row['body']);attempts=row['attempts'];delay=0;lock_wait=False;dependency_wait=False
+    state=row['state'];body=json.loads(row['body']);attempts=row['attempts'];delay=0;lock_wait=False;dependency_wait=False;repair_progress=False
     try:
         if state=='needs_fields':
             from .pipeline_modules.repair import PriceRepairModule
             result=await PriceRepairModule().run(db,*key)
             body['repair_reason']=result['reason']
+            if result.get('workflow'):body['repair_workflow']=result['workflow']
             if result['state']=='ready':
                 state='queued';body.pop('error',None);body.pop('reason',None)
+                body.pop('repair_manual',None);body.pop('repair_dependency',None)
                 if body.pop('official_dossier_pending',False):
                     for field in ('needs_dossier','missing_fields','pending_publication_fields','repair_full_dossier'):
                         body.pop(field,None)
@@ -133,6 +138,14 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
                         else:
                             from .pipeline_modules.repair_queue import preserve_review
                             preserve_review(c,db,key,body)
+            elif result.get('workflow'):
+                if result['state']=='progress':
+                    repair_progress=True;delay=0
+                elif result['state']=='manual':
+                    state='needs_review';body.update(reason='repair_input_required: '+result['reason'],repair_manual=True)
+                else:
+                    delay=result.get('retry_after',60)
+                    body['repair_dependency']=result.get('failure_class') or result['workflow'].get('failure_class')
             else:
                 repair=body.setdefault('repair_retry',{})
                 from .pipeline_modules.repair_retry import schedule
@@ -233,7 +246,7 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
                     if publication.get('phase'):
                         body['phase']=publication['phase']
                         body['submitted']=bool(body.get('submitted')) or publication['phase'] in ('submitting','reconciling','sync_pending','stock_ready','stock_pending','stock_verified')
-    if state=='needs_review':
+    if state=='needs_review' and not body.get('repair_manual'):
         from .manual_reviews import publication_started
         with db.connect() as c:
             if not publication_started(c,*key,body):body['same_product_only']=True
@@ -244,12 +257,13 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
     if lane=='reconcile_history' and state=='awaiting_remote' and body.get('phase')=='manual_review':delay=max(delay,900)
     from .pipeline_modules.lifecycle import track
     track(body,row['state'],state,time.time(),attempted=not (lock_wait or dependency_wait))
+    if repair_progress:body['lifecycle']['last_progress_at']=time.time()
     body['updated_at']=time.time()
     with db.connect() as c:
         c.execute('BEGIN IMMEDIATE')
         if not c.execute('SELECT 1 FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=? AND token=?',(*key,token)).fetchone():
             return False
-        if state=='needs_review' and body.get('same_product_only'):
+        if state=='needs_review' and body.get('same_product_only') and not body.get('repair_manual'):
             from .identity_review import reconcile_pending
             state=reconcile_pending(c,key,body) or state
         c.execute('DELETE FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=? AND token=?',(*key,token))

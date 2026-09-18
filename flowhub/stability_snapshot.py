@@ -91,6 +91,16 @@ def audit(data):
                           'used':used,'used_before':used,'limit':limit,'blocked':bool(blocked),
                           'source':'verified_capacity_observation'}
         out["last_collection_capacity_observation"] = capacity
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='repair_workflows'").fetchone():
+            stages=collections.Counter();waiting=0;oldest=0
+            for raw,state in db.execute('SELECT w.body,q.state FROM repair_workflows w JOIN plugin_pipeline q USING(owner,sku,seller)'):
+                w=json.loads(raw)
+                if state!='needs_fields':continue
+                stages[(w['kind'],w['stage'],w['state'])]+=1
+                age=max(0,now-w['last_progress_at']);oldest=max(oldest,age)
+                waiting+=age>=1800
+            out['repair_workflow']={'active_stages':[{'kind':k[0],'stage':k[1],'state':k[2],'count':v} for k,v in stages.items()],
+                                    'no_progress_30m':waiting,'oldest_progress_age_s':round(oldest)}
         db.rollback()
     finally:
         db.close()

@@ -36,6 +36,8 @@ def sample(data, output):
         try:
             report = audit(data)
             alerts = report['alerts']
+            if report.get('repair_workflow',{}).get('no_progress_30m') and not report.get('paused',{}).get('seed'):
+                alerts.append({'level':'critical','code':'repair_stage_no_progress_30m','count':report['repair_workflow']['no_progress_30m']})
             cleanup_path=data/'collection-autoclean-status.json'
             if cleanup_path.exists():
                 cleanup=json.loads(cleanup_path.read_text())
