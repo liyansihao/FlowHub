@@ -14,6 +14,26 @@ from flowhub.stability_monitor import transition
 from tests.test_draft_cleanup import setup, cleanup
 
 
+def test_monitor_uses_verified_post_cleanup_capacity(tmp_path):
+    import sqlite3
+    from flowhub.stability_snapshot import audit
+    from flowhub.pipeline_modules import control
+    db,owner,_=setup(tmp_path)
+    control.schema(db)
+    (tmp_path/'collection-capacity.json').write_text('{"enabled":true}')
+    with db.connect() as c:
+        c.execute('CREATE TABLE IF NOT EXISTS plugin_publications(body TEXT)')
+    control.record(db,'seed',owner,'*',time.time()-30,'draft_cleanup',{'used_before':1000,'limit':1000})
+    capacity.observe(db,'account',{'used':0,'limit':1000},time.time()-1)
+    (tmp_path/'cluster').mkdir()
+    with sqlite3.connect(tmp_path/'cluster/cluster.sqlite3') as c:
+        c.executescript('CREATE TABLE devices(name,last_seen,enabled); CREATE TABLE runtime_reports(component,seen);'
+                        'CREATE TABLE compute_jobs(kind,state,created); CREATE TABLE erp_commands(state,created);')
+    result=audit(tmp_path)
+    assert result['last_collection_capacity_observation']['used']==0
+    assert not any(a['code']=='collection_capacity_high_last_observation' for a in result['alerts'])
+
+
 def collector(tmp_path, sku='123'):
     db = Database(tmp_path)
     (tmp_path / 'collection-capacity.json').write_text('{"enabled":true}')

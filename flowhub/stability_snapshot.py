@@ -81,6 +81,15 @@ def audit(data):
                             **{k: detail.get(k) for k in ("used_before", "limit", "deleted", "skipped", "state")}}
         out["events_6h_attempt_counts"] = [{"module": m, "outcome": o, "count": n} for (m, o), n in events.most_common()]
         out["cleanup_6h_attempt_counts"] = [{"kind": k, "state": s, "error_type": e, "count": n} for (k, s, e), n in cleanup.most_common()]
+        # Admission and explicit maintenance write the actual post-cleanup count.
+        # A pre-cleanup event must not keep reporting a full box after it is freed.
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='collection_capacity'").fetchone():
+            latest=db.execute('SELECT used,capacity,observed,blocked FROM collection_capacity ORDER BY observed DESC LIMIT 1').fetchone()
+            if latest and (not capacity or latest[2] >= now-capacity['age_s']):
+                used,limit,observed,blocked=latest
+                capacity={'observed_at':stamp(observed),'age_s':round(now-observed),
+                          'used':used,'used_before':used,'limit':limit,'blocked':bool(blocked),
+                          'source':'verified_capacity_observation'}
         out["last_collection_capacity_observation"] = capacity
         db.rollback()
     finally:
