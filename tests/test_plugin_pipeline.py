@@ -80,7 +80,7 @@ async def test_repair_backoff_persists_and_exhausts_without_publication(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_repair_success_returns_to_measurement_and_removes_stale_cache(tmp_path,monkeypatch):
+async def test_repair_success_preserves_review_and_forces_fresh_measurement(tmp_path,monkeypatch):
     from flowhub.pipeline_modules.repair import PriceRepairModule
     db=Database(tmp_path);SourceLibrary(db);pipeline.schema(db)
     with db.connect() as c:
@@ -94,7 +94,11 @@ async def test_repair_success_returns_to_measurement_and_removes_stale_cache(tmp
     with db.connect() as c:
         r=c.execute('SELECT state,body FROM plugin_pipeline').fetchone()
         assert r['state']=='queued' and 'repair_retry' not in json.loads(r['body'])
-        assert c.execute('SELECT count(*) FROM plugin_reviews').fetchone()[0]==0
+        assert c.execute('SELECT count(*) FROM plugin_reviews').fetchone()[0]==1
+        body=json.loads(r['body'])
+        assert body['force_full_evaluation'] is True
+        archived=c.execute('SELECT body FROM repair_review_history WHERE id=?',(body['repair_review_revision'],)).fetchone()
+        assert db.open(archived[0])=={}
 
 
 @pytest.mark.asyncio

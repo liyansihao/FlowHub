@@ -67,15 +67,44 @@ def journal(db,account,draft_id,owner,sku,state,body):
 
 def candidates(db,owner,settings):
     with db.connect() as c:
-        found=c.execute('''SELECT q.sku,q.seller,q.body,s.config,s.secret FROM plugin_pipeline q
+        found=c.execute('''SELECT q.sku,q.seller,q.body,s.id AS store_id,s.config,s.secret FROM plugin_pipeline q
             JOIN plugin_routes r USING(owner,sku,seller) JOIN stores s ON s.id=r.store_id AND s.owner=q.owner
             WHERE q.owner=? AND q.state='selling' ORDER BY q.due''',(owner,)).fetchall()
-    groups={}
+    groups={};snapshot_index=None
     for r in found:
         ctx={'owner':owner,'candidate':{'source_key':r['sku']},'store':{'config':json.loads(r['config']),'credentials':db.open(r['secret'])}}
         token=ctx['store']['credentials'].get('erp_token')
         if not token:continue
         collector=SourceCollector(db,ctx);state,snapshot,updated=collector.load()
+        # Credential rotation changes the collector cache key. The immutable,
+        # owner/SKU/seller-bound publication retains the exact source draft used.
+        # Never search another owner's unbound source cache by SKU alone.
+        if state!='ready' or not snapshot.get('draft_id'):
+            with db.connect() as c:
+                exists=c.execute("SELECT 1 FROM sqlite_master WHERE name='plugin_publications'").fetchone()
+                row=c.execute('SELECT body FROM plugin_publications WHERE owner=? AND sku=? AND seller=?',
+                              (owner,r['sku'],r['seller'])).fetchone() if exists else None
+            record=json.loads(row[0]) if row else {}
+            saved=record.get('snapshot') or {}
+            queue=json.loads(r['body'])
+            if (record.get('owner')==owner and record.get('store_id')==r['store_id'] and str(record.get('sku'))==r['sku']
+                    and str(record.get('seller'))==r['seller'] and record.get('verified') is True
+                    and queue.get('offer_id') and record.get('offer_id')==queue['offer_id']):
+                if not saved.get('draft_id'):
+                    steps=record.get('review',{}).get('candidate',{}).get('origin',{}).get('collection_evidence',{}).get('last_repair',{}).get('steps',[])
+                    draft_ids={str(s['draft_id']) for s in steps if s.get('draft_id') and s.get('source') in ('maozi-erp-draft','maozi-erp-draft-cache')}
+                    if draft_ids:
+                        if snapshot_index is None:
+                            snapshot_index={}
+                            with db.connect() as c:
+                                for source in c.execute("SELECT key,body,updated FROM source_details WHERE state='ready'"):
+                                    value=db.open(source['body'])
+                                    if value.get('draft_id'):
+                                        snapshot_index.setdefault((str(value.get('source_key')),str(value['draft_id'])),[]).append((value,source['updated']))
+                        linked=[v for draft in draft_ids for v in snapshot_index.get((r['sku'],draft),[])]
+                        if len(linked)==1:saved=linked[0][0]
+                if str(saved.get('source_key'))==r['sku']:
+                    state,snapshot,updated='ready',saved,record.get('started_at',time.time())
         if (state!='ready' or not snapshot.get('draft_id') or not snapshot.get('favorite_id')
                 or (snapshot.get('recovery') and not settings.get('clear_completed')) or not snapshot.get('detail') or str(snapshot.get('source_key'))!=r['sku']
                 or time.time()-updated<settings['minimum_age_seconds']):continue
@@ -121,7 +150,10 @@ async def sold_observation(db,owner,item,client):
 
 async def clean_account(db,owner,account,items,settings,client=None):
     client=client or Client(items[0]['context'])
+    read_started=time.time()
     header,remote=await listing(client)
+    from ..collection_capacity import observe
+    observe(db,account,header,read_started)
     present={str(r['id']):r for r in remote}
     # Unknown prior writes are reconciled by absence only, never replayed.
     with db.connect() as c:prior=c.execute('SELECT * FROM draft_cleanup_receipts WHERE account=?',(account,)).fetchall()
@@ -176,7 +208,9 @@ async def clean_account(db,owner,account,items,settings,client=None):
             journal(db,account,draft,owner,sku,'unconfirmed',backup)
             break
     if touched:
+        read_started=time.time()
         after,remote=await listing(client);remaining={str(r['id']) for r in remote}
+        observe(db,account,after,read_started)
         for draft in touched:
             if draft in remaining:continue
             with db.connect() as c:r=c.execute('SELECT * FROM draft_cleanup_receipts WHERE account=? AND draft_id=?',(account,draft)).fetchone()
@@ -197,9 +231,18 @@ async def tick(db):
         results=[]
         for owner in owners:
             for account,items in candidates(db,owner,settings).items():
+                with db.connect() as c:
+                    c.execute('CREATE TABLE IF NOT EXISTS draft_cleanup_backoff(account TEXT PRIMARY KEY,failures INTEGER,due REAL)')
+                    backoff=c.execute('SELECT failures,due FROM draft_cleanup_backoff WHERE account=?',(account,)).fetchone()
+                if backoff and backoff['due']>time.time():continue
                 started=time.time()
                 try:result=await clean_account(db,owner,account,items,settings)
                 except Exception as error:result={'state':'error','error_type':type(error).__name__}
+                failures=(backoff['failures'] if backoff else 0)+1 if result['state'] in ('no_safe_candidates','error') else 0
+                delay=min(1800,settings['interval_seconds']*2**min(failures,5)) if failures else settings['interval_seconds']
+                with db.connect() as c:
+                    c.execute('INSERT OR REPLACE INTO draft_cleanup_backoff VALUES(?,?,?)',(account,failures,time.time()+delay))
+                result.update(consecutive_no_progress=failures,next_scan_after_seconds=delay)
                 control.record(db,'seed',owner,'',started,'draft_cleanup',result);results.append(result)
         return results
 

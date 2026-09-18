@@ -207,6 +207,8 @@ class SourceCollector:
         data=data|{'source_key':self.sku,'draft_id':draft_id,'detail':detail,'observed_at':time.time(),
                    'recovery':{'source':'exact-ozon-draft-list','at':time.time()}}
         self.save('ready',data)
+        from .collection_capacity import finish
+        finish(self)
         return data
 
     async def collect(self):
@@ -277,6 +279,8 @@ class SourceCollector:
             if self.c.get("existing_favorite_only"):
                 self.save("claimed", data)
                 raise Pending("source favorite missing; a real price is required before creating one")
+            from .collection_capacity import guard
+            await guard(self)
             self.save("favorite_started", {"source_key": self.sku, "favorite_attempted": True})
             p = self.c["candidate"]
             try:
@@ -309,9 +313,12 @@ class SourceCollector:
         if favorite is None:
             raise Pending("favorite creation not confirmed; lookup again later")
         data = {"source_key": self.sku, "favorite_id": int(favorite["id"])}
-        self.save("draft_started", data)
         if str(favorite.get("is_imported")) == "1":
+            self.save("draft_started", data)
             return await self.recover_draft(data)
+        from .collection_capacity import guard, finish
+        await guard(self, reserve=True)
+        self.save("draft_started", data)
         try:
             draft = await self.call("/api.product.favorite/edit_import", "POST", body={"id": data["favorite_id"]})
         except SourceAcquisitionFailure as error:
@@ -321,12 +328,14 @@ class SourceCollector:
                     and '采集箱已满' in str(diagnostic.get('api_message',''))):
                 data['last_rejection']=diagnostic
                 self.save('draft_rejected',data)
+                finish(self, rejected=True)
             raise
         draft_id = int(draft.get("jump_id") or draft.get("id") or 0)
         if draft_id <= 0:
             raise ModuleError("source draft acknowledgement missing")
         data["draft_id"] = draft_id
         self.save("draft_ready", data)
+        finish(self)
         detail = await self.call("/api.product.collect/detail", query={"id": draft_id, "is_online": 0})
         data |= {"detail": detail, "observed_at": time.time()}
         self.save("ready", data)

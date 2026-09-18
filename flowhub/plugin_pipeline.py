@@ -242,6 +242,8 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
         else:body.setdefault('repair_wait_started_at',body.get('updated_at',started))
     else:body.pop('repair_wait_started_at',None)
     if lane=='reconcile_history' and state=='awaiting_remote' and body.get('phase')=='manual_review':delay=max(delay,900)
+    from .pipeline_modules.lifecycle import track
+    track(body,row['state'],state,time.time(),attempted=not (lock_wait or dependency_wait))
     body['updated_at']=time.time()
     with db.connect() as c:
         c.execute('BEGIN IMMEDIATE')

@@ -76,6 +76,9 @@ def cleanup(db, *, now=None):
                 continue
             body = json.loads(row['body'])
             reason = classify(row['state'], body, now)
+            if not reason and row['state']=='needs_fields':
+                from .lifecycle import config as lifecycle_config, reason as lifecycle_reason
+                reason=lifecycle_reason(body,now,lifecycle_config(db))
             if not reason:
                 continue
             c.execute('INSERT INTO queue_isolation_receipts VALUES(NULL,?,?,?,?,?,?,?,?,?)',
