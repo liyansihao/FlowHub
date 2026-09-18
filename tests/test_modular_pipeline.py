@@ -234,3 +234,27 @@ async def test_manual_history_cannot_occupy_normal_reconcile_lane(tmp_path,monke
     with db.connect() as c:c.execute('UPDATE plugin_pipeline SET due=0')
     advance.return_value={'phase':'stock_verified','verified':True}
     assert await pipeline.tick(db,lane='reconcile')
+
+
+@pytest.mark.asyncio
+async def test_runtime_gives_acquisition_a_separate_lane_during_canary(tmp_path,monkeypatch):
+    from flowhub.pipeline_modules.runtime import run
+    db,_=setup(tmp_path);seen=[];started=asyncio.Event()
+    (tmp_path/'repair-workflow.json').write_text('{"enabled":true}')
+    (tmp_path/'acquisition-policy.json').write_text('{"enabled":true,"source_keys":["1"]}')
+    async def tick(db,lane=None,**kwargs):
+        if lane=='seed_repair':
+            seen.append(kwargs)
+            if len(seen)==4:started.set()
+        await asyncio.Event().wait()
+    monkeypatch.setattr(pipeline,'tick',tick)
+    task=asyncio.create_task(run(db))
+    try:
+        await asyncio.wait_for(started.wait(),2)
+        assert {'repair_kind':'publication','repair_stage':'acquire','acquisition_route':True} in seen
+        assert {'repair_kind':'publication','repair_stage':'acquire','acquisition_route':False} in seen
+        assert {'repair_kind':'publication','repair_stage':'validate'} in seen
+        assert {'repair_kind':'valuation'} in seen
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):await task

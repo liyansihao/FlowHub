@@ -32,6 +32,30 @@ def enabled(db, sku=None):
     return bool(cfg.get("enabled", False) and (sku is None or cohort is None or str(sku) in cohort))
 
 
+def routing(db, c):
+    """SQL predicate for the new lane; enrolled tasks survive flag rollback."""
+    active = enabled(db)  # validate the cohort before using it
+    cfg = json.loads((db.directory / "acquisition-policy.json").read_text()) if (db.directory / "acquisition-policy.json").exists() else {}
+    cohort = cfg.get("source_keys")
+    sql, args = "0", []
+    if active:
+        if cohort is None:
+            sql = "1"
+        elif cohort:
+            sql, args = "q.sku IN (" + ",".join("?" for _ in cohort) + ")", list(cohort)
+    if c.execute("SELECT 1 FROM sqlite_master WHERE name='acquisition_bindings'").fetchone():
+        sql += " OR EXISTS (SELECT 1 FROM acquisition_bindings a WHERE a.owner=q.owner AND a.sku=q.sku)"
+    return "(" + sql + ")", args
+
+
+def routing_active(db):
+    if enabled(db):
+        return True
+    with db.connect() as c:
+        return bool(c.execute("SELECT 1 FROM sqlite_master WHERE name='acquisition_bindings'").fetchone()
+                    and c.execute("SELECT 1 FROM acquisition_bindings LIMIT 1").fetchone())
+
+
 def enrolled(db, key):
     with db.connect() as c:
         if not c.execute("SELECT 1 FROM sqlite_master WHERE name='acquisition_tasks'").fetchone():

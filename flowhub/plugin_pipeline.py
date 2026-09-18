@@ -52,9 +52,11 @@ def readback_delay(body, phase, verified=False, submission_priority=False):
     return delay
 
 
-async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None, repair_stage=None):
+async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None, repair_stage=None, acquisition_route=None):
     from .pipeline_modules import repair_workflow
     staged_repairs=repair_workflow.enabled(db)
+    if acquisition_route is not None and (not isinstance(acquisition_route,bool) or repair_stage!='acquire'):
+        raise ValueError('invalid_acquisition_route')
     if repair_stage not in (None,'validate','acquire') or (repair_stage and repair_kind!='publication'):
         raise ValueError('invalid_repair_stage')
     if repair_kind not in (None,'publication','valuation') or (repair_kind and lane!='seed_repair'):
@@ -84,6 +86,11 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
             else:lane_sql += " AND COALESCE(json_extract(q.body,'$.official_dossier_pending'),0)" + ('=1' if repair_kind=='publication' else '!=1')
         if repair_stage:
             lane_sql += " AND COALESCE(json_extract(q.body,'$.repair_workflow.stage'),'facts')"+ ('=' if repair_stage=='validate' else '!=')+"'validate'"
+        route_args = []
+        if acquisition_route is not None:
+            from .acquisition import routing
+            route_sql, route_args = routing(db,c)
+            lane_sql += " AND " + ("" if acquisition_route else "NOT ") + route_sql
         now = time.time()
         r=c.execute("""SELECT q.* FROM plugin_pipeline q JOIN users u ON u.id=q.owner
             LEFT JOIN plugin_pipeline_leases l ON l.owner=q.owner AND l.sku=q.sku AND l.seller=q.seller
@@ -96,7 +103,7 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
               WHEN q.state='publishing' THEN 3
               ELSE 4 END,
               CASE WHEN q.state='needs_fields' AND json_extract(q.body,'$.repair_workflow.stage')='validate' THEN 0 ELSE 1 END,
-              CASE WHEN q.state='needs_fields' AND json_extract(q.body,'$.pending_publication_fields') IS NOT NULL THEN 0 WHEN q.state='needs_fields' AND json_extract(q.body,'$.evaluation_state') IS NULL AND json_extract(q.body,'$.repair_retry') IS NULL THEN 1 ELSE 2 END,q.due LIMIT 1""", (now, now, *(RECONCILE if lane in ('submit','reconcile') else ()),*(target or ()))).fetchone()
+              CASE WHEN q.state='needs_fields' AND json_extract(q.body,'$.pending_publication_fields') IS NOT NULL THEN 0 WHEN q.state='needs_fields' AND json_extract(q.body,'$.evaluation_state') IS NULL AND json_extract(q.body,'$.repair_retry') IS NULL THEN 1 ELSE 2 END,q.due LIMIT 1""", (now, now, *(RECONCILE if lane in ('submit','reconcile') else ()),*route_args,*(target or ()))).fetchone()
         if not r:return False
         if r['state']=='needs_fields' and not (staged_repairs and repair_kind=='publication'):
             campaign=c.execute('SELECT body FROM pipeline_campaigns WHERE owner=? AND enabled=1',(r['owner'],)).fetchone() if c.execute("SELECT 1 FROM sqlite_master WHERE name='pipeline_campaigns'").fetchone() else None
