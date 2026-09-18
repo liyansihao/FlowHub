@@ -38,6 +38,11 @@ def sample(data, output):
             if report.get('paused', {}).get('publication'):
                 alerts = [a for a in alerts if a['code'] != 'low_output_with_repair_backlog']
             else:
+                low_key='low_output_with_repair_backlog:'
+                if (low_key in previous and report['first_stock_verified']['rolling_minutes']['60'] < 15
+                        and report['queue'].get('needs_fields',0) >= 8
+                        and not any(a['code']=='low_output_with_repair_backlog' for a in alerts)):
+                    alerts.append(previous[low_key] | {'count_1h':report['first_stock_verified']['rolling_minutes']['60']})
                 pending = sum(report['queue'].get(s, 0) for s in ('queued', 'evaluating', 'publishing', 'awaiting_remote', 'needs_fields'))
                 if pending and report['first_stock_verified']['rolling_minutes']['30'] == 0:
                     alerts.append({'level': 'critical', 'code': 'no_output_30m_with_pending_work'})

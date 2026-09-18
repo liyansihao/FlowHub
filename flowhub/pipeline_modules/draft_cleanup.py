@@ -9,7 +9,7 @@ from ..maozi import MaoziPublisher
 from ..source_detail import SourceCollector
 from . import control
 
-DEFAULTS={'enabled':False,'threshold_ratio':0.85,'target_ratio':0.80,'batch_size':20,'interval_seconds':300,'minimum_age_seconds':3600}
+DEFAULTS={'enabled':False,'threshold_ratio':0.85,'target_ratio':0.80,'batch_size':20,'scan_limit':20,'interval_seconds':300,'minimum_age_seconds':3600}
 
 
 def schema(db):
@@ -17,13 +17,14 @@ def schema(db):
         c.execute('''CREATE TABLE IF NOT EXISTS draft_cleanup_receipts(
             account TEXT,draft_id TEXT,owner TEXT,sku TEXT,state TEXT,body TEXT,updated REAL,
             PRIMARY KEY(account,draft_id))''')
+        c.execute('CREATE TABLE IF NOT EXISTS draft_cleanup_cursors(account TEXT PRIMARY KEY,draft_id TEXT,updated REAL)')
 
 
 def config(db):
     p=Path(db.directory)/'draft-cleanup.json'
     d=DEFAULTS|json.loads(p.read_text()) if p.exists() else dict(DEFAULTS)
     if not 0<d['target_ratio']<d['threshold_ratio']<=1:raise ValueError('invalid cleanup thresholds')
-    if not 1<=d['batch_size']<=1000 or d['minimum_age_seconds']<0 or d['interval_seconds']<60:
+    if not 1<=d['batch_size']<=1000 or not 1<=d['scan_limit']<=100 or d['minimum_age_seconds']<0 or d['interval_seconds']<60:
         raise ValueError('invalid cleanup limits')
     return d
 
@@ -165,8 +166,12 @@ async def clean_account(db,owner,account,items,settings,client=None):
     summary={'used_before':used,'limit':limit,'deleted':0,'skipped':0}
     if not settings.get('clear_completed') and (limit<=0 or used<limit*settings['threshold_ratio']):return summary|{'state':'below_threshold'}
     count=min(settings['batch_size'],len(items) if settings.get('clear_completed') else max(0,used-int(limit*settings['target_ratio'])))
-    touched=[];seen=set()
-    for item in items:
+    touched=[];seen=set();examined=0
+    with db.connect() as c:
+        cursor=c.execute('SELECT draft_id FROM draft_cleanup_cursors WHERE account=?',(account,)).fetchone()
+    ordered=sorted(items,key=lambda item:str(item['snapshot']['draft_id']))
+    if cursor:ordered=[i for i in ordered if str(i['snapshot']['draft_id'])>cursor[0]]+[i for i in ordered if str(i['snapshot']['draft_id'])<=cursor[0]]
+    for item in ordered:
         if control.paused(db,'seed') or not config(db)['enabled']:return summary|{'state':'paused'}
         draft=str(item['snapshot']['draft_id']);sku=item['sku'];row=present.get(draft)
         if draft in seen:continue
@@ -175,6 +180,10 @@ async def clean_account(db,owner,account,items,settings,client=None):
         if not row or str(row.get('goods_id'))!=sku or row.get('collect_from')!='ozon':continue
         with db.connect() as c:
             if c.execute('SELECT 1 FROM draft_cleanup_receipts WHERE account=? AND draft_id=?',(account,draft)).fetchone():continue
+        if examined>=settings.get('scan_limit',20):break
+        examined+=1
+        with db.connect() as c:
+            c.execute('INSERT OR REPLACE INTO draft_cleanup_cursors VALUES(?,?,?)',(account,draft,time.time()))
         current=client;offer=item['queue'].get('offer_id')
         try:online=await sold_observation(db,owner,item,current)
         except Exception:
@@ -217,7 +226,7 @@ async def clean_account(db,owner,account,items,settings,client=None):
             body=db.open(r['body']);body['absence_verified_at']=time.time()
             journal(db,account,draft,owner,r['sku'],'deleted',body);summary['deleted']+=1
         summary['used_after']=after.get('used')
-    return summary|{'state':'cleaned' if summary['deleted'] else 'no_safe_candidates'}
+    return summary|{'state':'cleaned' if summary['deleted'] else 'no_safe_candidates','examined':examined}
 
 
 async def tick(db):

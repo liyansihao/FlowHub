@@ -106,8 +106,8 @@ def audit(data):
     worker = next((r for r in out["health"] if r["name"] == "worker"), None)
     if not worker or worker["heartbeat_age_s"] > 180:
         alert.append({"level": "critical", "code": "worker_heartbeat_missing"})
-    if counts["180"] <= 2 and out["queue"].get("needs_fields", 0) >= 8:
-        alert.append({"level": "critical", "code": "low_output_with_repair_backlog", "count_3h": counts["180"]})
+    if counts["60"] < 10 and out["queue"].get("needs_fields", 0) >= 8:
+        alert.append({"level": "critical", "code": "low_output_with_repair_backlog", "count_1h": counts["60"], "count_3h": counts["180"]})
     if capacity and capacity["limit"] and capacity["used_before"] / capacity["limit"] >= 0.95:
         alert.append({"level": "critical" if capacity["age_s"] < 900 else "warning",
                       "code": "collection_capacity_high_last_observation", "observation_age_s": capacity["age_s"]})

@@ -167,3 +167,35 @@ def test_service_entry_waits_for_existing_supervisor_lock(tmp_path, monkeypatch)
     monkeypatch.setattr(service_entry.os,'execv',execute)
     with pytest.raises(Executed):service_entry.main()
     assert waited==[10]
+
+
+def test_monitor_holds_low_output_until_recovery_and_respects_pause(tmp_path, monkeypatch):
+    from flowhub import stability_monitor as monitor
+    output=tmp_path/'monitor';output.mkdir()
+    monitor.atomic(output/'alerts.json',{'active':{'low_output_with_repair_backlog:':{'level':'critical','code':'low_output_with_repair_backlog'}}})
+    report={'alerts':[], 'captured_at':'test', 'paused':{'publication':0}, 'queue':{'needs_fields':20},
+            'first_stock_verified':{'rolling_minutes':{'30':4,'60':12}}, 'health':[], 'last_collection_capacity_observation':None}
+    monkeypatch.setattr(monitor,'audit',lambda data:json.loads(json.dumps(report)))
+    assert monitor.sample(tmp_path,output)==[]
+    report['first_stock_verified']['rolling_minutes']['60']=15
+    assert monitor.sample(tmp_path,output)[0]['transition']=='resolved'
+    report['paused']['publication']=1
+    report['alerts']=[{'level':'critical','code':'low_output_with_repair_backlog'}]
+    assert monitor.sample(tmp_path,output)==[]
+
+
+async def test_cleanup_scan_budget_rotates_without_starvation(tmp_path,monkeypatch):
+    db,owner,item=setup(tmp_path)
+    items=[dict(item,sku=str(i),snapshot={'draft_id':i,'source_key':str(i)}) for i in range(10,16)]
+    class Remote:
+        async def call(self,path,**kwargs):
+            assert path.endswith('/lists')
+            return {'used':1000,'limit':1000,'total':6,'data':[{'id':i,'goods_id':str(i),'collect_from':'ozon'} for i in range(10,16)]}
+    visited=[]
+    async def unavailable(db,owner,item,client):visited.append(item['sku']);return None
+    monkeypatch.setattr(cleanup,'sold_observation',unavailable)
+    policy=cleanup.config(db)|{'scan_limit':2}
+    for _ in range(3):
+        result=await cleanup.clean_account(db,owner,'a',items,policy,Remote())
+        assert result['examined']==2 and result['deleted']==0
+    assert visited==['10','11','12','13','14','15']
