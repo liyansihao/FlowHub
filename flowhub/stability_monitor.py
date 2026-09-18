@@ -2,6 +2,7 @@
 import argparse
 import fcntl
 import json
+import os
 import time
 from pathlib import Path
 
@@ -35,6 +36,20 @@ def sample(data, output):
         try:
             report = audit(data)
             alerts = report['alerts']
+            cleanup_path=data/'collection-autoclean-status.json'
+            if cleanup_path.exists():
+                cleanup=json.loads(cleanup_path.read_text())
+                report['automatic_collection_cleanup']=cleanup
+                if cleanup.get('state') in ('error','needs_reconciliation','interrupted'):
+                    alerts.append({'level':'critical','code':'automatic_collection_cleanup_failed','state':cleanup['state']})
+                if cleanup.get('state')=='running' and cleanup.get('pid'):
+                    try:os.kill(cleanup['pid'],0)
+                    except ProcessLookupError:
+                        alerts.append({'level':'critical','code':'automatic_collection_cleanup_interrupted'})
+            cleanup_policy=data/'collection-autoclean.json'
+            if cleanup_policy.exists() and json.loads(cleanup_policy.read_text()).get('enabled') and not any(report.get('paused',{}).values()):
+                if not cleanup_path.exists() or (cleanup.get('state')!='running' and time.time()-cleanup.get('checked_at',0)>180 and cleanup.get('retry_at',0)<time.time()):
+                    alerts.append({'level':'critical','code':'automatic_collection_cleanup_heartbeat_missing'})
             if report.get('paused', {}).get('publication'):
                 alerts = [a for a in alerts if a['code'] != 'low_output_with_repair_backlog']
             else:

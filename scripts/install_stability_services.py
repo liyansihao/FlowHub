@@ -22,6 +22,8 @@ def main():
                                   'KeepAlive': True, 'ThrottleInterval': 30},
         'com.flowhub.stability-monitor': {'ProgramArguments': [str(python), '-m', 'flowhub.stability_monitor', '--data', str(data), '--output', str(logs)],
                                          'StartInterval': 300},
+        'com.flowhub.collection-autoclean': {'ProgramArguments': [str(python), '-m', 'flowhub.collection_autoclean', '--data', str(data)],
+                                           'StartInterval': 60},
     }
     for label, fields in jobs.items():
         job = {'Label': label, 'WorkingDirectory': str(root), 'EnvironmentVariables': environment,

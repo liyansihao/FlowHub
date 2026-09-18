@@ -136,7 +136,7 @@ async def retry_authorized(db, context, identifiers, authorization_id, client=No
             'complete':not remaining and int(header.get('used',-1))==0,'finished_at':time.time()}
 
 
-async def maintenance(db, context):
+async def maintenance(db, context, *, automatic=False):
     locks=[]
     control.schema(db)
     receipt_path = db.directory/'collection-reset-status.json'
@@ -153,10 +153,16 @@ async def maintenance(db, context):
         # A crashed maintenance run leaves pauses in place; never guess prior intent.
         if receipt_path.exists() and json.loads(receipt_path.read_text()).get('state') in ('draining','clearing'):
             raise RuntimeError('unfinished maintenance: inspect saved pauses before resume')
-        for module in control.MODULES:
-            control.set_paused(db,module,True)
-            with db.connect() as c:marks[module]=c.execute('SELECT updated FROM pipeline_module_control WHERE module=?',(module,)).fetchone()[0]
-        save()
+        with db.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            prior=dict(c.execute('SELECT module,paused FROM pipeline_module_control'))
+            if automatic and any(prior.values()):return {'state':'paused'}
+            receipt['prior_paused']=prior
+            for module in control.MODULES:
+                marks[module]=time.time()
+                c.execute('INSERT OR REPLACE INTO pipeline_module_control VALUES(?,?,?)',(module,1,marks[module]))
+            receipt['pause_marks']=marks;receipt['automatic']=automatic
+            save()
         deadline=time.monotonic()+300
         while True:
             with db.connect() as c:
