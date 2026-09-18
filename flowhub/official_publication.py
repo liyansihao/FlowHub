@@ -135,6 +135,14 @@ async def advance_if_selected(db, owner, sku, seller):
         # A source may have another seller row, but may not acquire another publication.
         if not record and c.execute("SELECT 1 FROM plugin_publications WHERE sku=?", (sku,)).fetchone():
             raise ValueError("source_already_claimed")
+    from .acquisition import enabled as acquisition_enabled
+    if not record and acquisition_enabled(db,sku):
+        from .dossier_gate import valid as dossier_gate_valid
+        with db.connect() as c:
+            certified=dossier_gate_valid(c,key)
+        if not certified:
+            return {'phase':'awaiting_dossier','needs_dossier':True,'verified':False,
+                    'reason':'publication_dossier_gate_required','missing_fields':[], 'backend':'official'}
     rules = json.loads(wf["rules"])
     if int(rules.get("stock", 99)) != 99 or rules.get("logistics") != "ChinaPost":
         raise ValueError("unsupported_production_route")

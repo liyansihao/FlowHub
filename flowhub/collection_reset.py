@@ -168,6 +168,10 @@ async def maintenance(db, context, *, automatic=False):
             with db.connect() as c:
                 leases=c.execute('SELECT count(*) FROM plugin_pipeline_leases WHERE expires>?',(time.time(),)).fetchone()[0]
                 jobs=c.execute('SELECT count(*) FROM jobs WHERE lease_until>?',(time.time(),)).fetchone()[0]
+                # New acquisition leases survive between legacy pipeline ticks.
+                if c.execute("SELECT 1 FROM sqlite_master WHERE name='acquisition_tasks'").fetchone():
+                    leases+=c.execute('SELECT count(*) FROM acquisition_tasks WHERE account=? AND lease_until>?',
+                                      (account(context),time.time())).fetchone()[0]
             commands=0
             cluster=db.directory/'cluster/cluster.sqlite3'
             if cluster.exists():

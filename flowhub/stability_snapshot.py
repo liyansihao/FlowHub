@@ -101,6 +101,14 @@ def audit(data):
                 waiting+=age>=1800
             out['repair_workflow']={'active_stages':[{'kind':k[0],'stage':k[1],'state':k[2],'count':v} for k,v in stages.items()],
                                     'no_progress_30m':waiting,'oldest_progress_age_s':round(oldest)}
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='acquisition_attempts'").fetchone():
+            operation_counts=collections.Counter();durations=collections.defaultdict(lambda:collections.Counter())
+            for operation,state,error,timing in db.execute('SELECT operation,state,error_class,timing FROM acquisition_attempts WHERE started>?',(now-3600,)):
+                operation_counts[(operation,state,error)]+=1
+                for name,value in json.loads(timing).items():
+                    if name.endswith('_ms') and isinstance(value,(int,float)):durations[operation][name]+=value
+            out['acquisition']={'attempts_1h':[{'operation':k[0],'state':k[1],'error_class':k[2],'count':v} for k,v in operation_counts.items()],
+                                'duration_totals_ms':dict(durations),'note':'Operation attempts are not listing completions.'}
         db.rollback()
     finally:
         db.close()

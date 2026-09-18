@@ -69,7 +69,9 @@ async def run_one(module,db,owner,sku,seller):
         stage=work['stage'];work.update(state='running',started_at=began)
         c.execute('INSERT OR REPLACE INTO repair_workflows VALUES(?,?,?,?,?)',(*key,json.dumps(work),began))
     try:
-        result=await asyncio.wait_for(module.run_stage(db,*key,stage=stage,purpose=lane,full_dossier=lane=='publication'),cfg[stage+'_timeout'])
+        operation=module.run_stage(db,*key,stage=stage,purpose=lane,full_dossier=lane=='publication')
+        from ..acquisition import enabled as acquisition_enabled
+        result=await operation if stage=='source' and acquisition_enabled(db,sku) else await asyncio.wait_for(operation,cfg[stage+'_timeout'])
     except asyncio.CancelledError:
         # A restart retains the current stage and all source write intents.
         raise
@@ -82,13 +84,15 @@ async def run_one(module,db,owner,sku,seller):
     work.update(last_elapsed_seconds=round(now-began,3),updated_at=now,missing_fields=result.get('missing_fields',[]),reason=result['reason'])
     if result['state'] in ('ready','progress'):
         work.update(state=result['state'],next_at=now,last_progress_at=now,dependency_attempts=0,failures=0,failure_class=None)
-        if result['state']=='progress':work['stage']=result['next_stage']
+        if result['state']=='progress':
+            work['stage']=result['next_stage']
+            work['next_at']=now+result.get('retry_after',0)
     else:
         category=result.get('failure_class') or 'missing_fields';work['failure_class']=category
-        dependency=category in ('network','remote_pending','capacity')
+        dependency=category in ('network','remote_pending','capacity','rate_deferred','operation_timeout','auth_expired')
         name='dependency_attempts' if dependency else 'failures';work[name]=work.get(name,0)+1
         manual=not dependency and (stage=='validate' or work[name]>=3 or category=='identity_mismatch')
-        delay=min(900,30*2**min(work[name]-1,5)) if dependency else 300
+        delay=result.get('retry_after') or (min(900,30*2**min(work[name]-1,5)) if dependency else 300)
         work.update(state='manual' if manual else 'waiting',next_at=now+delay)
         result.update(state='manual' if manual else 'waiting',retry_after=delay)
     with db.connect() as c:

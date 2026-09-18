@@ -71,6 +71,7 @@ class SourceCollector:
             )
 
     async def call(self, path, method="GET", query=None, body=None):
+        self.last_timing={}
         # Old unresolved drafts must not each pay a full timeout during an outage.
         # Writes keep their original one-shot journal semantics and never use this gate.
         scope=(self.c['owner'],hashlib.sha256(self.keys.get('erp_token','').encode()).hexdigest(),path)
@@ -78,10 +79,16 @@ class SourceCollector:
         if method=='GET' and time.monotonic()<until:
             raise SourceAcquisitionFailure('CONNECT_TIMEOUT_BACKOFF',{'operation':path,'retry_after_ms':60000})
         try:
-            result=await request(path, method, self.keys, query, body)
+            from .acquisition import enabled, enrolled
+            if enabled(self.db,self.sku) or enrolled(self.db,self.key):
+                from .source_gateway import request as gateway_request
+                result,self.last_timing=await gateway_request(self.keys,path,method,query,body,proxy=self.c["store"].get("config",{}).get("erp_proxy"))
+            else:
+                result=await request(path, method, self.keys, query, body)
             if method=='GET':self.read_failures.pop(scope,None)
             return result
         except Exception as error:
+            self.last_timing=getattr(error,'diagnostic',{}).get('timing',{})
             code=str(error).lower()
             network=isinstance(error,TimeoutError) or any(v in code for v in ('connect_timeout','etimedout','econnreset','enotfound','fetch failed'))
             if method=='GET' and network:
@@ -218,6 +225,12 @@ class SourceCollector:
         return data
 
     async def collect(self):
+        from .acquisition import enabled, enrolled, dispatch
+        if enabled(self.db,self.sku) or enrolled(self.db,self.key):
+            return await dispatch(self)
+        return await self.collect_legacy()
+
+    async def collect_legacy(self):
         # Claim once per source/account. A crashed collecting call is not repeated blindly.
         with self.db.connect() as db:
             inserted = (

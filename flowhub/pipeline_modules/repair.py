@@ -141,6 +141,8 @@ class PriceRepairModule:
         if can_value and not require_dossier:
             return {'state':'ready','reason':'valuation_inputs_ready','missing_fields':before}
         evidence={'at':time.time(),'before':before,'steps':[]};context={'store':{'id':route['store_id'],'config':json.loads(store['config']),'credentials':db.open(store['secret'])}}
+        from ..acquisition import enabled as acquisition_enabled
+        if acquisition_enabled(db,sku):context['acquisition_gateway']=True
         if stage in (None,'facts'):
             from .repair_facts import supplement
             p=await supplement(db,owner,sku,seller,p,review,context,evidence,require_dossier)
@@ -153,7 +155,13 @@ class PriceRepairModule:
         acquired=False
         if stage in (None,'source'):
             from .repair_source import supplement
-            p,acquired=await supplement(db,owner,sku,seller,p,review,context,evidence,require_dossier,official_pending)
+            from ..acquisition import AcquisitionPending
+            try:
+                p,acquired=await supplement(db,owner,sku,seller,p,review,context,evidence,require_dossier,official_pending)
+            except AcquisitionPending as error:
+                return {'state':'progress' if error.progress else 'waiting','reason':str(error),
+                        'next_stage':'source','retry_after':error.delay,'failure_class':error.category,
+                        'missing_fields':missing_fields(p)}
         if stage=='source':
             missing=missing_fields(p);evidence['after']=missing
             save_progress(db,owner,sku,seller,p,evidence)

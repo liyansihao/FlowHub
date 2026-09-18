@@ -52,9 +52,11 @@ def readback_delay(body, phase, verified=False, submission_priority=False):
     return delay
 
 
-async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None):
+async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None, repair_stage=None):
     from .pipeline_modules import repair_workflow
     staged_repairs=repair_workflow.enabled(db)
+    if repair_stage not in (None,'validate','acquire') or (repair_stage and repair_kind!='publication'):
+        raise ValueError('invalid_repair_stage')
     if repair_kind not in (None,'publication','valuation') or (repair_kind and lane!='seed_repair'):
         raise ValueError('invalid_repair_kind')
     if target is not None and (len(target)!=3 or not all(isinstance(v,str) and v for v in target)):
@@ -80,6 +82,8 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
         if repair_kind:
             if staged_repairs:lane_sql+=' AND '+('' if repair_kind=='publication' else 'NOT ')+repair_workflow.PUBLICATION_SQL
             else:lane_sql += " AND COALESCE(json_extract(q.body,'$.official_dossier_pending'),0)" + ('=1' if repair_kind=='publication' else '!=1')
+        if repair_stage:
+            lane_sql += " AND COALESCE(json_extract(q.body,'$.repair_workflow.stage'),'facts')"+ ('=' if repair_stage=='validate' else '!=')+"'validate'"
         now = time.time()
         r=c.execute("""SELECT q.* FROM plugin_pipeline q JOIN users u ON u.id=q.owner
             LEFT JOIN plugin_pipeline_leases l ON l.owner=q.owner AND l.sku=q.sku AND l.seller=q.seller
@@ -139,9 +143,12 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
                         else:
                             from .pipeline_modules.repair_queue import preserve_review
                             preserve_review(c,db,key,body)
+                    if state=='publishing' and (result.get('workflow') or {}).get('kind')=='publication':
+                        from .dossier_gate import record as record_gate
+                        body['dossier_gate_hash']=record_gate(c,key)
             elif result.get('workflow'):
                 if result['state']=='progress':
-                    repair_progress=True;delay=0
+                    repair_progress=True;delay=result.get('retry_after',0)
                 elif result['state']=='manual':
                     state='needs_review';body.update(reason='repair_input_required: '+result['reason'],repair_manual=True)
                 else:
@@ -172,6 +179,14 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
             body['evaluation_state']=report['state']
             if report['state']=='matched':
                 state='publishing'
+                from .acquisition import enabled as acquisition_enabled
+                if acquisition_enabled(db,key[1]):
+                    with db.connect() as c:
+                        exists=c.execute("SELECT 1 FROM sqlite_master WHERE name='plugin_publications'").fetchone()
+                        existing=exists and c.execute('SELECT 1 FROM plugin_publications WHERE owner=? AND sku=? AND seller=?',key).fetchone()
+                    if not existing:
+                        state='needs_fields'
+                        body.update(repair_full_dossier=True,official_dossier_pending=True,reason='publication_dossier_gate')
                 origin=(report.get('candidate') or {}).get('origin') or {}
                 if origin.get('weight_first_valuation'):
                     from .pipeline_modules.repair import missing_fields

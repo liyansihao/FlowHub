@@ -14,6 +14,8 @@ async def supplement(db,owner,sku,seller,p,review,context,evidence,require_dossi
     can_value=valuation_ready(p)
     acquired=False
     if ((not can_value or require_dossier) and any(k in missing_fields(p) for k in ('weight_g','dimensions_mm','attributes','title','image','url','fresh_dossier'))) or (official_pending and not p.get('ozon_dossier',{}).get('attributes')):
+        from ..acquisition import saved_candidate
+        existing=saved_candidate(db,SourceCollector(db,context|{'owner':owner,'candidate':{'source_key':sku}}).key)
         quote=sale_price(p)
         if quote is None:
             # A stored real reference price may seed acquisition metadata only.
@@ -24,8 +26,8 @@ async def supplement(db,owner,sku,seller,p,review,context,evidence,require_dossi
                 evidence['steps'].append({'source':'acquisition_reference_only',
                     'value':quote['value'],'currency':quote['currency'],
                     'observed_at':p.get('collected_at'),'usable_for_valuation':False})
-        draft_price=intent['value'] if intent else None
-        if draft_price is None and quote:
+        draft_price=existing.get('price') if existing is not None else intent['value'] if intent else None
+        if existing is None and draft_price is None and quote:
             if quote['currency']=='CNY':draft_price=quote['value']
             else:
                 try:
@@ -47,6 +49,9 @@ async def supplement(db,owner,sku,seller,p,review,context,evidence,require_dossi
             acquired=True
             evidence['steps'].append({'source':'maozi-erp-draft','draft_id':snapshot.get('draft_id'),'observed_at':snapshot['observed_at']})
         except Pending as error:
+            from ..acquisition import AcquisitionPending
+            if isinstance(error,AcquisitionPending):
+                raise
             evidence['steps'].append({'source':'maozi-draft','reason':str(error)})
         except Exception as error:
             evidence['steps'].append({'source':'maozi-draft','reason':str(error) if getattr(error,'diagnostic',None) is not None else type(error).__name__,'diagnostic':getattr(error,'diagnostic',{})})

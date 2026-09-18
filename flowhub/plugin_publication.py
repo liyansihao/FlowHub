@@ -139,7 +139,13 @@ async def _advance(db, owner, sku, seller):
                 review=latest
                 c.execute('UPDATE plugin_publications SET body=?,updated=? WHERE owner=? AND sku=? AND seller=?',
                           (json.dumps(record),time.time(),owner,sku,seller))
-        if not record:approved(review,rules,allow_unknown=allow_unknown)
+        if not record:
+            from .acquisition import enabled as acquisition_enabled
+            from .dossier_gate import valid as dossier_gate_valid
+            if acquisition_enabled(db,sku) and not dossier_gate_valid(c,(owner,sku,seller)):
+                return {'phase':'awaiting_dossier','needs_dossier':True,'verified':False,
+                        'reason':'publication_dossier_gate_required','missing_fields':[]}
+            approved(review,rules,allow_unknown=allow_unknown)
         target_id=record['store_id'] if record else route['store_id'] if route else wf['active_store']
         if not record and route and time.time()>=route['expires']:raise ValueError('hour_window_closed')
         store=c.execute('SELECT * FROM stores WHERE owner=? AND id=? AND verified=1',(owner,target_id)).fetchone()

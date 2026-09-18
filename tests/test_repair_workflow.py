@@ -126,3 +126,14 @@ async def test_completed_source_validation_is_not_starved_by_older_source_backlo
     monkeypatch.setattr(PriceRepairModule,'run',run)
     assert await pipeline.tick(db,lane='seed_repair',repair_kind='publication')
     assert seen==['3']
+
+
+@pytest.mark.asyncio
+async def test_validate_lane_cannot_claim_slow_acquisition(tmp_path,monkeypatch):
+    db,owner=configured(tmp_path);seen=[]
+    async def run(self,db,owner,sku,seller,**kwargs):
+        seen.append(sku);return {'state':'waiting','reason':'test','failure_class':'network'}
+    monkeypatch.setattr(PriceRepairModule,'run',run)
+    assert not await pipeline.tick(db,lane='seed_repair',repair_kind='publication',repair_stage='validate')
+    assert await pipeline.tick(db,lane='seed_repair',repair_kind='publication',repair_stage='acquire')
+    assert seen==['1']

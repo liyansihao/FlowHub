@@ -22,9 +22,11 @@ async def run(db, *, review_workers=2, submit_workers=2, reconcile_workers=2, se
     control.schema(db)
     from . import repair_workflow
     repair_policy=repair_workflow.config(db)
+    from ..acquisition import enabled as acquisition_enabled
+    operation_repairs=acquisition_enabled(db)
 
     async def lane(name, index=0):
-        module = 'seed' if name in ('seed_repair','repair_valuation','repair_publication') else 'review' if name in ('review','remote_review') else 'publication'
+        module = 'seed' if name in ('seed_repair','repair_valuation','repair_publication','repair_validation') else 'review' if name in ('review','remote_review') else 'publication'
         while True:
             if name=='remote_review':
                 from ..cluster_compute import extra_review_workers
@@ -40,7 +42,11 @@ async def run(db, *, review_workers=2, submit_workers=2, reconcile_workers=2, se
                     await asyncio.sleep(5)
                     continue
             try:
-                if name in ('repair_valuation','repair_publication'):
+                if name=='repair_validation':
+                    worked=await tick(db,lane='seed_repair',repair_kind='publication',repair_stage='validate')
+                elif name=='repair_publication' and operation_repairs:
+                    worked=await tick(db,lane='seed_repair',repair_kind='publication',repair_stage='acquire')
+                elif name in ('repair_valuation','repair_publication'):
                     worked=await tick(db,lane='seed_repair',repair_kind=name.removeprefix('repair_'))
                 elif name=='seed_repair' and seed_workers==2:
                     from .repair_queue import tick_repair
@@ -73,6 +79,7 @@ async def run(db, *, review_workers=2, submit_workers=2, reconcile_workers=2, se
             await asyncio.sleep(15)
 
     repairs=[('repair_valuation',repair_policy['valuation_workers']),('repair_publication',repair_policy['publication_workers'])] if repair_policy['enabled'] else [('seed_repair',seed_workers)]
+    if operation_repairs and repair_policy['enabled']:repairs.append(('repair_validation',1))
     tasks = [asyncio.create_task(lane(name,index)) for name, count in
              repairs+[('review', review_workers), ('submit', submit_workers), ('reconcile', reconcile_workers), ('reconcile_history',1)] for index in range(count)]
     tasks.extend(asyncio.create_task(lane('remote_review',index)) for index in range(2))
@@ -96,6 +103,10 @@ async def run(db, *, review_workers=2, submit_workers=2, reconcile_workers=2, se
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        from ..acquisition import close_runners
+        await close_runners()
         await close_workers()
         from .request_bridge import close_requests
         await close_requests()
+        from ..source_gateway import close as close_acquisition
+        await close_acquisition()
