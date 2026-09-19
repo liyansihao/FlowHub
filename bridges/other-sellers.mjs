@@ -3,6 +3,7 @@ import {chromium} from 'playwright';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {sourceNetworkArgs} from './source-network.mjs';
+import {settleSourcePage} from './source-page.mjs';
 const [sku,outDir,maxRoundsArg='8']=process.argv.slice(2);
 if(!/^\d+$/.test(sku||''))throw Error('numeric SKU required');
 const maxRounds=Math.min(40,Math.max(1,Number(maxRoundsArg)||8));
@@ -15,7 +16,8 @@ process.once('SIGINT',()=>{void c.close().catch(()=>{});});
 let step='navigation',p;
 try{
  p=await c.newPage();
- const response=await p.goto(`https://www.ozon.ru/product/${sku}/`,{waitUntil:'domcontentloaded',timeout:45000});
+ let response=await p.goto(`https://www.ozon.ru/product/${sku}/`,{waitUntil:'domcontentloaded',timeout:45000});
+ step='access_challenge';response=await settleSourcePage(p,response);
  if(response?.status()===403||/captcha|antibot|access denied/i.test(await p.title())){step='access_challenge';throw Error('browser_access_challenge');}
  step='product_main';
  await p.locator('[data-widget="webProductMainWidget"]').waitFor({state:'attached',timeout:20000});
