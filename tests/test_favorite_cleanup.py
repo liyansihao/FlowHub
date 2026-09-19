@@ -210,3 +210,55 @@ async def test_pause_after_ack_preserves_receipt_without_replaying_write(tmp_pat
     await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
     assert api.writes==1
     with db.connect() as c:assert c.execute('SELECT state FROM favorite_cleanup_receipts').fetchone()[0]=='deleted'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('cancel',[False,True])
+async def test_slow_archive_keeps_loop_responsive_and_drains_before_cancel(tmp_path,monkeypatch,cancel):
+    import asyncio
+    import threading
+    db,owner,item=setup(tmp_path);api=Fake(db=db)
+    entered=threading.Event();release=threading.Event();finished=threading.Event()
+    original=cleanup.archive
+    def slow(*args):
+        entered.set()
+        assert release.wait(5), 'event loop did not advance during archive'
+        try:return original(*args)
+        finally:finished.set()
+    monkeypatch.setattr(cleanup,'archive',slow)
+    task=asyncio.create_task(cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api))
+    try:
+        assert await asyncio.to_thread(entered.wait,3)
+        assert not finished.is_set() and api.writes==0
+        if cancel:
+            task.cancel()
+            await asyncio.sleep(.02)
+            assert not task.done(), 'cancellation released work before archive drained'
+        release.set()
+        if cancel:
+            with pytest.raises(asyncio.CancelledError):await task
+            assert finished.is_set() and api.writes==0
+            with db.connect() as c:
+                r=c.execute('SELECT * FROM favorite_cleanup_receipts').fetchone()
+                assert r['state']=='intent'
+                assert Path(db.open(r['body'])['archive_path']).exists()
+            await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
+            assert api.writes==0
+        else:
+            result=await task
+            assert result['deleted']==1 and api.writes==1
+    finally:
+        release.set()
+        if not task.done():await task
+
+
+def test_evidence_product_index_preserves_all_archive_evidence(tmp_path):
+    db,owner,item=setup(tmp_path)
+    with db.connect() as c:
+        c.executemany('INSERT INTO sourcing_evidence VALUES(?,?,?,?,?)',
+            [(owner,str(i),str(123 if i%10==0 else 999),'{}',i) for i in range(100)])
+        expected=[dict(r) for r in c.execute('SELECT * FROM sourcing_evidence WHERE owner=? AND sku=? ORDER BY hash',(owner,'123'))]
+        plan=' '.join(str(tuple(r)) for r in c.execute('EXPLAIN QUERY PLAN SELECT * FROM sourcing_evidence WHERE owner=? AND sku=? ORDER BY hash',(owner,'123')))
+        assert 'sourcing_evidence_product' in plan and 'sku=?' in plan
+        backup=cleanup.archive(db,c,item,{'id':7},{})
+    assert backup['evidence']==expected

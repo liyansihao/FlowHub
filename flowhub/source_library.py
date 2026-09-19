@@ -149,6 +149,7 @@ class SourceLibrary:
             CREATE TABLE IF NOT EXISTS sourcing_evidence(
               owner TEXT NOT NULL,hash TEXT NOT NULL,sku TEXT NOT NULL,body TEXT NOT NULL,at REAL NOT NULL,
               PRIMARY KEY(owner,hash));
+            CREATE INDEX IF NOT EXISTS sourcing_evidence_product ON sourcing_evidence(owner,sku,hash);
             CREATE TABLE IF NOT EXISTS sourcing_seeds(
               owner TEXT NOT NULL,shop TEXT NOT NULL,offer TEXT NOT NULL,sku TEXT NOT NULL,
               body TEXT NOT NULL,archived INTEGER,sales REAL,checked REAL,

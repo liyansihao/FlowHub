@@ -52,7 +52,7 @@ class CleanupPaused(Exception):
 async def listing(client,should_stop=lambda:False):
     found=[];header=None;total=None
     for page in range(1,101):
-        if should_stop():raise CleanupPaused()
+        if await database_work(should_stop):raise CleanupPaused()
         response=await client.call('/api.product.favorite/lists',params={'page':page,'page_size':100})
         if not isinstance(response,dict) or response.get('total') is None:raise ValueError('favorite total required')
         if header is None:header=response;total=int(response['total'])
@@ -112,7 +112,7 @@ def archive(db,c,item,favorite,online):
     backup={'version':1,'at':time.time(),'owner':key[0],'sku':key[1],'seller':key[2],
             'favorite':favorite,'online':online,'product':dict(product),'root_seeds':roots,'seed_records':seeds,
             'publication':json.loads(publication['body']),'pipeline':dict(q),
-            'evidence':[dict(r) for r in c.execute('SELECT * FROM sourcing_evidence WHERE owner=? AND sku=?',key[:2])],
+            'evidence':[dict(r) for r in c.execute('SELECT * FROM sourcing_evidence WHERE owner=? AND sku=? ORDER BY hash',key[:2])],
             'scope':'ERP favorite only; local source graph and online listing retained'}
     directory=Path(db.directory)/'favorite-lineage-archive';directory.mkdir(mode=0o700,exist_ok=True)
     encoded=json.dumps(backup,ensure_ascii=False,sort_keys=True).encode();digest=hashlib.sha256(encoded).hexdigest()
@@ -125,6 +125,28 @@ def archive(db,c,item,favorite,online):
         finally:os.close(fd)
     if hashlib.sha256(path.read_bytes()).hexdigest()!=digest:raise ValueError('archive verification failed')
     return backup|{'archive_path':str(path),'archive_sha256':digest}
+
+
+def receipt(db,account,favorite):
+    with db.connect() as c:
+        return c.execute('SELECT * FROM favorite_cleanup_receipts WHERE account=? AND favorite_id=?',
+                         (account,favorite)).fetchone()
+
+
+def prepare_archive(db,owner,account,item,favorite,online):
+    # The durable archive and intent are one drained unit. Cancellation must not
+    # release the account lock or reach the remote write while this is running.
+    with db.connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        if control.paused(db,'seed') or not config(db)['enabled']:return 'paused',None
+        if not c.execute('SELECT 1 FROM pipeline_campaigns p JOIN users u ON p.owner=u.id WHERE p.owner=? AND p.enabled=1 AND u.active=1',(owner,)).fetchone():return 'disabled',None
+        fid=str(favorite['id'])
+        if c.execute('SELECT 1 FROM favorite_cleanup_receipts WHERE account=? AND favorite_id=?',(account,fid)).fetchone():return 'exists',None
+        backup=archive(db,c,item,favorite,online)
+        if backup is None:return 'skipped',None
+        inserted=c.execute('INSERT OR IGNORE INTO favorite_cleanup_receipts VALUES(?,?,?,?,?,?,?)',
+            (account,fid,owner,item['sku'],'intent',db.seal(backup),time.time())).rowcount
+        return ('intent',backup) if inserted else ('exists',None)
 
 
 async def clean_account(db,owner,account,items,settings,client=None):
@@ -140,20 +162,19 @@ async def clean_account(db,owner,account,items,settings,client=None):
     for r in prior:
         if r['state']!='deleted' and r['favorite_id'] not in present:
             body=db.open(r['body']);body['absence_verified_at']=time.time()
-            update_receipt(db,account,r['favorite_id'],'deleted',body)
+            await database_work(update_receipt,db,account,r['favorite_id'],'deleted',body)
     used=int(header.get('used',header['total']));limit=int(header.get('limit') or 0)
     result={'used_before':used,'limit':limit,'deleted':0,'skipped':0}
     if not settings.get('clear_completed') and (limit<=0 or used<limit*settings['threshold_ratio']):return result|{'state':'below_threshold'}
     count=min(settings['batch_size'],len(items) if settings.get('clear_completed') else max(0,used-int(limit*settings['target_ratio'])))
     touched=[]
     for item in items:
-        if stopped():return result|{'state':'paused'}
+        if await database_work(stopped):return result|{'state':'paused'}
         if len(touched)>=count:break
         sku=item['sku'];matches=[r for r in remote if str(r.get('sku'))==sku]
         if len(matches)!=1 or str(matches[0].get('is_imported'))!='1':continue
         favorite=matches[0];fid=str(favorite['id'])
-        with db.connect() as c:
-            if c.execute('SELECT 1 FROM favorite_cleanup_receipts WHERE account=? AND favorite_id=?',(account,fid)).fetchone():continue
+        if await database_work(receipt,db,account,fid):continue
         shop=item['context']['store']['config']['shop_id'];offer=item['offer_id']
         try:
             data=await client.call('/api.product.online/lists',params={'page':1,'page_size':100,'shop_id':shop,'offer_id':offer})
@@ -162,56 +183,53 @@ async def clean_account(db,owner,account,items,settings,client=None):
         exact=[r for r in rows(data) if str(r.get('shop_id'))==str(shop) and str(r.get('offer_id'))==str(offer)]
         if len(exact)!=1 or exact[0].get('online_status')!='selling' or float(exact[0].get('stock') or 0)<=0:
             result['skipped']+=1;continue
-        with db.connect() as c:
-            c.execute('BEGIN IMMEDIATE')
-            if control.paused(db,'seed') or not config(db)['enabled']:return result|{'state':'paused'}
-            if not c.execute('SELECT 1 FROM pipeline_campaigns p JOIN users u ON p.owner=u.id WHERE p.owner=? AND p.enabled=1 AND u.active=1',(owner,)).fetchone():return result|{'state':'disabled'}
-            backup=archive(db,c,item,favorite,exact[0])
-            if backup is None:result['skipped']+=1;continue
-            inserted=c.execute('INSERT OR IGNORE INTO favorite_cleanup_receipts VALUES(?,?,?,?,?,?,?)',
-                (account,fid,owner,sku,'intent',db.seal(backup),time.time())).rowcount
-            if not inserted:continue
+        state,backup=await database_work(prepare_archive,db,owner,account,item,favorite,exact[0])
+        if state in ('paused','disabled'):return result|{'state':state}
+        if state=='skipped':result['skipped']+=1
+        if state!='intent':continue
         touched.append(fid)
         try:
             backup['response']=await client.call('/api.product.favorite/toggle',method='POST',body={'status':False,'productInfo':favorite|{
                 'sku':sku,'coverImage':favorite.get('cover_image',''),'price_info':{'sell_price':favorite.get('sell_price'),'currency':'CNY'}}})
-            update_receipt(db,account,fid,'acknowledged',backup)
+            await database_work(update_receipt,db,account,fid,'acknowledged',backup)
         except Exception as e:
-            backup['error_type']=type(e).__name__;update_receipt(db,account,fid,'unconfirmed',backup);break
+            backup['error_type']=type(e).__name__;await database_work(update_receipt,db,account,fid,'unconfirmed',backup);break
     if touched:
         try:after,remote=await listing(client,stopped)
         except CleanupPaused:return result|{'state':'paused'}
         remaining={str(r['id']) for r in remote}
         for fid in touched:
             if fid in remaining:continue
-            with db.connect() as c:r=c.execute('SELECT body FROM favorite_cleanup_receipts WHERE account=? AND favorite_id=?',(account,fid)).fetchone()
+            r=await database_work(receipt,db,account,fid)
             backup=db.open(r['body']);backup['absence_verified_at']=time.time()
-            update_receipt(db,account,fid,'deleted',backup);result['deleted']+=1
+            await database_work(update_receipt,db,account,fid,'deleted',backup);result['deleted']+=1
         result['used_after']=after.get('used',after['total'])
     return result|{'state':'cleaned' if result['deleted'] else 'no_safe_candidates'}
 
 
 async def tick(db):
     settings=config(db)
-    if not settings['enabled'] or control.paused(db,'seed'):return []
-    schema(db)
+    if not settings['enabled'] or await database_work(control.paused,db,'seed'):return []
+    await database_work(schema,db)
     with (Path(db.directory)/'favorite-cleanup.lock').open('a') as lock:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:return []
-        with db.connect() as c:owners=[r[0] for r in c.execute('SELECT p.owner FROM pipeline_campaigns p JOIN users u ON p.owner=u.id WHERE p.enabled=1 AND u.active=1')]
+        def active_owners():
+            with db.connect() as c:return [r[0] for r in c.execute('SELECT p.owner FROM pipeline_campaigns p JOIN users u ON p.owner=u.id WHERE p.enabled=1 AND u.active=1')]
+        owners=await database_work(active_owners)
         results=[]
         for owner in owners:
             for account,items in (await database_work(candidates,db,owner,settings)).items():
-                if control.paused(db,'seed') or not config(db)['enabled']:return results
+                if await database_work(control.paused,db,'seed') or not config(db)['enabled']:return results
                 started=time.time()
                 try:result=await clean_account(db,owner,account,items,settings)
                 except Exception as e:result={'state':'error','error_type':type(e).__name__,'reason':str(e)[:160] if isinstance(e,ValueError) else type(e).__name__}
-                control.record(db,'seed',owner,'',started,'favorite_cleanup',result);results.append(result)
+                await database_work(control.record,db,'seed',owner,'',started,'favorite_cleanup',result);results.append(result)
         return results
 
 
 async def run(db):
     while True:
         try:await tick(db)
-        except Exception as e:control.record(db,'seed','','',time.time(),'favorite_cleanup_error',{'error_type':type(e).__name__,'reason':str(e)[:160] if isinstance(e,ValueError) else type(e).__name__})
+        except Exception as e:await database_work(control.record,db,'seed','','',time.time(),'favorite_cleanup_error',{'error_type':type(e).__name__,'reason':str(e)[:160] if isinstance(e,ValueError) else type(e).__name__})
         await asyncio.sleep(config(db)['interval_seconds'])
