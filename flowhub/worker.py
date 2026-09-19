@@ -545,6 +545,9 @@ class Worker:
         tasks = [asyncio.create_task(heartbeat()), asyncio.create_task(refill()),
                  asyncio.create_task(collect_sources()), asyncio.create_task(plugin_publications()),
                  asyncio.create_task(remote_review_sync())]
+        if (self.db.directory/'observe-loop-stalls').exists():
+            from .loop_health import monitor
+            tasks.append(asyncio.create_task(monitor(self.db.directory)))
         try:
             while True:
                 for task in tasks:
