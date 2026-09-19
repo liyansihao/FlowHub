@@ -187,12 +187,15 @@ async def prepare_listing(db,key,body):
  if result.get('rejected') or result.get('manual_review'):raise ValueError('上架数据检查未通过：'+str(result.get('reason') or '物流或类目不可用'))
  new={'sku':key[1],'seller':key[2],'state':'matched','candidate':env,'result':result,'started_at':time.time(),'finished_at':time.time(),'identity_review':r['identity_review'],'publication_blockers':env['origin']['publication_blockers'],'price_basis':env['origin']['price_evidence'],'website_listing_authorization':{'id':body['id'],'actor':body['actor'],'at':body['requested_at'],'price_policy':'available_asking_price','same_product_only':True}}
  expiry=time.time()+86400
- with db.connect() as c:
-  c.execute('UPDATE plugin_reviews SET state=?,body=?,updated=? WHERE owner=? AND sku=? AND seller=?',('matched',json.dumps(new),time.time(),*key))
-  c.execute('UPDATE plugin_routes SET expires=?,run_id=? WHERE owner=? AND sku=? AND seller=?',(expiry,body['id'],*key))
-  c.execute('INSERT OR REPLACE INTO plugin_publication_permissions VALUES(?,?,?,?,?)',(*key,expiry,'用户要求网站同款上架'))
-  q=json.loads(c.execute('SELECT body FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?',key).fetchone()[0]);q.update(listing_control_id=body['id'],same_product_only=True);q.pop('repair_retry',None);q.pop('error',None);q.pop('reason',None)
-  c.execute("UPDATE plugin_pipeline SET state='publishing',body=?,due=0,attempts=0 WHERE owner=? AND sku=? AND seller=?",(json.dumps(q),*key))
+ def persist_ready():
+  with db.connect() as c:
+   c.execute('UPDATE plugin_reviews SET state=?,body=?,updated=? WHERE owner=? AND sku=? AND seller=?',('matched',json.dumps(new),time.time(),*key))
+   c.execute('UPDATE plugin_routes SET expires=?,run_id=? WHERE owner=? AND sku=? AND seller=?',(expiry,body['id'],*key))
+   c.execute('INSERT OR REPLACE INTO plugin_publication_permissions VALUES(?,?,?,?,?)',(*key,expiry,'用户要求网站同款上架'))
+   q=json.loads(c.execute('SELECT body FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?',key).fetchone()[0]);q.update(listing_control_id=body['id'],same_product_only=True);q.pop('repair_retry',None);q.pop('error',None);q.pop('reason',None)
+   c.execute("UPDATE plugin_pipeline SET state='publishing',body=?,due=0,attempts=0 WHERE owner=? AND sku=? AND seller=?",(json.dumps(q),*key))
+ from .pipeline_modules.database_work import run as database_work
+ await database_work(persist_ready)
  return 'waiting',body|{'phase':'publication_pipeline'}
 
 
