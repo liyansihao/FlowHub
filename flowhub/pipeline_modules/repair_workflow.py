@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import time
+from .database_work import run as database_work
 
 PUBLICATION_SQL="(COALESCE(json_extract(q.body,'$.official_dossier_pending'),0)=1 OR COALESCE(json_extract(q.body,'$.repair_full_dossier'),0)=1 OR COALESCE(json_array_length(json_extract(q.body,'$.pending_publication_fields')),0)>0 OR COALESCE(json_extract(q.body,'$.phase'),'')='awaiting_dossier')"
 
@@ -46,28 +47,33 @@ def fingerprint(queue,store):
 
 async def run_one(module,db,owner,sku,seller):
     key=(owner,sku,seller);cfg=config(db);began=time.time()
-    with db.connect() as c:
-        c.execute('BEGIN IMMEDIATE');schema(c)
-        row=c.execute('SELECT body FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?',key).fetchone()
-        route=c.execute('SELECT store_id FROM plugin_routes WHERE owner=? AND sku=? AND seller=?',key).fetchone()
-        if not row or not route:return {'state':'waiting','reason':'repair_binding_missing','failure_class':'identity_mismatch'}
-        queue=json.loads(row[0]);identity=fingerprint(queue,route[0]);lane=kind(queue)
-        lease=c.execute('SELECT token FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=?',key).fetchone()
-        if not lease:raise BlockingIOError('repair requires original SKU lease')
-        token=lease[0]
-        old=c.execute('SELECT body FROM repair_workflows WHERE owner=? AND sku=? AND seller=?',key).fetchone()
-        work=json.loads(old[0]) if old else {}
-        if work.get('identity')!=identity:
-            if work:c.execute('INSERT INTO repair_workflow_events VALUES(NULL,?,?,?,?,?)',(*key,began,json.dumps({'event':'superseded','previous':work})))
-            work={'identity':identity,'kind':lane,'stage':'facts','created_at':began,'last_progress_at':began,'attempts':{}}
-        if work.get('next_at',0)>began:
-            return {'state':'waiting','reason':work.get('reason','stage_backoff'),'retry_after':work['next_at']-began,
-                    'workflow':work,'failure_class':work.get('failure_class','remote_pending')}
-        if work.get('state')=='ready':
-            return {'state':'ready','reason':'complete_dossier' if lane=='publication' else 'valuation_inputs_ready','workflow':work}
-        if work.get('state')=='manual':return {'state':'manual','reason':work['reason'],'workflow':work,'missing_fields':work.get('missing_fields',[])}
-        stage=work['stage'];work.update(state='running',started_at=began)
-        c.execute('INSERT OR REPLACE INTO repair_workflows VALUES(?,?,?,?,?)',(*key,json.dumps(work),began))
+    def prepare_work():
+        with db.connect() as c:
+            c.execute('BEGIN IMMEDIATE');schema(c)
+            row=c.execute('SELECT body FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?',key).fetchone()
+            route=c.execute('SELECT store_id FROM plugin_routes WHERE owner=? AND sku=? AND seller=?',key).fetchone()
+            if not row or not route:return {'state':'waiting','reason':'repair_binding_missing','failure_class':'identity_mismatch'}
+            queue=json.loads(row[0]);identity=fingerprint(queue,route[0]);lane=kind(queue)
+            lease=c.execute('SELECT token FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=?',key).fetchone()
+            if not lease:raise BlockingIOError('repair requires original SKU lease')
+            token=lease[0]
+            old=c.execute('SELECT body FROM repair_workflows WHERE owner=? AND sku=? AND seller=?',key).fetchone()
+            work=json.loads(old[0]) if old else {}
+            if work.get('identity')!=identity:
+                if work:c.execute('INSERT INTO repair_workflow_events VALUES(NULL,?,?,?,?,?)',(*key,began,json.dumps({'event':'superseded','previous':work})))
+                work={'identity':identity,'kind':lane,'stage':'facts','created_at':began,'last_progress_at':began,'attempts':{}}
+            if work.get('next_at',0)>began:
+                return {'state':'waiting','reason':work.get('reason','stage_backoff'),'retry_after':work['next_at']-began,
+                        'workflow':work,'failure_class':work.get('failure_class','remote_pending')}
+            if work.get('state')=='ready':
+                return {'state':'ready','reason':'complete_dossier' if lane=='publication' else 'valuation_inputs_ready','workflow':work}
+            if work.get('state')=='manual':return {'state':'manual','reason':work['reason'],'workflow':work,'missing_fields':work.get('missing_fields',[])}
+            stage=work['stage'];work.update(state='running',started_at=began)
+            c.execute('INSERT OR REPLACE INTO repair_workflows VALUES(?,?,?,?,?)',(*key,json.dumps(work),began))
+        return work,stage,lane,token,identity
+    prepared=await database_work(prepare_work)
+    if isinstance(prepared,dict):return prepared
+    work,stage,lane,token,identity=prepared
     try:
         operation=module.run_stage(db,*key,stage=stage,purpose=lane,full_dossier=lane=='publication')
         from ..acquisition import enabled as acquisition_enabled
@@ -95,13 +101,15 @@ async def run_one(module,db,owner,sku,seller):
         delay=result.get('retry_after') or (min(900,30*2**min(work[name]-1,5)) if dependency else 300)
         work.update(state='manual' if manual else 'waiting',next_at=now+delay)
         result.update(state='manual' if manual else 'waiting',retry_after=delay)
-    with db.connect() as c:
-        c.execute('BEGIN IMMEDIATE')
-        current=c.execute('SELECT token FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=?',key).fetchone()
-        q=c.execute('SELECT body FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?',key).fetchone()
-        r=c.execute('SELECT store_id FROM plugin_routes WHERE owner=? AND sku=? AND seller=?',key).fetchone()
-        if not current or current[0]!=token or not q or not r or fingerprint(json.loads(q[0]),r[0])!=identity:
-            raise BlockingIOError('repair ownership changed; checkpoint not advanced')
-        c.execute('UPDATE repair_workflows SET body=?,updated=? WHERE owner=? AND sku=? AND seller=?',(json.dumps(work),now,*key))
-        c.execute('INSERT INTO repair_workflow_events VALUES(NULL,?,?,?,?,?)',(*key,now,json.dumps({'stage':stage,'elapsed_seconds':work['last_elapsed_seconds'],'state':work['state'],'reason':result['reason'],'missing_fields':work['missing_fields']})))
+    def checkpoint():
+        with db.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            current=c.execute('SELECT token FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=?',key).fetchone()
+            q=c.execute('SELECT body FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?',key).fetchone()
+            r=c.execute('SELECT store_id FROM plugin_routes WHERE owner=? AND sku=? AND seller=?',key).fetchone()
+            if not current or current[0]!=token or not q or not r or fingerprint(json.loads(q[0]),r[0])!=identity:
+                raise BlockingIOError('repair ownership changed; checkpoint not advanced')
+            c.execute('UPDATE repair_workflows SET body=?,updated=? WHERE owner=? AND sku=? AND seller=?',(json.dumps(work),now,*key))
+            c.execute('INSERT INTO repair_workflow_events VALUES(NULL,?,?,?,?,?)',(*key,now,json.dumps({'stage':stage,'elapsed_seconds':work['last_elapsed_seconds'],'state':work['state'],'reason':result['reason'],'missing_fields':work['missing_fields']})))
+    await database_work(checkpoint)
     return result|{'workflow':work}

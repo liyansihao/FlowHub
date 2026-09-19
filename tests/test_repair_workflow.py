@@ -137,3 +137,20 @@ async def test_validate_lane_cannot_claim_slow_acquisition(tmp_path,monkeypatch)
     assert not await pipeline.tick(db,lane='seed_repair',repair_kind='publication',repair_stage='validate')
     assert await pipeline.tick(db,lane='seed_repair',repair_kind='publication',repair_stage='acquire')
     assert seen==['1']
+
+
+@pytest.mark.asyncio
+async def test_repair_journal_writer_wait_keeps_main_loop_responsive(tmp_path,monkeypatch):
+    import sqlite3,threading
+    from flowhub.pipeline_modules.repair_workflow import run_one
+    db,owner=configured(tmp_path)
+    with db.connect() as c:c.execute('INSERT INTO plugin_pipeline_leases VALUES(?,?,?,?,?)',(owner,'1','2','lease',time.time()+60))
+    async def stage(self,*args,**kwargs):return {'state':'ready','reason':'complete_dossier'}
+    monkeypatch.setattr(PriceRepairModule,'run_stage',stage)
+    blocker=sqlite3.connect(db.path,check_same_thread=False);blocker.execute('BEGIN IMMEDIATE')
+    timer=threading.Timer(.4,blocker.commit);timer.start()
+    try:
+        began=time.monotonic();task=asyncio.create_task(run_one(PriceRepairModule(),db,owner,'1','2'))
+        await asyncio.sleep(.02);assert time.monotonic()-began<.2
+        assert (await task)['state']=='ready'
+    finally:timer.join();blocker.close()
