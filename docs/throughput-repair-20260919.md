@@ -27,3 +27,12 @@ records / 199,587,211 JSON bytes in 2.883 seconds, plus backlog evaluation in
 other-seller discovery preparation, selection, and event recording off-loop.
 Keep existing per-source file locks held until cancellation-drained work finishes;
 leave all source selection rules and publication authorization unchanged.
+
+A stack-only loop observer located remaining >5 second stalls in compareBot
+review reservation and result persistence, listing-control queue claim, source
+claim, favorite cleanup candidate/receipt reads, and publication record saves.
+Move these exact synchronous units off-loop without changing their decisions.
+Cancellation drains claims and releases only the matching lease. Project only
+required publication identity/product fields for source enrollment and finish
+its read cursor before seed inserts, avoiding read-to-write cursor contention
+and loading large historical request logs into the enrollment pass.

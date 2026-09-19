@@ -9,6 +9,7 @@ import httpx
 from pathlib import Path
 from ..maozi import MaoziPublisher
 from . import control
+from .database_work import run as database_work
 
 DEFAULTS={'enabled':False,'threshold_ratio':0.95,'target_ratio':2/3,'batch_size':1000,'interval_seconds':60,'minimum_age_seconds':3600}
 
@@ -132,7 +133,9 @@ async def clean_account(db,owner,account,items,settings,client=None):
     try:header,remote=await listing(client,stopped)
     except CleanupPaused:return {'state':'paused','deleted':0,'skipped':0}
     present={str(r['id']):r for r in remote}
-    with db.connect() as c:prior=c.execute('SELECT * FROM favorite_cleanup_receipts WHERE account=?',(account,)).fetchall()
+    def previous_receipts():
+        with db.connect() as c:return c.execute('SELECT * FROM favorite_cleanup_receipts WHERE account=?',(account,)).fetchall()
+    prior=await database_work(previous_receipts)
     # A timeout is reconciled by absence; a still-present favorite is never blindly deleted again.
     for r in prior:
         if r['state']!='deleted' and r['favorite_id'] not in present:
@@ -198,7 +201,7 @@ async def tick(db):
         with db.connect() as c:owners=[r[0] for r in c.execute('SELECT p.owner FROM pipeline_campaigns p JOIN users u ON p.owner=u.id WHERE p.enabled=1 AND u.active=1')]
         results=[]
         for owner in owners:
-            for account,items in candidates(db,owner,settings).items():
+            for account,items in (await database_work(candidates,db,owner,settings)).items():
                 if control.paused(db,'seed') or not config(db)['enabled']:return results
                 started=time.time()
                 try:result=await clean_account(db,owner,account,items,settings)

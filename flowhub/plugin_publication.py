@@ -205,7 +205,7 @@ async def _advance(db, owner, sku, seller, *, native_follow=False):
             else:
                 q=await MaoziPublisher({'store':{'config':config,'credentials':keys}}).erp('POST','/api.shop/sync_single_product_limit',body={'id':int(plan.shop_id)})
             if record is not None:
-                record['quota']={'at':time.time(),'data':q};save()
+                record['quota']={'at':time.time(),'data':q};await database_work(save)
             from .pipeline_modules.store_capacity import observe
             observe(db,owner,target_id,q)
             require_quota(q)
@@ -241,9 +241,9 @@ async def _advance(db, owner, sku, seller, *, native_follow=False):
             if not ownership.acquire(plan.shop_id,offer,sku):raise ValueError('source_claim_conflict')
             record={'owner':owner,'sku':sku,'seller':seller,'store_id':store['id'],'store_name':store['name'],'review':review,'snapshot':snapshot,'plan':plan.to_dict(),'offer_id':offer,'started_at':time.time(),'events':[],'allow_unknown_shipping_follow':allow_unknown,'pricing_intent':approved_price_intent(review),'permission_reason':permission['reason'] if allow_unknown else None}
             if native_follow:record['backend']='maozi_follow'
-            save()
+            await database_work(save)
             if route:
-                record.update(authorized_store_id=target_id,write_deadline=route['expires'],run_id=route['run_id']);save()
+                record.update(authorized_store_id=target_id,write_deadline=route['expires'],run_id=route['run_id']);await database_work(save)
         plan=ZeroStockListingPlan(**record['plan']);offer=record['offer_id']
         async def stock_guard(plan,product):
             blocks,offers=await exclusions()
@@ -293,7 +293,7 @@ async def _advance(db, owner, sku, seller, *, native_follow=False):
             cause=error.__cause__ or error
             record['phase']=journal.read(offer)['phase']
             record.setdefault('api_timings',[]).append({'at':time.time(),'calls':transport.timings[:]})
-            record['events'].append({'at':time.time(),'from':before,'error':type(error).__name__,'reason':str(cause)[:250]});save()
+            record['events'].append({'at':time.time(),'from':before,'error':type(error).__name__,'reason':str(cause)[:250]});await database_work(save)
             raise
         # Official Maozi UI uses repair_images({ids:[ERP record id]}).
         # Persist intent before dispatch; an unknown outcome is never replayed.
@@ -314,7 +314,7 @@ async def _advance(db, owner, sku, seller, *, native_follow=False):
                         journal.move(offer,'manual_review','manual_review',image_repair_acknowledged_at=time.time())
                     except Exception as error:
                         journal.move(offer,'manual_review','manual_review',image_repair_error=type(error).__name__)
-                    record['phase']='manual_review';save()
+                    record['phase']='manual_review';await database_work(save)
                     return {'sku':sku,'offer_id':offer,'phase':'manual_review','verified':False,'retryable_readback':True,'reason':'image_repair_waiting_for_platform'}
         from .pipeline_modules.platform_recovery import recover_platform_warning
         if not favorite_handled and await recover_platform_warning(port,journal,offer,plan,preflight):
@@ -331,7 +331,7 @@ async def _advance(db, owner, sku, seller, *, native_follow=False):
                 approved(review,rules,allow_unknown=allow_unknown,native_follow=native_follow)
                 journal.move(offer,'manual_review','reconciling',reason=None,waiting_since=time.time(),recovered_at=time.time())
             else:
-                record['phase']='manual_review';record['last_reconciliation_at']=time.time();save()
+                record['phase']='manual_review';record['last_reconciliation_at']=time.time();await database_work(save)
                 return {'sku':sku,'offer_id':offer,'phase':'manual_review','verified':False,'retryable_readback':True,'reason':'awaiting_exact_remote_outcome'}
             before=journal.read(offer)['phase']
         if (not favorite_handled and before not in ('stock_verified','failed','manual_review')) or (favorite_handled and journal.read(offer)['phase']=='ready'):
@@ -350,16 +350,16 @@ async def _advance(db, owner, sku, seller, *, native_follow=False):
                 cause=error.__cause__ or error
                 record['phase']=journal.read(offer)['phase']
                 record.setdefault('api_timings',[]).append({'at':time.time(),'calls':transport.timings[:]})
-                record['events'].append({'at':time.time(),'from':before,'error':type(error).__name__,'reason':str(cause)[:250]});save()
+                record['events'].append({'at':time.time(),'from':before,'error':type(error).__name__,'reason':str(cause)[:250]});await database_work(save)
                 if isinstance(cause,ValueError) and str(cause) in ('target_quota_unavailable','hour_window_closed'):raise cause
                 raise
         final=journal.read(offer)
         record.setdefault('api_timings',[]).append({'at':time.time(),'calls':transport.timings[:]})
-        record['events'].append({'at':time.time(),'from':before,'to':final['phase']});record['phase']=final['phase'];save()
+        record['events'].append({'at':time.time(),'from':before,'to':final['phase']});record['phase']=final['phase'];await database_work(save)
         if final['phase']=='stock_verified':
             product=await port.find_product(plan.shop_id,offer);stocks=await port.read_stocks(product) if product else []
             record['product']=asdict(product) if product else None;record['stocks']=[asdict(s) for s in stocks]
-            record['verified']=bool(product and product.status=='selling' and any(s.warehouse_id==warehouse and s.present==99 for s in stocks));save()
+            record['verified']=bool(product and product.status=='selling' and any(s.warehouse_id==warehouse and s.present==99 for s in stocks));await database_work(save)
         library=SourceLibrary(db)
         with db.connect() as c:
             row=c.execute('SELECT body FROM sourcing_products WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()

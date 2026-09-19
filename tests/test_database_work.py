@@ -146,3 +146,32 @@ async def test_source_scan_keeps_loop_responsive_and_lock_until_drained(tmp_path
         release.set()
         with pytest.raises(asyncio.CancelledError):await task
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+
+
+@pytest.mark.asyncio
+async def test_listing_control_lock_does_not_block_loop(tmp_path):
+    from flowhub import listing_controls
+    db=configured(tmp_path);listing_controls.schema(db)
+    blocker=sqlite3.connect(db.path,check_same_thread=False);blocker.execute('BEGIN IMMEDIATE')
+    timer=threading.Timer(.3,blocker.commit);timer.start()
+    try:
+        began=time.monotonic();task=asyncio.create_task(listing_controls.tick(db))
+        await asyncio.sleep(.02);assert time.monotonic()-began<.15
+        assert await task is False
+    finally:timer.join();blocker.close()
+
+
+@pytest.mark.asyncio
+async def test_review_reservation_competition_keeps_single_running_marker(tmp_path):
+    from flowhub.plugin_comparebot import reserve_review
+    db=configured(tmp_path)
+    with db.connect() as c:c.execute('CREATE TABLE plugin_reviews(owner TEXT,sku TEXT,seller TEXT,state TEXT,body TEXT,updated REAL,PRIMARY KEY(owner,sku,seller))')
+    blocker=sqlite3.connect(db.path,check_same_thread=False);blocker.execute('BEGIN IMMEDIATE')
+    timer=threading.Timer(.3,blocker.commit);timer.start()
+    try:
+        began=time.monotonic();tasks=[asyncio.create_task(run(reserve_review,db,'owner','1','2',False,time.time(),'digest')) for _ in range(2)]
+        await asyncio.sleep(.02);assert time.monotonic()-began<.15
+        results=await asyncio.gather(*tasks)
+        assert sum(r is None for r in results)==1
+        assert [r for r in results if r is not None][0]['state']=='running'
+    finally:timer.join();blocker.close()

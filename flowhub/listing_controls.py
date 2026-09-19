@@ -196,7 +196,7 @@ async def prepare_listing(db,key,body):
  return 'waiting',body|{'phase':'publication_pipeline'}
 
 
-async def tick(db, *, target=None):
+def claim_listing(db, *, target=None):
  if target is not None and (len(target)!=3 or not all(isinstance(x,str) and x for x in target)):
   raise ValueError("exact_listing_identity_required")
  scope=" AND owner=? AND sku=? AND seller=?" if target else ""
@@ -211,6 +211,19 @@ async def tick(db, *, target=None):
   token='listing-control-'+body['id']
   c.execute('INSERT OR REPLACE INTO plugin_pipeline_leases VALUES(?,?,?,?,?)',(*key,token,time.time()+360))
   c.execute("UPDATE product_listing_controls SET state='running',updated=? WHERE owner=? AND sku=? AND seller=?",(time.time(),*key))
+ return dict(row),key,body,token
+
+
+async def tick(db, *, target=None):
+ from .pipeline_modules.database_work import run as database_work
+ task=asyncio.create_task(asyncio.to_thread(claim_listing,db,target=target))
+ try:claimed=await asyncio.shield(task)
+ except asyncio.CancelledError:
+  claimed=await task
+  if claimed:await database_work(finish_listing,db,claimed[1],'waiting',claimed[2],claimed[3])
+  raise
+ if not claimed:return False
+ row,key,body,token=claimed
  try:
   if row['action']=='unlist':state,body=await remove(db,key,body)
   elif body.get('phase')=='publication_pipeline':
@@ -222,13 +235,11 @@ async def tick(db, *, target=None):
  except OfficialDeferred as e:
   state='waiting';body['next_attempt_at']=e.until;body['dependency_wait']=e.reason
  except asyncio.CancelledError:
-  save(db,key,'waiting',body)
-  with db.connect() as c:c.execute('DELETE FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=? AND token=?',(*key,token))
+  await database_work(finish_listing,db,key,'waiting',body,token)
   raise
  except Exception as e:state='blocked';body['error']=(str(e) or type(e).__name__)[:220]
  if state=='waiting' and body.get('phase') not in ('publication_pipeline','capacity_wait') and time.time()-max(body['requested_at'],body.get('workflow_repaired_at',0))>1800:state='blocked';body['error']='上下架回查尚未完成，请查看原记录后重试'
- save(db,key,state,body)
- with db.connect() as c:c.execute('DELETE FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=? AND token=?',(*key,token))
+ await database_work(finish_listing,db,key,state,body,token)
  return True
 
 
@@ -299,3 +310,8 @@ def management_card(c,owner,row,sku,seller):
  labels={'quarantined':'已隔离 · 不占正常上架队列','selling':'已上架','same_product_confirmed':'同款已确认','rejected':'已拒绝','delisting':'下架处理中','delisted':'已下架','not_listed':'未查到本店上架记录','publishing':'上架处理中'}
  item['category_label']=labels.get(row['state'],item['category_label'])
  return item
+
+
+def finish_listing(db,key,state,body,token):
+ save(db,key,state,body)
+ with db.connect() as c:c.execute('DELETE FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=? AND token=?',(*key,token))

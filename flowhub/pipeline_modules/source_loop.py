@@ -48,7 +48,7 @@ def sync_stores(db, owner, run_id, now=None):
                         c.execute('UPDATE sourcing_seeds SET body=? WHERE owner=? AND shop=? AND offer=?',(json.dumps(body),owner,shop,offer))
         # Completed publications give exact own offer -> original SKU/seller bindings.
         if c.execute("SELECT 1 FROM sqlite_master WHERE name='plugin_publications'").fetchone():
-            for r in c.execute("SELECT body FROM plugin_publications WHERE owner=? AND json_extract(body,'$.verified')=1",(owner,)):
+            for r in c.execute("SELECT json_object('sku',json_extract(body,'$.sku'),'seller',json_extract(body,'$.seller'),'offer_id',json_extract(body,'$.offer_id'),'product',json_extract(body,'$.product')) AS body FROM plugin_publications WHERE owner=? AND json_extract(body,'$.verified')=1",(owner,)).fetchall():
                 p=json.loads(r[0]);product=p.get('product') or {}
                 shop=str(product.get('shop_id') or '');sku=str(p.get('sku') or '');seller=str(p.get('seller') or '')
                 offer=p.get('offer_id')

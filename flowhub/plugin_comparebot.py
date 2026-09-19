@@ -3,6 +3,7 @@ import asyncio
 import json
 import time
 
+from .pipeline_modules.database_work import run as database_work
 from .comparebot import invoke
 from .modules import ModuleError, image_url
 from .plugin_detail import positive
@@ -83,15 +84,8 @@ async def evaluate(db, owner, sku, seller, *, force=False):
     started = time.time()
     matcher_secret=db.open(workflow['secrets'])['flowb-matcher']
     digest = fingerprint({'credential_revision':fingerprint(matcher_secret),'adapter_version':4,'plugin':product['plugin_detail'],'quote':envelope['origin']['price_evidence'],'roots':roots,'rules':workflow['rules']})
-    with db.connect() as c:
-        c.execute('BEGIN IMMEDIATE')
-        prior = c.execute('SELECT * FROM plugin_reviews WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()
-        if prior and not force and 0 <= started-prior['updated'] < (600 if prior['state']=='running' else 21600) and prior['state']!='error':
-            saved=json.loads(prior['body'])
-            retryable=(saved.get('result',{}).get('reason') or '').startswith('qwen_')
-            if prior['state']=='running' or (saved.get('input_digest')==digest and not retryable):
-                return saved | {'cached':True}
-        c.execute('INSERT OR REPLACE INTO plugin_reviews VALUES(?,?,?,?,?,?)',(owner,sku,seller,'running',json.dumps({'state':'running','sku':sku,'input_digest':digest}),started))
+    cached=await database_work(reserve_review,db,owner,sku,seller,force,started,digest)
+    if cached is not None:return cached
     report={'sku':sku,'seller':seller,'started_at':started,'candidate':envelope,'submitted':False,'input_digest':digest,
             'publication_blockers':envelope['origin']['publication_blockers'],'price_basis':envelope['origin']['price_evidence']}
     try:
@@ -108,6 +102,24 @@ async def evaluate(db, owner, sku, seller, *, force=False):
         if getattr(error, 'diagnostic', None):
             report['diagnostic'] = error.diagnostic
     report['finished_at']=time.time()
+    await database_work(finish_review,db,library,owner,sku,seller,report)
+    return report
+
+
+def reserve_review(db,owner,sku,seller,force,started,digest):
+    with db.connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        prior = c.execute('SELECT * FROM plugin_reviews WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()
+        if prior and not force and 0 <= started-prior['updated'] < (600 if prior['state']=='running' else 21600) and prior['state']!='error':
+            saved=json.loads(prior['body'])
+            retryable=(saved.get('result',{}).get('reason') or '').startswith('qwen_')
+            if prior['state']=='running' or (saved.get('input_digest')==digest and not retryable):
+                return saved | {'cached':True}
+        c.execute('INSERT OR REPLACE INTO plugin_reviews VALUES(?,?,?,?,?,?)',(owner,sku,seller,'running',json.dumps({'state':'running','sku':sku,'input_digest':digest}),started))
+    return None
+
+
+def finish_review(db,library,owner,sku,seller,report):
     with db.connect() as c:
         c.execute('UPDATE plugin_reviews SET state=?,body=?,updated=? WHERE owner=? AND sku=? AND seller=?',
                   (report['state'],json.dumps(report),report['finished_at'],owner,sku,seller))
@@ -120,4 +132,3 @@ async def evaluate(db, owner, sku, seller, *, force=False):
             'evidence_source':'plugin_reviews','publication_ready':False,
             'publication_blockers':report['publication_blockers'],'price_basis':report['price_basis']}
         library.put(owner,product,{'channel':'plugin-comparebot','observed_at':report['finished_at']},connection=c)
-    return report

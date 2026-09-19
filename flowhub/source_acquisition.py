@@ -11,6 +11,7 @@ from collections import Counter
 from pathlib import Path
 
 from .source_library import SourceFilters, assess, numeric, ranking_product
+from .pipeline_modules.database_work import run as database_work
 
 
 class AcquisitionError(Exception):
@@ -130,7 +131,16 @@ class SourceAcquirer:
                 self.delist_checked = now
             except Exception:
                 return {"state": "blocked", "reason": "explicit_delists_unavailable"}
-        task = self.library.claim(owner, now, kinds=kinds)
+        claim_task=asyncio.create_task(asyncio.to_thread(self.library.claim,owner,now,kinds=kinds))
+        try:task=await asyncio.shield(claim_task)
+        except asyncio.CancelledError:
+            task=await claim_task
+            if task:
+                def release():
+                    with self.library.db.connect() as c:
+                        c.execute('UPDATE sourcing_tasks SET lease=NULL,lease_until=0 WHERE id=? AND lease=?',(task['id'],task['lease']))
+                await database_work(release)
+            raise
         if not task:
             return {"state": "idle"}
         try:
