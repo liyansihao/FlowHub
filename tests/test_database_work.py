@@ -175,3 +175,16 @@ async def test_review_reservation_competition_keeps_single_running_marker(tmp_pa
         assert sum(r is None for r in results)==1
         assert [r for r in results if r is not None][0]['state']=='running'
     finally:timer.join();blocker.close()
+
+
+@pytest.mark.asyncio
+async def test_isolated_readback_claim_lock_does_not_block_loop(tmp_path):
+    from flowhub.pipeline_modules import isolation
+    db=configured(tmp_path);(db.directory/isolation.POLICY_FILE).write_text('{"enabled":true}')
+    blocker=sqlite3.connect(db.path,check_same_thread=False);blocker.execute('BEGIN IMMEDIATE')
+    timer=threading.Timer(.3,blocker.commit);timer.start()
+    try:
+        began=time.monotonic();task=asyncio.create_task(isolation.tick(db))
+        await asyncio.sleep(.02);assert time.monotonic()-began<.15
+        assert await task is False
+    finally:timer.join();blocker.close()
