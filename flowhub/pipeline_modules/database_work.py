@@ -12,3 +12,14 @@ async def run(function, *args, **kwargs):
         # transaction continue after its caller has released a publication lock.
         await task
         raise
+
+
+async def health(db,name):
+    """A contended diagnostic write must not shut down the publishing lanes."""
+    import sqlite3
+    try:
+        await run(db.health,name)
+    except sqlite3.OperationalError as error:
+        if not any(word in str(error).lower() for word in ('locked','busy')):raise
+        return False
+    return True

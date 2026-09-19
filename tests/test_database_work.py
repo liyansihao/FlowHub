@@ -188,3 +188,29 @@ async def test_isolated_readback_claim_lock_does_not_block_loop(tmp_path):
         await asyncio.sleep(.02);assert time.monotonic()-began<.15
         assert await task is False
     finally:timer.join();blocker.close()
+
+
+@pytest.mark.asyncio
+async def test_store_capacity_claim_does_not_block_loop(tmp_path):
+    from flowhub.pipeline_modules import store_capacity
+    db=configured(tmp_path)
+    with db.connect() as c:store_capacity.schema(c)
+    blocker=sqlite3.connect(db.path,check_same_thread=False);blocker.execute('BEGIN IMMEDIATE')
+    timer=threading.Timer(.4,blocker.commit);timer.start()
+    try:
+        began=time.monotonic();task=asyncio.create_task(store_capacity.check_one(db))
+        await asyncio.sleep(.02);assert time.monotonic()-began<.2
+        assert await task is None
+    finally:timer.join();blocker.close()
+
+
+@pytest.mark.asyncio
+async def test_contended_error_health_does_not_stop_lanes(tmp_path,monkeypatch):
+    from flowhub.pipeline_modules.database_work import health
+    db=Database(tmp_path)
+    def busy(*args):raise sqlite3.OperationalError('database is locked')
+    monkeypatch.setattr(db,'health',busy)
+    assert await health(db,'test-error') is False
+    def broken(*args):raise sqlite3.OperationalError('no such table: health')
+    monkeypatch.setattr(db,'health',broken)
+    with pytest.raises(sqlite3.OperationalError,match='no such table'):await health(db,'test-error')

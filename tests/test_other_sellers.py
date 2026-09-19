@@ -65,3 +65,37 @@ def test_pending_second_generation_requires_explicit_exploration_policy(tmp_path
     with db.connect() as c:
         body=json.loads(c.execute('SELECT body FROM source_discovery_seeds').fetchone()[0])
         assert body['exploration_only'] and body['assessment']['state']=='needs_review'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('success',[False,True])
+async def test_discovery_persistence_waits_off_loop(tmp_path,monkeypatch,success):
+    import asyncio,sqlite3,threading
+    from flowhub.other_sellers import discover_one
+    db=Database(tmp_path);BrowserSource(db);schema(db)
+    with db.connect() as c:
+        c.execute('INSERT INTO source_discovery_seeds VALUES(?,?,?,0,0,?,?)',('o','123','queued','{}',time.time()))
+    artifact=tmp_path/'offers.html';artifact.write_text(page())
+    blocker=sqlite3.connect(db.path,check_same_thread=False);started=asyncio.Event();timers=[]
+    class Process:
+        returncode=0 if success else 1
+        async def communicate(self):
+            blocker.execute('BEGIN IMMEDIATE')
+            timer=threading.Timer(.4,blocker.commit);timer.start();timers.append(timer)
+            started.set()
+            return (json.dumps({'artifact':str(artifact)} if success else {'error':'access_challenge'}).encode(),b'')
+    async def spawn(*args,**kwargs):return Process()
+    monkeypatch.setattr(asyncio,'create_subprocess_exec',spawn)
+    try:
+        task=asyncio.create_task(discover_one(db,'o',{'profile':'test'}))
+        await started.wait();began=time.monotonic()
+        await asyncio.sleep(.02)
+        assert time.monotonic()-began<.2
+        result=await task
+        assert result['state']==('complete' if success else 'blocked')
+        with db.connect() as c:
+            assert c.execute('SELECT state FROM source_discovery_seeds').fetchone()[0]==result['state']
+            assert c.execute('SELECT count(*) FROM source_discovery_failures').fetchone()[0]==(0 if success else 1)
+    finally:
+        for timer in timers:timer.join()
+        blocker.close()

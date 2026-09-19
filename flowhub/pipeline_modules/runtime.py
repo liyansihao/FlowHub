@@ -14,7 +14,7 @@ async def publication_tick(db, name, index, tick):
 
 
 async def run(db, *, review_workers=2, submit_workers=2, reconcile_workers=2, seed_workers=1):
-    from .database_work import run as database_work
+    from .database_work import run as database_work, health as database_health
     from ..plugin_pipeline import tick
     from ..comparebot_process import close_workers
     if not all(1 <= n <= 4 for n in (review_workers, submit_workers, reconcile_workers)):
@@ -57,7 +57,7 @@ async def run(db, *, review_workers=2, submit_workers=2, reconcile_workers=2, se
                 else:
                     worked = await tick(db, lane='review' if name=='remote_review' else name)
             except Exception:
-                await database_work(db.health,'pipeline-' + name + '-error')
+                await database_health(db,'pipeline-' + name + '-error')
                 worked = False
             await asyncio.sleep(60 if name=='reconcile_history' and worked else 5 if name=='reconcile_history' else .05 if worked else .5)
 
@@ -67,7 +67,7 @@ async def run(db, *, review_workers=2, submit_workers=2, reconcile_workers=2, se
             try:
                 await asyncio.to_thread(cleanup,db)
             except Exception:
-                db.health('repair-cleanup-error')
+                await database_health(db,'repair-cleanup-error')
             await asyncio.sleep(60)
 
     async def isolated_readback():
@@ -76,7 +76,7 @@ async def run(db, *, review_workers=2, submit_workers=2, reconcile_workers=2, se
             try:
                 await inspect_isolated(db)
             except Exception:
-                db.health("queue-isolation-read-error")
+                await database_health(db,"queue-isolation-read-error")
             await asyncio.sleep(15)
 
     repairs=[('repair_valuation',repair_policy['valuation_workers']),('repair_publication',repair_policy['publication_workers'])] if repair_policy['enabled'] else [('seed_repair',seed_workers)]
