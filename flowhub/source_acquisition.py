@@ -116,11 +116,13 @@ class SourceAcquirer:
 
     async def cycle(self, owner, token, now=None, kinds=None):
         now = time.time() if now is None else now
-        with self.library.db.connect() as c:
-            pending = c.execute(
-                "SELECT COUNT(*) FROM jobs WHERE owner=? AND (phase NOT IN ('selling','rejected','attention') OR (phase='attention' AND json_extract(data,'$.candidate.source_contract')='flowhub-source-candidates-v1'))",
-                (owner,),
-            ).fetchone()[0]
+        def pending_count():
+            with self.library.db.connect() as c:
+                return c.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE owner=? AND (phase NOT IN ('selling','rejected','attention') OR (phase='attention' AND json_extract(data,'$.candidate.source_contract')='flowhub-source-candidates-v1'))",
+                    (owner,),
+                ).fetchone()[0]
+        pending=await database_work(pending_count)
         if pending >= 30:
             return {"state": "backpressure"}
         if self.delist_snapshot is None or now - self.delist_checked >= 60:
