@@ -176,8 +176,12 @@ async def _advance(db, owner, sku, seller, *, native_follow=False):
     def save():
         with db.connect() as c:c.execute('INSERT OR REPLACE INTO plugin_publications VALUES(?,?,?,?,?)',(owner,sku,seller,json.dumps(record),time.time()))
     from .pipeline_modules.transport import StepTransport
-    transport=StepTransport(MeasuredTransport(bridge),ttl=15,namespace=fingerprint({'token':keys['erp_token']}),
-                            circuit_namespace=getattr(bridge,'execution_route','local'))
+    transport_args={'namespace':fingerprint({'token':keys['erp_token']}),
+                    'circuit_namespace':getattr(bridge,'execution_route','local')}
+    if native_follow:
+        from .follow_execution import FollowBatchTransport
+        transport=FollowBatchTransport(MeasuredTransport(bridge),sku=sku,**transport_args)
+    else:transport=StepTransport(MeasuredTransport(bridge),ttl=15,**transport_args)
     async with httpx.AsyncClient(base_url='https://api.maozierp.com',transport=transport) as client, AsyncExitStack() as observation_clients:
         from .pipeline_modules.favorite_lookup import PublicationSourceAdapter, PublicationAdapter
         base=PublicationSourceAdapter(client)
@@ -331,7 +335,8 @@ async def _advance(db, owner, sku, seller, *, native_follow=False):
             before=journal.read(offer)['phase']
         if (not favorite_handled and before not in ('stock_verified','failed','manual_review')) or (favorite_handled and journal.read(offer)['phase']=='ready'):
             try:
-                await service.advance(offer)
+                from .follow_execution import submit_prepared
+                await submit_prepared(service,journal,offer,native_follow=native_follow,before=before)
                 if before=='prepared' and journal.read(offer)['phase']=='favorite_pending':
                     # Verify a successful favorite creation in this same operation.
                     # Some favorites disappear before a later queue turn can see them.

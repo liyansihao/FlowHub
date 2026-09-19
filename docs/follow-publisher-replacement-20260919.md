@@ -4,6 +4,14 @@
 
 参考实现固定为 ozon 652199132824c732e8b002bc7e40338454046d0a 的 flow_b_process_batch.py，及 ozon-playwright cff47b4c0ba4936b99f3e1345ec4eb656c486746 的 publish-runner.mjs/maozi-client.mjs。发布请求恢复为 /api.selection.follow/import，scene=erp、单店、原水印、source=favorite、CNY 售价。只提交收藏ID、SKU、标题、图片、链接、价格、offer及店铺信息，不提交完整属性包。
 
+## 跟卖执行方式修正
+
+按用户追加要求参考旧仓库的批次复用和提交后继续处理方式。仅 maozi_follow 使用 FollowBatchTransport：同账号、同 SKU 的成功查询在 60 秒内跨准备/提交轮次复用，最多保留 256 个 SKU 批次；店铺仍按原 60 秒账号缓存复用。相关写入（包括结果未知的写入）在发送前失效该 SKU 的查询缓存，不因其他 SKU 的写入丢弃本商品的查询。账号凭据不同不共享，认证失败清理账号缓存；库存不缓存。历史官方/ERP 任务保持原 transport、15 秒 SKU 查询缓存和原执行顺序。
+
+已有收藏的 prepared 商品在同一调度轮次沿原 journal CAS 到 ready、submitting、reconciling，省掉 ready 的一次重新排队。预检、人工规则、额度、店铺和 Offer 绑定继续在原写入关口执行；提交响应未知仍只回查原 Offer。新增收藏也须先读回收藏 ID 才能提交。回查与库存验证继续由原独立队列执行，不能把 ERP 受理记为库存验证成功。
+
+验证包括一次调用完成已有/新建收藏提交、重复查询计数、丢失提交响应后不重发、缓存跨 SKU/账号隔离及写入失效、到期重新读取、库存实时读取和历史路径回归。未修改全局限速、并发数、估价规则或生产队列身份。数据库/外围调度等待未被本补丁证明解决，需部署后实测实际吞吐。
+
 ## 唯一切换入口
 
 主数据目录 publication-policy.json 的 backend=maozi_follow 选择新商品的跟卖发布路径。店铺配置不改，已有记录优先按自身 backend 路由：official仍走官方回查，旧无backend记录仍走原ERP账本，maozi_follow始终走本次跟卖路径。未部署或backend=existing沿用原新任务选择策略。

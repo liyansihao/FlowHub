@@ -26,6 +26,8 @@ class StepTransport(httpx.AsyncBaseTransport):
 
     def scope(self,path):return (asyncio.get_running_loop(),self.namespace,path)
 
+    def generation_scope(self,path):return self.scope(path)
+
     def invalidate(self,path):
         # Stock/import writes cannot change shop identity. Unknown endpoints may.
         affected={'/api.product.favorite/lists','/api.product.import_logs/index','/api.product.online/lists'}
@@ -38,7 +40,7 @@ class StepTransport(httpx.AsyncBaseTransport):
                         '/api.product.online/batch_update_stock','/api.product.online/sync_shop'):
             affected.add('/api.shop/lists')
         for read in affected:
-            scope=self.scope(read);self.generations[scope]=self.generations.get(scope,0)+1
+            scope=self.generation_scope(read);self.generations[scope]=self.generations.get(scope,0)+1
         for key in list(self.cache):
             if httpx.URL(key[1]).path in affected:self.cache.pop(key,None)
         if '/api.shop/lists' in affected:
@@ -53,7 +55,8 @@ class StepTransport(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request):
         path=request.url.path;start=time.monotonic();scope=self.scope(path)
-        key=(request.method,str(request.url));generation=self.generations.get(scope,0)
+        generation_scope=self.generation_scope(path)
+        key=(request.method,str(request.url));generation=self.generations.get(generation_scope,0)
         shared_key=(*scope[:2],*key,generation)
         read=request.method=='GET';cacheable=read and path in self.CACHEABLE
         shop=read and path=='/api.shop/lists'
@@ -67,7 +70,7 @@ class StepTransport(httpx.AsyncBaseTransport):
         coalesce=read and path!='/api.product.online/get_stock'
         if coalesce and shared_key in self.inflight:
             result=await asyncio.shield(self.inflight[shared_key])
-            if generation!=self.generations.get(scope,0):return await self.handle_async_request(request)
+            if generation!=self.generations.get(generation_scope,0):return await self.handle_async_request(request)
             self.timings.append({'path':path,'seconds':round(time.monotonic()-start,3),'cache_hit':False,'coalesced':True})
             return httpx.Response(result[0],content=result[1],headers=result[2],request=request)
         # Connection failures belong to an execution host, not the shared account.
@@ -90,7 +93,7 @@ class StepTransport(httpx.AsyncBaseTransport):
             if cacheable and response.status_code==200:
                 try:ok=response.json().get('code') in (1,'1')
                 except (ValueError,AttributeError):ok=False
-                if ok and generation==self.generations.get(scope,0):
+                if ok and generation==self.generations.get(generation_scope,0):
                     saved=(time.monotonic(),response.status_code,content,dict(response.headers),generation)
                     self.cache[key]=saved
                     if shop:

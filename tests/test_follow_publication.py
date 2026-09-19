@@ -40,8 +40,11 @@ def native(flow, monkeypatch):
         body=json.loads(request.content) if request.content else {}
         calls.append((path,body))
         if path=='/api.product.favorite/lists':
-            rows=[] if request.url.params.get('is_imported')=='1' else [{'id':101,'sku':'123','is_imported':0}]
+            rows=[] if request.url.params.get('is_imported')=='1' or getattr(platform,'favorite_missing',False) else [{'id':101,'sku':'123','is_imported':0}]
             data={'data':rows,'total':len(rows)}
+        elif path=='/api.product.favorite/toggle':
+            platform.favorite_missing=False
+            data={'accepted':True}
         elif path=='/api.product.import_logs/index':data={'data':[],'last_page':1}
         elif path=='/api.selection.follow/import':
             platform.offer=body['rows'][0]['offer_id']
@@ -86,7 +89,6 @@ async def test_full_follow_path_without_dossier_or_collection(native):
 
 async def test_lost_import_response_and_policy_rollback_never_republish(native):
     db,owner,platform,*_=native
-    assert (await advance(native))['phase']=='ready'
     platform.lost_import=True
     with pytest.raises(Exception):await advance(native)
     (db.directory/'publication-policy.json').write_text('{"backend":"existing"}')
@@ -94,6 +96,28 @@ async def test_lost_import_response_and_policy_rollback_never_republish(native):
     platform.lost_import=False
     assert (await finish(native))['verified']
     assert sum(p=='/api.selection.follow/import' for p,b in native[-1])==1
+
+
+async def test_follow_submits_in_first_turn_without_waiting_for_stock(native):
+    result=await advance(native)
+    assert result['phase']=='reconciling'
+    assert not result.get('verified')
+    calls=native[-1]
+    assert sum(p=='/api.selection.follow/import' for p,b in calls)==1
+    # Initial dedup, recovery and both preflights reuse the same two SKU views.
+    assert sum(p=='/api.product.favorite/lists' for p,b in calls)==2
+    assert sum(p=='/api.product.import_logs/index' for p,b in calls)==1
+
+
+async def test_missing_favorite_is_created_observed_then_submitted_once(native):
+    native[2].favorite_missing=True
+    result=await advance(native)
+    assert result['phase']=='reconciling'
+    paths=[p for p,b in native[-1]]
+    assert paths.count('/api.product.favorite/toggle')==1
+    assert paths.count('/api.selection.follow/import')==1
+    toggle=paths.index('/api.product.favorite/toggle')
+    assert '/api.product.favorite/lists' in paths[toggle+1:paths.index('/api.selection.follow/import')]
 
 
 async def test_historical_official_record_keeps_official_readback(flow):
