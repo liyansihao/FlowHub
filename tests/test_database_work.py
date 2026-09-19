@@ -79,3 +79,52 @@ async def test_official_reservation_lock_does_not_stop_other_coroutines(tmp_path
             assert not requests
             assert (await task).status_code==200
     finally:timer.join();blocker.close()
+
+
+@pytest.mark.asyncio
+async def test_generic_worker_claim_lock_keeps_loop_responsive(tmp_path):
+    from flowhub.worker import Worker
+    db=Database(tmp_path);worker=Worker(db)
+    blocker=sqlite3.connect(db.path,check_same_thread=False);blocker.execute('BEGIN IMMEDIATE')
+    timer=threading.Timer(.3,blocker.commit);timer.start()
+    try:
+        began=time.monotonic();task=asyncio.create_task(worker.step())
+        await asyncio.sleep(.02);assert time.monotonic()-began<.15
+        assert await task is False
+    finally:timer.join();blocker.close()
+
+
+@pytest.mark.asyncio
+async def test_busy_claim_defers_without_crashing_worker(tmp_path,monkeypatch):
+    from flowhub.worker import Worker
+    worker=Worker(Database(tmp_path))
+    def busy():raise sqlite3.OperationalError('database is locked')
+    monkeypatch.setattr(worker,'claim',busy)
+    assert await worker.step() is False
+    def broken():raise sqlite3.OperationalError('no such table: jobs')
+    monkeypatch.setattr(worker,'claim',broken)
+    with pytest.raises(sqlite3.OperationalError,match='no such table'):await worker.step()
+
+
+@pytest.mark.asyncio
+async def test_remote_snapshot_does_not_stall_loop_and_drains_before_sync_unlock(tmp_path,monkeypatch):
+    import fcntl
+    from flowhub import remote_reviews
+    from test_manual_reviews import setup
+    db,owner=setup(tmp_path);entered=threading.Event();release=threading.Event()
+    monkeypatch.setenv('FLOWHUB_REVIEW_SYNC_URL','https://review.invalid/api/reviews')
+    monkeypatch.setenv('FLOWHUB_REVIEW_SYNC_TOKEN','test-token')
+    monkeypatch.setenv('FLOWHUB_REVIEW_OWNER',owner)
+    def slow_snapshot(*args):
+        entered.set();assert release.wait(3);return {'items':[],'total':0}
+    monkeypatch.setattr(remote_reviews,'current_snapshot',slow_snapshot)
+    original=httpx.AsyncClient
+    monkeypatch.setattr(remote_reviews.httpx,'AsyncClient',lambda **kw:original(transport=httpx.MockTransport(lambda r:httpx.Response(200,json={'items':[]})),**kw))
+    task=asyncio.create_task(remote_reviews.once(db))
+    assert await asyncio.to_thread(entered.wait,2)
+    task.cancel();await asyncio.sleep(.02);assert not task.done()
+    with (db.directory/'remote-review-sync.lock').open('a') as lock:
+        with pytest.raises(BlockingIOError):fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):await task
+        fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)

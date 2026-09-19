@@ -8,3 +8,14 @@ The user's ordered repair is: safely reclaim parked Windows ERP slots, remove bl
 - Tests hold an actual SQLite writer lock while asserting other coroutines continue, compete for a single task and cancel an in-flight claim. Remote-slot tests cover parked states, active leases, live requests, unknown writes and acknowledged responses. Existing publication and official API regressions remain required.
 
 Other synchronous DB work remains; this patch does not claim every blocking site has been removed. Runtime observations determine whether a pacing trial is appropriate. The existing global 2500ms policy is unchanged by this code; any 2000ms trial must have an expiry, failure/429 baseline, automatic rollback and a recorded result. Never retry an unknown publication to manufacture throughput.
+
+Post-deployment follow-up: a read-only production measurement of review snapshot
+construction took 31.313 seconds for 14,375 cards. It was still synchronous inside
+the worker event loop. Move snapshot construction and application of incoming
+review decisions to the same cancellation-draining database helper without
+changing decision semantics or outgoing protocol. Move the generic worker claim
+transaction off-loop as well. Temporary SQLite busy/locked errors at idle claim
+or heartbeat now defer instead of terminating the worker and interrupting other
+operations; other database errors continue to surface. Regression covers lock
+competition, preservation of the review-sync lock during cancellation, and
+non-lock error propagation.

@@ -4,6 +4,7 @@ import asyncio
 import fcntl
 import json
 import secrets
+import sqlite3
 import time
 
 from .db import Database
@@ -329,7 +330,21 @@ class Worker:
             return dict(r) | {"lease": lease}
 
     async def step(self):
-        job = self.claim()
+        from .pipeline_modules.database_work import run as database_work
+        claim_task=asyncio.create_task(asyncio.to_thread(self.claim))
+        try:
+            job=await asyncio.shield(claim_task)
+        except asyncio.CancelledError:
+            job=await claim_task
+            if job:
+                def release():
+                    with self.db.connect() as c:
+                        c.execute("UPDATE jobs SET lease=NULL,lease_until=0 WHERE id=? AND lease=?",(job['id'],job['lease']))
+                await database_work(release)
+            raise
+        except sqlite3.OperationalError as error:
+            if 'locked' not in str(error).lower() and 'busy' not in str(error).lower():raise
+            return False
         if not job:
             return False
         try:
@@ -462,7 +477,13 @@ class Worker:
         async def heartbeat():
             from .pipeline_modules.database_work import run as database_work
             while True:
-                await database_work(self.db.health,"worker")
+                try:
+                    await database_work(self.db.health,"worker")
+                except sqlite3.OperationalError as error:
+                    if 'locked' not in str(error).lower() and 'busy' not in str(error).lower():raise
+                    # A busy writer is retried; do not restart in-flight operations.
+                    await asyncio.sleep(1)
+                    continue
                 save_runtime(self.db.directory, RUNTIME_IDENTITY)
                 await asyncio.sleep(5)
 
