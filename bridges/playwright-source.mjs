@@ -5,6 +5,7 @@ import {promisify} from 'node:util';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {sourceNetworkArgs} from './source-network.mjs';
+import {settleSourcePage} from './source-page.mjs';
 const exec=promisify(execFile);
 const root=path.resolve(import.meta.dirname,'..');
 const [owner,runId,seller,maxPagesArg='3']=process.argv.slice(2);
@@ -35,6 +36,8 @@ try{
   let response;
   try{response=await page.goto(task.url,{waitUntil:'domcontentloaded',timeout:45000});}
   catch(error){console.log(JSON.stringify(await api('fail',['--reason','browser_navigation_'+(error.message.match(/net::ERR_[A-Z_]+/)?.[0]||error.name)])));break;}
+  try{response=await settleSourcePage(page,response);}
+  catch(error){console.log(JSON.stringify(await api('fail',['--reason',error.message==='browser_access_challenge'?error.message:'browser_page_state_unavailable'])));break;}
   const title=await page.title();
   if(response?.status()===403||/captcha|antibot|access denied/i.test(title)){
    console.log(JSON.stringify(await api('fail',['--reason','browser_access_challenge'])));break;
