@@ -18,6 +18,7 @@ def schema(db):
     control.schema(db)
     with db.connect() as c:
         c.execute('CREATE TABLE IF NOT EXISTS plugin_pipeline(owner TEXT,sku TEXT,seller TEXT,state TEXT,body TEXT,due REAL,attempts INTEGER DEFAULT 0,PRIMARY KEY(owner,sku,seller))')
+        c.execute('CREATE INDEX IF NOT EXISTS plugin_pipeline_state_due ON plugin_pipeline(state,due)')
         c.execute('CREATE TABLE IF NOT EXISTS plugin_pipeline_leases(owner TEXT,sku TEXT,seller TEXT,token TEXT,expires REAL,PRIMARY KEY(owner,sku,seller))')
 
 
@@ -53,7 +54,7 @@ def readback_delay(body, phase, verified=False, submission_priority=False, *, na
     return delay
 
 
-async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None, repair_stage=None, acquisition_route=None):
+def claim(db, lane=None, *, target=None, run_paused=False, repair_kind=None, repair_stage=None, acquisition_route=None):
     from .pipeline_modules import repair_workflow
     staged_repairs=repair_workflow.enabled(db)
     if acquisition_route is not None and (not isinstance(acquisition_route,bool) or repair_stage!='acquire'):
@@ -114,12 +115,25 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
             if active>=limit:return False
         row=dict(r);key=(row['owner'],row['sku'],row['seller']);token=secrets.token_hex(16)
         c.execute('INSERT OR REPLACE INTO plugin_pipeline_leases VALUES(?,?,?,?,?)',(*key,token,now+120))
+    return row,key,token
+
+
+async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None, repair_stage=None, acquisition_route=None):
+    from .pipeline_modules.database_work import run as database_work
+    claim_task=asyncio.create_task(asyncio.to_thread(claim,db,lane,target=target,run_paused=run_paused,
+        repair_kind=repair_kind,repair_stage=repair_stage,acquisition_route=acquisition_route))
+    try:
+        claimed=await asyncio.shield(claim_task)
+    except asyncio.CancelledError:
+        claimed=await claim_task
+        if claimed:await database_work(release_lease,db,claimed[1],claimed[2])
+        raise
+    if not claimed:return False
+    row,key,token=claimed
     async def renew():
         while True:
             await asyncio.sleep(30)
-            with db.connect() as c:
-                c.execute('UPDATE plugin_pipeline_leases SET expires=? WHERE owner=? AND sku=? AND seller=? AND token=?',
-                          (time.time()+120,*key,token))
+            await database_work(renew_lease,db,key,token)
     heartbeat=asyncio.create_task(renew())
     started=time.time()
     state=row['state'];body=json.loads(row['body']);attempts=row['attempts'];delay=0;lock_wait=False;dependency_wait=False;repair_progress=False
@@ -260,12 +274,16 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
         # An uncertain publication remains resumable in its immutable ERP journal.
         if state not in ('publishing','awaiting_remote') and attempts>=8:state='needs_review'
     except asyncio.CancelledError:
-        with db.connect() as c:
-            c.execute('DELETE FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=? AND token=?',(*key,token))
+        await database_work(release_lease,db,key,token)
         raise
     finally:
         heartbeat.cancel()
         await asyncio.gather(heartbeat,return_exceptions=True)
+    return await database_work(finish,db,row,key,token,state,body,attempts,delay,lane,started,
+                               lock_wait,dependency_wait,repair_progress)
+
+
+def finish(db,row,key,token,state,body,attempts,delay,lane,started,lock_wait,dependency_wait,repair_progress):
     if state=='publishing':
         with db.connect() as c:
             if c.execute("SELECT 1 FROM sqlite_master WHERE name='plugin_publications'").fetchone():
@@ -308,3 +326,14 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
             SourceLibrary(db).put(key[0],p,{'channel':'plugin-pipeline','state':state},connection=c)
     control.record(db,'seed' if row['state']=='needs_fields' else 'review' if row['state'] in ('queued','evaluating') else 'publication',key[0],key[1],started,'waiting_lock' if lock_wait else 'waiting_dependency' if dependency_wait else state,{'lane':lane,'phase':body.get('phase'),'reason':body.get('dependency_wait') if dependency_wait else None if lock_wait else body.get('error')})
     return not lock_wait
+
+
+def release_lease(db,key,token):
+    with db.connect() as c:
+        c.execute('DELETE FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=? AND token=?',(*key,token))
+
+
+def renew_lease(db,key,token):
+    with db.connect() as c:
+        c.execute('UPDATE plugin_pipeline_leases SET expires=? WHERE owner=? AND sku=? AND seller=? AND token=?',
+                  (time.time()+120,*key,token))

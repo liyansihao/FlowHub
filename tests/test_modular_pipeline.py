@@ -130,7 +130,7 @@ async def test_runtime_starts_configured_independent_worker_counts(tmp_path,monk
     db,_=setup(tmp_path);counts={};started=asyncio.Event()
     async def tick(db,lane=None):
         counts[lane]=counts.get(lane,0)+1
-        if sum(counts.values())==7:started.set()
+        if sum(counts.values())==8:started.set()
         await asyncio.Event().wait()
     monkeypatch.setattr(pipeline,'tick',tick)
     task=asyncio.create_task(run(db))

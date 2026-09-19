@@ -1,0 +1,81 @@
+import asyncio
+import sqlite3
+import threading
+import time
+
+import httpx
+import pytest
+
+from flowhub import plugin_pipeline as pipeline
+from flowhub.db import Database
+from flowhub.source_library import SourceLibrary
+from flowhub.pipeline_modules.database_work import run
+
+
+def configured(tmp_path):
+    db=Database(tmp_path);SourceLibrary(db);pipeline.schema(db)
+    with db.connect() as c:
+        owner=c.execute('SELECT id FROM users').fetchone()[0]
+        c.execute('INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)',(owner,'1','2','publishing','{}',0,0))
+    return db
+
+
+@pytest.mark.asyncio
+async def test_writer_lock_does_not_block_event_loop_or_duplicate_claim(tmp_path,monkeypatch):
+    db=configured(tmp_path);calls=[]
+    async def publish(*args):
+        calls.append(args);await asyncio.sleep(.03)
+        return {'phase':'stock_verified','verified':True}
+    monkeypatch.setattr(pipeline,'advance',publish)
+    blocker=sqlite3.connect(db.path,check_same_thread=False);blocker.execute('BEGIN IMMEDIATE')
+    timer=threading.Timer(.4,blocker.commit);timer.start()
+    try:
+        started=time.monotonic();tasks=[asyncio.create_task(pipeline.tick(db,lane='submit')) for _ in range(2)]
+        await asyncio.sleep(.03)
+        assert time.monotonic()-started<.2
+        assert sorted(await asyncio.gather(*tasks))==[False,True]
+        assert len(calls)==1
+    finally:timer.join();blocker.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_claim_drains_then_releases_its_lease(tmp_path,monkeypatch):
+    db=configured(tmp_path)
+    async def publish(*args):pytest.fail('cancelled claim must never publish')
+    monkeypatch.setattr(pipeline,'advance',publish)
+    blocker=sqlite3.connect(db.path,check_same_thread=False);blocker.execute('BEGIN IMMEDIATE')
+    timer=threading.Timer(.2,blocker.commit);timer.start()
+    try:
+        task=asyncio.create_task(pipeline.tick(db,lane='submit'));await asyncio.sleep(.02);task.cancel()
+        with pytest.raises(asyncio.CancelledError):await task
+        with db.connect() as c:assert c.execute('SELECT count(*) FROM plugin_pipeline_leases').fetchone()[0]==0
+    finally:timer.join();blocker.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_db_unit_finishes_before_caller_releases_resources():
+    entered=threading.Event();release=threading.Event();finished=[]
+    def transaction():entered.set();release.wait(2);finished.append(True)
+    task=asyncio.create_task(run(transaction))
+    await asyncio.to_thread(entered.wait,1);task.cancel();await asyncio.sleep(.02)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):await task
+    assert finished==[True]
+
+
+@pytest.mark.asyncio
+async def test_official_reservation_lock_does_not_stop_other_coroutines(tmp_path):
+    from flowhub.official_api import OfficialTransport
+    db=Database(tmp_path);requests=[]
+    def response(r):requests.append(r);return httpx.Response(200,json={'result':[]})
+    transport=OfficialTransport(db,{'client_id':'1','api_key':'test'},transport=httpx.MockTransport(response))
+    blocker=sqlite3.connect(db.path,check_same_thread=False);blocker.execute('BEGIN IMMEDIATE')
+    timer=threading.Timer(.3,blocker.commit);timer.start()
+    try:
+        async with httpx.AsyncClient(transport=transport) as client:
+            started=time.monotonic();task=asyncio.create_task(client.post('https://api-seller.ozon.ru/v2/warehouse/list',json={}))
+            await asyncio.sleep(.02);assert time.monotonic()-started<.15
+            assert not requests
+            assert (await task).status_code==200
+    finally:timer.join();blocker.close()

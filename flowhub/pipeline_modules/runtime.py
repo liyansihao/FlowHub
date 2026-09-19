@@ -14,12 +14,13 @@ async def publication_tick(db, name, index, tick):
 
 
 async def run(db, *, review_workers=2, submit_workers=2, reconcile_workers=2, seed_workers=1):
+    from .database_work import run as database_work
     from ..plugin_pipeline import tick
     from ..comparebot_process import close_workers
     if not all(1 <= n <= 4 for n in (review_workers, submit_workers, reconcile_workers)):
         raise ValueError('each lane requires 1..4 workers')
     if seed_workers not in (1,2):raise ValueError('seed workers must be 1 or a guarded trial of 2')
-    control.schema(db)
+    await database_work(control.schema,db)
     from . import repair_workflow
     repair_policy=repair_workflow.config(db)
     from ..acquisition import routing_active
@@ -33,7 +34,7 @@ async def run(db, *, review_workers=2, submit_workers=2, reconcile_workers=2, se
                 if index>=extra_review_workers(db.directory):
                     await asyncio.sleep(5)
                     continue
-            if control.paused(db, module):
+            if await database_work(control.paused,db, module):
                 await asyncio.sleep(.5)
                 continue
             if name=='seed_repair' and index>0:
@@ -56,7 +57,7 @@ async def run(db, *, review_workers=2, submit_workers=2, reconcile_workers=2, se
                 else:
                     worked = await tick(db, lane='review' if name=='remote_review' else name)
             except Exception:
-                db.health('pipeline-' + name + '-error')
+                await database_work(db.health,'pipeline-' + name + '-error')
                 worked = False
             await asyncio.sleep(60 if name=='reconcile_history' and worked else 5 if name=='reconcile_history' else .05 if worked else .5)
 

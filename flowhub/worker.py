@@ -460,8 +460,9 @@ class Worker:
         save_runtime(self.db.directory, RUNTIME_IDENTITY)
 
         async def heartbeat():
+            from .pipeline_modules.database_work import run as database_work
             while True:
-                self.db.health("worker")
+                await database_work(self.db.health,"worker")
                 save_runtime(self.db.directory, RUNTIME_IDENTITY)
                 await asyncio.sleep(5)
 

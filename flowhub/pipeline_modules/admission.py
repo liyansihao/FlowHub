@@ -175,7 +175,8 @@ def renew_campaign(c, owner, policy, now):
 
 async def run(db):
     import asyncio
-    schema(db)
+    from .database_work import run as database_work
+    await database_work(schema,db)
     while True:
         with db.connect() as c:owners=[r[0] for r in c.execute('SELECT owner FROM pipeline_campaigns WHERE enabled=1')]
         for owner in owners:
@@ -184,5 +185,5 @@ async def run(db):
                 result=await asyncio.to_thread(admit_one,db,owner)
             except Exception as error:
                 result={'state':'error','reason':type(error).__name__}
-            control.record(db,'seed',owner,'',started,result['state'],result)
+            await database_work(control.record,db,'seed',owner,'',started,result['state'],result)
         await asyncio.sleep(5)

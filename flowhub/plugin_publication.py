@@ -172,7 +172,8 @@ async def _advance(db, owner, sku, seller, *, native_follow=False):
     from .pipeline_modules.request_bridge import PublicationBridge, MeasuredTransport
     bridge=PublicationBridge(ROOT,execute=True,token=keys['erp_token'])
     from .cluster_routing import route_bridge
-    route_bridge(bridge, DATA, (owner, sku, seller))
+    from .pipeline_modules.database_work import run as database_work
+    await database_work(route_bridge,bridge, DATA, (owner, sku, seller))
     def save():
         with db.connect() as c:c.execute('INSERT OR REPLACE INTO plugin_publications VALUES(?,?,?,?,?)',(owner,sku,seller,json.dumps(record),time.time()))
     from .pipeline_modules.transport import StepTransport

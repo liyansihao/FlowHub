@@ -1,0 +1,10 @@
+# Publication scheduler repair
+
+The user's ordered repair is: safely reclaim parked Windows ERP slots, remove blocking database units from the event loop, then evaluate a bounded pacing trial.
+
+- A parked `same_product_confirmed`, `not_listed`, `quarantined` or `delisted` product can release its transport assignment only after its pipeline lease ends and all associated ERP commands settle. Running commands and unknown write outcomes keep the original assignment. This never requeues the parked product or changes its offer, review or publication journal.
+- Queue claiming, lease renewal, final persistence, remote transport routing and Ozon API reservation/accounting run complete SQLite units in background threads. Cancellation drains a transaction before returning; a cancelled claim explicitly releases its own token. Existing fences, priorities, final verified criteria and remote backoff remain unchanged.
+- A `(state,due)` queue index and a `(device,created)` ERP command index support the affected lookups. Runtime module checks and worker heartbeat DB writes also leave the event loop.
+- Tests hold an actual SQLite writer lock while asserting other coroutines continue, compete for a single task and cancel an in-flight claim. Remote-slot tests cover parked states, active leases, live requests, unknown writes and acknowledged responses. Existing publication and official API regressions remain required.
+
+Other synchronous DB work remains; this patch does not claim every blocking site has been removed. Runtime observations determine whether a pacing trial is appropriate. The existing global 2500ms policy is unchanged by this code; any 2000ms trial must have an expiry, failure/429 baseline, automatic rollback and a recorded result. Never retry an unknown publication to manufacture throughput.
