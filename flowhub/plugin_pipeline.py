@@ -19,6 +19,7 @@ def schema(db):
     with db.connect() as c:
         c.execute('CREATE TABLE IF NOT EXISTS plugin_pipeline(owner TEXT,sku TEXT,seller TEXT,state TEXT,body TEXT,due REAL,attempts INTEGER DEFAULT 0,PRIMARY KEY(owner,sku,seller))')
         c.execute('CREATE INDEX IF NOT EXISTS plugin_pipeline_state_due ON plugin_pipeline(state,due)')
+        c.execute('CREATE INDEX IF NOT EXISTS plugin_pipeline_owner_state_due ON plugin_pipeline(owner,state,due)')
         c.execute('CREATE TABLE IF NOT EXISTS plugin_pipeline_leases(owner TEXT,sku TEXT,seller TEXT,token TEXT,expires REAL,PRIMARY KEY(owner,sku,seller))')
 
 
@@ -251,14 +252,9 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
                     delay=min(21600,3600*2**min(max(0,unchanged-1),3))
             elif result['phase'] in ('failed','manual_review'):state='needs_review'
             if state not in ('awaiting_remote','needs_fields'):
-                with db.connect() as c:
-                    campaign=c.execute('SELECT body FROM pipeline_campaigns WHERE owner=? AND enabled=1',(key[0],)).fetchone() if c.execute("SELECT 1 FROM sqlite_master WHERE name='pipeline_campaigns'").fetchone() else None
-                policy=json.loads(campaign[0]) if campaign else {}
-                priority=policy.get('submission_priority',False) and body.get('campaign_run_id')==policy.get('run_id')
-                from .pipeline_modules.throughput_policy import readback_policy
-                with db.connect() as c:
-                    body['readback_policy']=readback_policy(c,key[0],priority,time.time())
-                delay=readback_delay(body,result['phase'],bool(result.get('verified')),body['readback_policy']['submission_priority'],native_follow=follow_selected(db,key))
+                policy,native_follow=await database_work(publication_readback_policy,db,key,body.get('campaign_run_id'))
+                body['readback_policy']=policy
+                delay=readback_delay(body,result['phase'],bool(result.get('verified')),policy['submission_priority'],native_follow=native_follow)
         body.pop('dependency_wait',None)
         if state!='needs_fields':body.pop('error',None)
     except OfficialDeferred as error:
@@ -281,6 +277,17 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
         await asyncio.gather(heartbeat,return_exceptions=True)
     return await database_work(finish,db,row,key,token,state,body,attempts,delay,lane,started,
                                lock_wait,dependency_wait,repair_progress)
+
+
+def publication_readback_policy(db,key,campaign_run_id):
+    from .pipeline_modules.throughput_policy import readback_policy
+    from .follow_publication import selected
+    with db.connect() as c:
+        campaign=c.execute('SELECT body FROM pipeline_campaigns WHERE owner=? AND enabled=1',(key[0],)).fetchone() if c.execute("SELECT 1 FROM sqlite_master WHERE name='pipeline_campaigns'").fetchone() else None
+        policy=json.loads(campaign[0]) if campaign else {}
+        priority=policy.get('submission_priority',False) and campaign_run_id==policy.get('run_id')
+        result=readback_policy(c,key[0],priority,time.time())
+    return result,selected(db,key)
 
 
 def finish(db,row,key,token,state,body,attempts,delay,lane,started,lock_wait,dependency_wait,repair_progress):
