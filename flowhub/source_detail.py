@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+from .pipeline_modules.database_work import run as database_work
 from pathlib import Path
 
 from .modules import ModuleError, Pending
@@ -142,7 +143,7 @@ class SourceCollector:
             total_seen = 0
             for page in range(1, 101):
                 if claimed:
-                    self.renew_claim()
+                    await database_work(self.renew_claim)
                 response = await self.call(
                     "/api.product.favorite/lists",
                     query={"sku": self.sku, "is_imported": imported, "page": page, "page_size": 100},
@@ -219,7 +220,7 @@ class SourceCollector:
         detail=await self.call('/api.product.collect/detail',query={'id':draft_id,'is_online':0})
         data=data|{'source_key':self.sku,'draft_id':draft_id,'detail':detail,'observed_at':time.time(),
                    'recovery':{'source':'exact-ozon-draft-list','at':time.time()}}
-        self.save('ready',data)
+        await database_work(self.save,'ready',data)
         from .collection_capacity import finish
         finish(self)
         return data
@@ -265,7 +266,7 @@ class SourceCollector:
             data.pop("mapping", None)
             data.pop("mapping_client", None)
             data |= {"detail": detail, "observed_at": time.time()}
-            self.save("ready", data)
+            await database_work(self.save,"ready", data)
             return data
         if not inserted and state=="draft_started" and time.time()-updated>120:
             return await self.recover_draft(data)
@@ -287,7 +288,7 @@ class SourceCollector:
         self.claim_updated = self.load()[2]
         try:
             favorite = await self.find_favorite(claimed=True)
-            self.renew_claim()
+            await database_work(self.renew_claim)
         except BaseException:
             if data.get("favorite_attempted"):
                 with self.db.connect() as db:
@@ -305,14 +306,14 @@ class SourceCollector:
             raise
         if favorite is None:
             if data.get("favorite_attempted"):
-                self.save("favorite_started", data)
+                await database_work(self.save,"favorite_started", data)
                 raise Pending("favorite creation not confirmed; lookup again later")
             if self.c.get("existing_favorite_only"):
-                self.save("claimed", data)
+                await database_work(self.save,"claimed", data)
                 raise Pending("source favorite missing; a real price is required before creating one")
             from .collection_capacity import guard
             await guard(self)
-            self.save("favorite_started", {"source_key": self.sku, "favorite_attempted": True})
+            await database_work(self.save,"favorite_started", {"source_key": self.sku, "favorite_attempted": True})
             p = self.c["candidate"]
             try:
                 await self.call(
@@ -334,13 +335,13 @@ class SourceCollector:
                         and diagnostic.get('operation')=='/api.product.favorite/toggle'
                         and diagnostic.get('write_outcome_unknown') is False
                         and '收藏数量已达上限' in str(diagnostic.get('api_message',''))):
-                    self.save('favorite_rejected',{'source_key':self.sku,'last_rejection':diagnostic})
+                    await database_work(self.save,'favorite_rejected',{'source_key':self.sku,'last_rejection':diagnostic})
                 raise
             # Keep the unknown marker while renewing the lease for a long lookup.
-            self.save("claimed", {"source_key": self.sku, "favorite_attempted": True})
+            await database_work(self.save,"claimed", {"source_key": self.sku, "favorite_attempted": True})
             self.claim_updated = self.load()[2]
             favorite = await self.find_favorite(claimed=True)
-            self.renew_claim()
+            await database_work(self.renew_claim)
         if favorite is None:
             raise Pending("favorite creation not confirmed; lookup again later")
         replacement=data.get('replaces_deleted_draft_id')
@@ -350,11 +351,11 @@ class SourceCollector:
             recovered=await self.recover_draft(data,allow_missing=True)
             if recovered:return recovered
         if str(favorite.get("is_imported")) == "1" and not replacement:
-            self.save("draft_started", data)
+            await database_work(self.save,"draft_started", data)
             return await self.recover_draft(data)
         from .collection_capacity import guard, finish
         await guard(self, reserve=True)
-        self.save("draft_started", data)
+        await database_work(self.save,"draft_started", data)
         try:
             draft = await self.call("/api.product.favorite/edit_import", "POST", body={"id": data["favorite_id"]})
         except SourceAcquisitionFailure as error:
@@ -363,18 +364,18 @@ class SourceCollector:
             if (diagnostic.get('api_code')==0 and diagnostic.get('operation')=='/api.product.favorite/edit_import'
                     and '采集箱已满' in str(diagnostic.get('api_message',''))):
                 data['last_rejection']=diagnostic
-                self.save('draft_rejected',data)
+                await database_work(self.save,'draft_rejected',data)
                 finish(self, rejected=True)
             raise
         draft_id = int(draft.get("jump_id") or draft.get("id") or 0)
         if draft_id <= 0:
             raise ModuleError("source draft acknowledgement missing")
         data["draft_id"] = draft_id
-        self.save("draft_ready", data)
+        await database_work(self.save,"draft_ready", data)
         finish(self)
         detail = await self.call("/api.product.collect/detail", query={"id": draft_id, "is_online": 0})
         data |= {"detail": detail, "observed_at": time.time()}
-        self.save("ready", data)
+        await database_work(self.save,"ready", data)
         return data
 
 
