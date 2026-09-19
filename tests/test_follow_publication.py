@@ -168,3 +168,13 @@ def test_existing_legacy_intent_is_never_adopted_by_follow_policy(native):
     body={'official_dossier_pending':True}
     assert not follow.release_repair(db,(owner,'123','456'),body)
     assert body=={'official_dossier_pending':True}
+
+
+def test_follow_readback_is_short_without_changing_historical_scheduling():
+    assert pipeline.readback_delay({},'reconciling',submission_priority=True)==180
+    body={}
+    assert pipeline.readback_delay(body,'reconciling',submission_priority=True,native_follow=True)==15
+    assert pipeline.readback_delay(body,'reconciling',native_follow=True)==30
+    assert pipeline.readback_delay(body,'reconciling',native_follow=True)==60
+    assert pipeline.readback_delay(body,'reconciling',native_follow=True)==60
+    assert pipeline.readback_delay(body,'stock_verified',verified=True,native_follow=True)==0

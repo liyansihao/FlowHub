@@ -35,7 +35,7 @@ def enqueue(db, owner, sku, seller):
 RECONCILE = ('submitting','reconciling','sync_pending','stock_ready','stock_pending','stock_verified','favorite_pending','manual_review')
 
 
-def readback_delay(body, phase, verified=False, submission_priority=False):
+def readback_delay(body, phase, verified=False, submission_priority=False, *, native_follow=False):
     """Persisted phase-based polling: useful writes stay immediate, remote waits back off."""
     if verified:
         body.pop('readback_schedule',None)
@@ -46,6 +46,7 @@ def readback_delay(body, phase, verified=False, submission_priority=False):
     previous=body.get('readback_schedule') or {}
     repeat=previous.get('repeat',0)+1 if previous.get('phase')==phase else 0
     base,cap=(60,600) if phase=='favorite_pending' else (20,120) if phase=='stock_pending' else ((180,900) if submission_priority else (60,240))
+    if native_follow:base,cap=15,60
     delay=min(cap,base*2**min(repeat,4))
     body['readback_schedule']={'phase':phase,'repeat':repeat,'delay_seconds':delay,
                                'first_wait_at':previous.get('first_wait_at',time.time())}
@@ -243,7 +244,7 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
                 from .pipeline_modules.throughput_policy import readback_policy
                 with db.connect() as c:
                     body['readback_policy']=readback_policy(c,key[0],priority,time.time())
-                delay=readback_delay(body,result['phase'],bool(result.get('verified')),body['readback_policy']['submission_priority'])
+                delay=readback_delay(body,result['phase'],bool(result.get('verified')),body['readback_policy']['submission_priority'],native_follow=follow_selected(db,key))
         body.pop('dependency_wait',None)
         if state!='needs_fields':body.pop('error',None)
     except OfficialDeferred as error:
