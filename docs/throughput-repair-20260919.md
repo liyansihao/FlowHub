@@ -36,3 +36,11 @@ Cancellation drains claims and releases only the matching lease. Project only
 required publication identity/product fields for source enrollment and finish
 its read cursor before seed inserts, avoiding read-to-write cursor contention
 and loading large historical request logs into the enrollment pass.
+
+Root write-lock amplification: `other_sellers.prepare_samples` updates a state row
+before its correlated source/store existence query. With 38,590 seller references
+and 24,414 scan rows, the old `(owner,run_id,seller)` key only resolved `owner`.
+On an isolated copy of real key columns, the unchanged query took 13.628 seconds
+and returned zero candidates. Adding `browser_source_scans(owner,seller)` reduced
+it to 0.0108 seconds with identical candidates. This removes repeated full-owner
+scans while holding the writer; it does not change eligibility or source choice.
