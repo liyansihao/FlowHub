@@ -31,7 +31,7 @@ async def run(db, *, review_workers=2, submit_workers=2, reconcile_workers=2, se
         while True:
             if name=='remote_review':
                 from ..cluster_compute import extra_review_workers
-                if index>=extra_review_workers(db.directory):
+                if index>=await database_work(extra_review_workers,db.directory):
                     await asyncio.sleep(5)
                     continue
             if await database_work(control.paused,db, module):
@@ -39,7 +39,7 @@ async def run(db, *, review_workers=2, submit_workers=2, reconcile_workers=2, se
                 continue
             if name=='seed_repair' and index>0:
                 from .repair_queue import can_expand
-                if not can_expand(db):
+                if not await database_work(can_expand,db):
                     await asyncio.sleep(5)
                     continue
             try:
