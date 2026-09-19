@@ -11,6 +11,7 @@ from pathlib import Path
 from ..browser_source import BrowserSource
 from ..source_acquisition import erp_request
 from . import control
+from .database_work import run as database_work
 
 
 def schema(db):
@@ -170,36 +171,41 @@ async def collect(db,task,config):
             process.terminate()
             try:await asyncio.wait_for(process.wait(),15)
             except asyncio.TimeoutError:process.kill();await process.wait()
-    return finish(db,task)
+    return await database_work(finish,db,task)
+
+
+def backlog_state(db,owner):
+    with db.connect() as c:
+        last=c.execute('SELECT MAX(updated) FROM source_seed_resolutions WHERE owner=?',(owner,)).fetchone()[0] or 0
+        backlog=c.execute('''SELECT COUNT(DISTINCT p.sku) FROM sourcing_products p WHERE p.owner=?
+          AND json_extract(p.body,'$.coverage') IN ('storefront-page','maozi-exact-seller-page')
+          AND NOT EXISTS(SELECT 1 FROM pipeline_admissions a WHERE a.owner=p.owner AND a.sku=p.sku)
+          AND NOT EXISTS(SELECT 1 FROM plugin_pipeline q WHERE q.owner=p.owner AND q.sku=p.sku)
+          AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.owner=p.owner AND j.source_key=p.sku)
+          AND NOT EXISTS(SELECT 1 FROM blocks b WHERE b.owner=p.owner AND b.source_key=p.sku)''',(owner,)).fetchone()[0]
+    return last,backlog
 
 
 async def tick(db,config):
-    schema(db)
-    if not config.get('enabled') or control.paused(db,'seed'):return {'state':'paused'}
+    await database_work(schema,db)
+    if not config.get('enabled') or await database_work(control.paused,db,'seed'):return {'state':'paused'}
     owner=config['owner'];now=time.time()
     # One worker per database/profile. OS releases the lock after a crash.
     with (db.directory/'source-loop.lock').open('a') as lock:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:return {'state':'busy'}
-        enrolled=sync_stores(db,owner,config['run_id'])
-        with db.connect() as c:
-            last=c.execute('SELECT MAX(updated) FROM source_seed_resolutions WHERE owner=?',(owner,)).fetchone()[0] or 0
-            backlog=c.execute('''SELECT COUNT(DISTINCT p.sku) FROM sourcing_products p WHERE p.owner=?
-              AND json_extract(p.body,'$.coverage') IN ('storefront-page','maozi-exact-seller-page')
-              AND NOT EXISTS(SELECT 1 FROM pipeline_admissions a WHERE a.owner=p.owner AND a.sku=p.sku)
-              AND NOT EXISTS(SELECT 1 FROM plugin_pipeline q WHERE q.owner=p.owner AND q.sku=p.sku)
-              AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.owner=p.owner AND j.source_key=p.sku)
-              AND NOT EXISTS(SELECT 1 FROM blocks b WHERE b.owner=p.owner AND b.source_key=p.sku)''',(owner,)).fetchone()[0]
+        enrolled=await database_work(sync_stores,db,owner,config['run_id'])
+        last,backlog=await database_work(backlog_state,db,owner)
         if now-last>=config.get('resolve_interval_seconds',120):
             result=await resolve_one(db,owner)
-            control.record(db,'seed',owner,result.get('sku',''),now,result['state'],result)
-            sync_stores(db,owner,config['run_id'])
-        if control.paused(db,'seed'):return {'state':'paused'}
+            await database_work(control.record,db,'seed',owner,result.get('sku',''),now,result['state'],result)
+            await database_work(sync_stores,db,owner,config['run_id'])
+        if await database_work(control.paused,db,'seed'):return {'state':'paused'}
         if config.get('other_sellers_enabled'):
             from .. import other_sellers
-            other_sellers.schema(db)
-            other_sellers.prepare_samples(db,owner)
-            other_sellers.promote_qualified(db,owner)
+            await database_work(other_sellers.schema,db)
+            await database_work(other_sellers.prepare_samples,db,owner)
+            await database_work(other_sellers.promote_qualified,db,owner)
             with db.connect() as c:
                 due=c.execute('SELECT due FROM source_discovery_clock WHERE owner=?',(owner,)).fetchone()
                 discovery_due=not due or now>=due[0]
@@ -207,15 +213,15 @@ async def tick(db,config):
                     c.execute('INSERT OR REPLACE INTO source_discovery_clock VALUES(?,?)',
                         (owner,now+config.get('discovery_interval_seconds',120)))
             if discovery_due:
-                other_sellers.replenish(db,owner,explore_pending=config.get('explore_pending_sources',False))
+                await database_work(other_sellers.replenish,db,owner,explore_pending=config.get('explore_pending_sources',False))
                 result=await other_sellers.discover_one(db,owner,config)
-                control.record(db,'seed',owner,result.get('sku',''),now,'other_sellers',result)
-                other_sellers.prepare_samples(db,owner)
+                await database_work(control.record,db,'seed',owner,result.get('sku',''),now,'other_sellers',result)
+                await database_work(other_sellers.prepare_samples,db,owner)
             if discovery_due and backlog<config.get('max_source_backlog',2000):
                 result=await other_sellers.sample_one(db,owner,config)
                 if result['state']!='no_due_sample':return result
         if backlog>=config.get('max_source_backlog',2000):return {'state':'source_backpressure','backlog':backlog}
-        task=choose(db,owner)
+        task=await database_work(choose,db,owner)
         result=await collect(db,task,config) if task else {'state':'no_due_store'}
         return result|{'enrolled':enrolled,'backlog':backlog}
 
@@ -228,10 +234,10 @@ async def run(db):
             if config_path.exists():
                 config=json.loads(config_path.read_text())
                 result=await tick(db,config)
-                control.record(db,'seed',config.get('owner',''),'',started,result['state'],result)
+                await database_work(control.record,db,'seed',config.get('owner',''),'',started,result['state'],result)
         except Exception as error:
-            control.schema(db)
-            control.record(db,'seed',config.get('owner',''),'',started,'source_loop_error',{'reason':type(error).__name__})
+            await database_work(control.schema,db)
+            await database_work(control.record,db,'seed',config.get('owner',''),'',started,'source_loop_error',{'reason':type(error).__name__})
         await asyncio.sleep(5)
 
 

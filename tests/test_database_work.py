@@ -128,3 +128,21 @@ async def test_remote_snapshot_does_not_stall_loop_and_drains_before_sync_unlock
         release.set()
         with pytest.raises(asyncio.CancelledError):await task
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+
+
+@pytest.mark.asyncio
+async def test_source_scan_keeps_loop_responsive_and_lock_until_drained(tmp_path,monkeypatch):
+    import fcntl
+    from flowhub.pipeline_modules import source_loop
+    db=Database(tmp_path);entered=threading.Event();release=threading.Event()
+    def slow_sync(*args):
+        entered.set();assert release.wait(3);return 0
+    monkeypatch.setattr(source_loop,'sync_stores',slow_sync)
+    task=asyncio.create_task(source_loop.tick(db,{'enabled':True,'owner':'test','run_id':'test'}))
+    assert await asyncio.to_thread(entered.wait,2)
+    task.cancel();await asyncio.sleep(.02);assert not task.done()
+    with (db.directory/'source-loop.lock').open('a') as lock:
+        with pytest.raises(BlockingIOError):fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):await task
+        fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)

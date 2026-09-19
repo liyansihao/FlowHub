@@ -19,3 +19,11 @@ or heartbeat now defer instead of terminating the worker and interrupting other
 operations; other database errors continue to surface. Regression covers lock
 competition, preservation of the review-sync lock during cancellation, and
 non-lock error propagation.
+
+The shared source loop also synchronously reads all verified publication bodies
+and source backlog on every cycle. Read-only measurements found 3,018 publication
+records / 199,587,211 JSON bytes in 2.883 seconds, plus backlog evaluation in
+3.008 seconds. Move full store synchronization, backlog calculation, synchronous
+other-seller discovery preparation, selection, and event recording off-loop.
+Keep existing per-source file locks held until cancellation-drained work finishes;
+leave all source selection rules and publication authorization unchanged.
