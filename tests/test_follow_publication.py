@@ -17,6 +17,25 @@ def enable(db):
     (db.directory/'publication-policy.json').write_text(json.dumps({'backend':follow.BACKEND}))
 
 
+def test_follow_policy_makes_full_dossier_optional_by_default(tmp_path):
+    from flowhub.db import Database
+    db=Database(tmp_path)
+    assert follow.dossier_mode(db)=='required'
+    enable(db)
+    assert follow.dossier_mode(db)=='optional'
+    assert not follow.full_dossier_required(db,('owner','sku','seller'))
+    (db.directory/'publication-policy.json').write_text(json.dumps({'backend':follow.BACKEND,'dossier_mode':'required'}))
+    assert follow.full_dossier_required(db,('owner','sku','seller'))
+
+
+def test_follow_policy_rejects_unknown_dossier_mode(tmp_path):
+    from flowhub.db import Database
+    db=Database(tmp_path)
+    (db.directory/'publication-policy.json').write_text(json.dumps({'backend':follow.BACKEND,'dossier_mode':'sometimes'}))
+    with pytest.raises(ValueError,match='invalid_dossier_mode'):
+        follow.dossier_mode(db)
+
+
 @pytest.fixture
 def native(flow, monkeypatch):
     db, owner, platform, review = flow
@@ -150,6 +169,21 @@ async def test_approval_skips_both_new_and_old_dossier_gates(native,monkeypatch)
     with db.connect() as c:c.execute("UPDATE plugin_pipeline SET state='queued'")
     assert await pipeline.tick(db,lane='review')
     with db.connect() as c:assert c.execute('SELECT state FROM plugin_pipeline').fetchone()[0]=='publishing'
+
+
+async def test_follow_can_opt_into_full_dossier_gate(native,monkeypatch):
+    db,owner,_,review,_=native
+    (db.directory/'acquisition-policy.json').write_text('{"enabled":true}')
+    (db.directory/'publication-policy.json').write_text(json.dumps({'backend':follow.BACKEND,'dossier_mode':'required'}))
+    review['candidate']['origin']['weight_first_valuation']=True
+    monkeypatch.setattr(pipeline,'evaluate',AsyncMock(return_value=review))
+    with db.connect() as c:c.execute("UPDATE plugin_pipeline SET state='queued'")
+    assert await pipeline.tick(db,lane='review')
+    with db.connect() as c:
+        row=c.execute('SELECT state,body FROM plugin_pipeline').fetchone()
+        body=json.loads(row['body'])
+    assert row['state']=='needs_fields'
+    assert body['official_dossier_pending']
 
 
 @pytest.mark.parametrize('change',['profit','review','restriction','expired'])

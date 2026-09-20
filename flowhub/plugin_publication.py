@@ -114,6 +114,7 @@ async def advance(db, owner, sku, seller):
 
 
 async def _advance(db, owner, sku, seller, *, native_follow=False):
+    from .follow_publication import full_dossier_required
     with db.connect() as c:
         c.execute('CREATE TABLE IF NOT EXISTS plugin_publications(owner TEXT,sku TEXT,seller TEXT,body TEXT,updated REAL,PRIMARY KEY(owner,sku,seller))')
         prior=c.execute('SELECT body FROM plugin_publications WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()
@@ -132,6 +133,7 @@ async def _advance(db, owner, sku, seller, *, native_follow=False):
         c.execute('CREATE TABLE IF NOT EXISTS plugin_publication_permissions(owner TEXT,sku TEXT,seller TEXT,expires REAL,reason TEXT,PRIMARY KEY(owner,sku,seller))')
         permission=c.execute('SELECT * FROM plugin_publication_permissions WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()
         allow_unknown=bool(permission and time.time()<permission['expires'] and route and time.time()<route['expires'])
+        require_full_dossier = native_follow and full_dossier_required(db,(owner,sku,seller))
         if record and fingerprint(json.loads(row[0]))!=fingerprint(review):
             phase=TestListingJournal(DATA/'plugin-production.sqlite3').read(record['offer_id'])['phase']
             if phase in ('prepared','ready','favorite_pending','reconciling','sync_pending','stock_ready','stock_pending') or (phase=='manual_review' and TestListingJournal(DATA/'plugin-production.sqlite3').read(record['offer_id'])['details'].get('reason') in ('reconciliation_timeout','platform_issue_requires_review')):
@@ -222,7 +224,7 @@ async def _advance(db, owner, sku, seller, *, native_follow=False):
                 from .follow_publication import local_inputs, legacy_source_hold
                 hold=legacy_source_hold(db,owner,sku,keys['erp_token'])
                 if hold:raise ValueError(hold)
-                snapshot=local_inputs(review)
+                snapshot=reviewed_snapshot(review) if require_full_dossier else local_inputs(review)
             else:snapshot=reviewed_snapshot(review)
             if snapshot is None and review.get('website_listing_authorization'):
                 original=review['candidate'];physical=original['origin'].get('plugin_detail') or {}

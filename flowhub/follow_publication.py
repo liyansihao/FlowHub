@@ -9,6 +9,7 @@ import math
 import time
 
 BACKEND = 'maozi_follow'
+DOSSIER_MODES = ('optional', 'required')
 
 
 def enabled(db):
@@ -19,6 +20,35 @@ def enabled(db):
     if policy.get('backend') not in (BACKEND, 'existing'):
         raise ValueError('invalid_publication_policy')
     return policy['backend'] == BACKEND
+
+
+def dossier_mode(db):
+    """Return whether the full product dossier is required for new follow jobs.
+
+    Native ERP follow imports only need the reviewed identity and package facts.
+    Keep the complete dossier available as an explicit opt-in for operators that
+    want the stricter legacy gate, without changing historical publications.
+    """
+    path = db.directory / 'publication-policy.json'
+    if not path.exists():
+        return 'required'
+    policy = json.loads(path.read_text())
+    mode = policy.get('dossier_mode')
+    if mode is None:
+        return 'optional' if policy.get('backend') == BACKEND else 'required'
+    if mode not in DOSSIER_MODES:
+        raise ValueError('invalid_dossier_mode')
+    return mode
+
+
+def full_dossier_required(db, key=None):
+    """Whether a new publication must pass the complete dossier gate.
+
+    ``key`` is accepted so callers can keep a stable policy-call shape while
+    historical records remain routed by their existing backend and intent.
+    """
+    del key
+    return dossier_mode(db) == 'required'
 
 
 def selected(db, key):

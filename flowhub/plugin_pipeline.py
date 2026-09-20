@@ -139,7 +139,12 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
     started=time.time()
     state=row['state'];body=json.loads(row['body']);attempts=row['attempts'];delay=0;lock_wait=False;dependency_wait=False;repair_progress=False
     try:
-        from .follow_publication import release_repair, selected as follow_selected, clear_dossier
+        from .follow_publication import (
+            release_repair,
+            selected as follow_selected,
+            clear_dossier,
+            full_dossier_required as follow_full_dossier_required,
+        )
         if state=='needs_fields' and release_repair(db,key,body):
             state='queued'
         elif state=='needs_fields':
@@ -207,8 +212,9 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
                 state='publishing'
                 from .acquisition import enabled as acquisition_enabled
                 native_follow=follow_selected(db,key)
-                if native_follow:clear_dossier(body)
-                if not native_follow and acquisition_enabled(db,key[1]):
+                full_dossier = native_follow and follow_full_dossier_required(db,key)
+                if native_follow and not full_dossier:clear_dossier(body)
+                if (not native_follow or full_dossier) and acquisition_enabled(db,key[1]):
                     with db.connect() as c:
                         exists=c.execute("SELECT 1 FROM sqlite_master WHERE name='plugin_publications'").fetchone()
                         existing=exists and c.execute('SELECT 1 FROM plugin_publications WHERE owner=? AND sku=? AND seller=?',key).fetchone()
@@ -216,7 +222,7 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
                         state='needs_fields'
                         body.update(repair_full_dossier=True,official_dossier_pending=True,reason='publication_dossier_gate')
                 origin=(report.get('candidate') or {}).get('origin') or {}
-                if not native_follow and origin.get('weight_first_valuation'):
+                if (not native_follow or full_dossier) and origin.get('weight_first_valuation'):
                     from .pipeline_modules.repair import missing_fields
                     pending=missing_fields(origin)
                     if pending:

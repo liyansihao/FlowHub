@@ -14,7 +14,7 @@
 
 ## 唯一切换入口
 
-主数据目录 publication-policy.json 的 backend=maozi_follow 选择新商品的跟卖发布路径。店铺配置不改，已有记录优先按自身 backend 路由：official仍走官方回查，旧无backend记录仍走原ERP账本，maozi_follow始终走本次跟卖路径。未部署或backend=existing沿用原新任务选择策略。
+主数据目录 publication-policy.json 的 backend=maozi_follow 选择新商品的跟卖发布路径。店铺配置不改，已有记录优先按自身 backend 路由：official仍走官方回查，旧无backend记录仍走原ERP账本，maozi_follow始终走本次跟卖路径。`dossier_mode` 默认为 `optional`：跟卖新商品只校验审核结果中的标题、图片、重量、尺寸和价格事实，不要求完整官方商品档案；设置为 `required` 才启用完整资料补全门禁。未部署或backend=existing沿用原新任务选择策略。
 
 新路径复用已审批利润输入，不创建ERP草稿、不运行采集状态机、不映射官方属性、不校验dossier证书、不调用/v3/product/import。队列审核成功后直接进入发布；仅因上架完整资料滞留且尚无发布意图的needs_fields任务回到原审核入口，原补资料状态存入publication_migrations。基础估价资料、同款识别和利润判断不修改，人工审核/隔离/拒绝任务不自动恢复。
 
