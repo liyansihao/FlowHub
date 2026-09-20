@@ -6,6 +6,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {sourceNetworkArgs} from './source-network.mjs';
 import {settleSourcePage} from './source-page.mjs';
+import {sourceBrowserOptions} from './source-browser.mjs';
 const exec=promisify(execFile);
 const root=path.resolve(import.meta.dirname,'..');
 const [owner,runId,seller,maxPagesArg='3']=process.argv.slice(2);
@@ -19,11 +20,9 @@ async function api(action,args=[]){
  const {stdout}=await exec(path.join(root,'.venv/bin/python'),['-m','flowhub.browser_source',action,'--owner',owner,'--run-id',runId,'--seller',seller,...args],{cwd:root,maxBuffer:2_000_000});
  return JSON.parse(stdout);
 }
-const context=await chromium.launchPersistentContext(path.resolve(profile),{
- channel:'chrome',headless:false,viewport:null,
- args:['--no-first-run','--no-default-browser-check',...sourceNetworkArgs()],
- ignoreDefaultArgs:['--disable-extensions'],
-});
+const browserOptions=sourceBrowserOptions(process.env);
+browserOptions.args.push(...sourceNetworkArgs());
+const context=await chromium.launchPersistentContext(browserOptions.profile,browserOptions);
 const page=await context.newPage();
 let stopped=false;
 process.once('SIGTERM',()=>{stopped=true;void context.close().catch(()=>{});});

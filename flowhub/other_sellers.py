@@ -134,7 +134,11 @@ async def discover_one(db,owner,config,now=None):
     try:
         process=await asyncio.create_subprocess_exec('node',str(root/'bridges/other-sellers.mjs'),seed['sku'],
             str(root/'output/playwright/other-seller-expansion'),str(min(40,8*(seed['attempts']+1))),
-            cwd=root,env=os.environ|{'FLOWHUB_SOURCE_PROFILE':config['profile']},
+            cwd=root,env=os.environ|{
+                'FLOWHUB_SOURCE_PROFILE':config['profile'],
+                **({'FLOWHUB_SOURCE_EXTENSION_DIR':str(config['extension_dir'])} if config.get('extension_dir') else {}),
+                **({'FLOWHUB_SOURCE_CHROMIUM_EXECUTABLE':str(config['chromium_executable'])} if config.get('chromium_executable') else {}),
+            },
             stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
         output,error=await asyncio.wait_for(process.communicate(),120)
         if process.returncode:

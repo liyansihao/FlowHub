@@ -157,8 +157,11 @@ async def collect(db,task,config):
         with db.connect() as c:c.execute('UPDATE source_loop_stores SET run_id=? WHERE owner=? AND seller=?',(run_id,task['owner'],task['seller']))
         task=dict(task)|{'run_id':run_id};key=(task['owner'],run_id,task['seller'])
     root=Path(__file__).resolve().parents[2]
+    browser_env={'FLOWHUB_SOURCE_PROFILE':config['profile'],'FLOWHUB_DATA':str(db.directory.resolve())}
+    if config.get('extension_dir'):browser_env['FLOWHUB_SOURCE_EXTENSION_DIR']=str(config['extension_dir'])
+    if config.get('chromium_executable'):browser_env['FLOWHUB_SOURCE_CHROMIUM_EXECUTABLE']=str(config['chromium_executable'])
     process=await asyncio.create_subprocess_exec('node',str(root/'bridges/playwright-source.mjs'),*key,str(config.get('pages_per_store',3)),
-        cwd=root,env=os.environ|{'FLOWHUB_SOURCE_PROFILE':config['profile'],'FLOWHUB_DATA':str(db.directory.resolve())},
+        cwd=root,env=os.environ|browser_env,
         stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
     try:
         await asyncio.wait_for(process.communicate(),240)
