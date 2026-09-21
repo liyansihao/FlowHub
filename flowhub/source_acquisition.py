@@ -245,8 +245,8 @@ class SourceAcquirer:
                 )
                 else "network"
             )
-            self.library.fail(
-                task,
+            await database_work(
+                self.library.fail, task,
                 kind,
                 now,
                 diagnostic=getattr(error, "diagnostic", {}) | {"exception": type(error).__name__},
@@ -304,7 +304,10 @@ class SourceAcquirer:
         rows, last = page_data(data, task["page"], 100)
         if any(str(r.get("shop_id")) != shop for r in rows):
             raise AcquisitionError("identity_mismatch")
-        # Commit the observed identities and cursor in one transaction.
+        return await database_work(self._commit_own_shop, task, rows, last, now, shop)
+
+    def _commit_own_shop(self, task, rows, last, now, shop):
+        # Keep the complete transaction together, and drain it on cancellation.
         from .source_library import fingerprint
 
         signature = fingerprint(sorted(str(r.get("id")) for r in rows))
