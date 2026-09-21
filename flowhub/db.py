@@ -110,7 +110,11 @@ class Database:
 
     @contextmanager
     def connect(self):
-        db = sqlite3.connect(self.path, timeout=10)
+        diagnostic = os.environ.get('FLOWHUB_SQLITE_DIAGNOSTICS') == '1'
+        if diagnostic:
+            from .sqlite_diagnostics import TimedConnection
+        db = sqlite3.connect(self.path, timeout=10,
+                            factory=TimedConnection if diagnostic else sqlite3.Connection)
         db.row_factory = sqlite3.Row
         # WAL mode is a persistent database property. Re-applying it on every
         # short-lived connection can itself contend with writers and was a
@@ -127,6 +131,8 @@ class Database:
                 yield db
         finally:
             db.close()
+            if diagnostic:
+                db.report(self.directory / 'sqlite-transactions.jsonl')
 
     def schema_once(self, name, initializer):
         """Run a module schema initializer once per Database instance.
