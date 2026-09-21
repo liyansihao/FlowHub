@@ -3,6 +3,7 @@ import json
 import os
 import secrets
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -38,6 +39,10 @@ class Database:
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.directory, 0o700)
         self.path = self.directory / "flowhub.sqlite3"
+        self._schema_ready = set()
+        self._schema_lock = threading.RLock()
+        self._journal_configured = False
+        self._journal_lock = threading.Lock()
         key = self.directory / "master.key"
         if not key.exists():
             private_write(key, Fernet.generate_key().decode())
@@ -107,7 +112,14 @@ class Database:
     def connect(self):
         db = sqlite3.connect(self.path, timeout=10)
         db.row_factory = sqlite3.Row
-        db.execute("PRAGMA journal_mode=WAL")
+        # WAL mode is a persistent database property. Re-applying it on every
+        # short-lived connection can itself contend with writers and was a
+        # source of long claim stalls under concurrent lanes.
+        if not self._journal_configured:
+            with self._journal_lock:
+                if not self._journal_configured:
+                    db.execute("PRAGMA journal_mode=WAL")
+                    self._journal_configured = True
         db.execute("PRAGMA synchronous=FULL")
         db.execute("PRAGMA busy_timeout=10000")
         try:
@@ -115,6 +127,19 @@ class Database:
                 yield db
         finally:
             db.close()
+
+    def schema_once(self, name, initializer):
+        """Run a module schema initializer once per Database instance.
+
+        Schema setup belongs to startup or an explicit migration, not to every
+        claim/admission tick. Keeping the cache on the Database instance avoids
+        global state leaking between test databases and production workers.
+        """
+        with self._schema_lock:
+            if name in self._schema_ready:
+                return
+            initializer()
+            self._schema_ready.add(name)
 
     def seal(self, value):
         return self.cipher.encrypt(json.dumps(value).encode()).decode()

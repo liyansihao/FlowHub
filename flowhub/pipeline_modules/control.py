@@ -6,10 +6,12 @@ MODULES = ('seed', 'review', 'publication')
 
 
 def schema(db):
-    with db.connect() as c:
-        c.execute('CREATE TABLE IF NOT EXISTS pipeline_module_control(module TEXT PRIMARY KEY,paused INTEGER NOT NULL,updated REAL NOT NULL)')
-        c.execute('CREATE TABLE IF NOT EXISTS pipeline_module_events(id INTEGER PRIMARY KEY,module TEXT,owner TEXT,sku TEXT,started REAL,finished REAL,outcome TEXT,details TEXT)')
-        c.execute('CREATE INDEX IF NOT EXISTS pipeline_module_events_time ON pipeline_module_events(finished)')
+    def initialize():
+        with db.connect() as c:
+            c.execute('CREATE TABLE IF NOT EXISTS pipeline_module_control(module TEXT PRIMARY KEY,paused INTEGER NOT NULL,updated REAL NOT NULL)')
+            c.execute('CREATE TABLE IF NOT EXISTS pipeline_module_events(id INTEGER PRIMARY KEY,module TEXT,owner TEXT,sku TEXT,started REAL,finished REAL,outcome TEXT,details TEXT)')
+            c.execute('CREATE INDEX IF NOT EXISTS pipeline_module_events_time ON pipeline_module_events(finished)')
+    db.schema_once('pipeline_modules.control', initialize)
 
 
 def paused(db, module):

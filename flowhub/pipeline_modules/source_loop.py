@@ -15,19 +15,21 @@ from .database_work import run as database_work
 
 
 def schema(db):
-    from .admission import schema as admission_schema
-    admission_schema(db)
-    BrowserSource(db)
-    control.schema(db)
-    with db.connect() as c:
-        c.executescript('''
-        CREATE TABLE IF NOT EXISTS source_loop_stores(
-          owner TEXT,seller TEXT,run_id TEXT,due REAL,failures INTEGER DEFAULT 0,
-          last_state TEXT,updated REAL,PRIMARY KEY(owner,seller));
-        CREATE TABLE IF NOT EXISTS source_seed_resolutions(
-          owner TEXT,sku TEXT,state TEXT,seller TEXT,reason TEXT,due REAL,attempts INTEGER,
-          evidence TEXT,updated REAL,PRIMARY KEY(owner,sku));
-        ''')
+    def initialize():
+        from .admission import schema as admission_schema
+        admission_schema(db)
+        BrowserSource(db)
+        control.schema(db)
+        with db.connect() as c:
+            c.executescript('''
+            CREATE TABLE IF NOT EXISTS source_loop_stores(
+              owner TEXT,seller TEXT,run_id TEXT,due REAL,failures INTEGER DEFAULT 0,
+              last_state TEXT,updated REAL,PRIMARY KEY(owner,seller));
+            CREATE TABLE IF NOT EXISTS source_seed_resolutions(
+              owner TEXT,sku TEXT,state TEXT,seller TEXT,reason TEXT,due REAL,attempts INTEGER,
+              evidence TEXT,updated REAL,PRIMARY KEY(owner,sku));
+            ''')
+    db.schema_once('pipeline_modules.source_loop', initialize)
 
 
 def sync_stores(db, owner, run_id, now=None):

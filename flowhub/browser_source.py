@@ -19,18 +19,20 @@ class BrowserSource:
     def __init__(self, db):
         self.db=db
         self.library=SourceLibrary(db)
-        with db.connect() as c:
-            c.executescript('''
-            CREATE TABLE IF NOT EXISTS browser_source_scans(
-             owner TEXT,run_id TEXT,seller TEXT,roots TEXT,next_url TEXT,page INTEGER,
-             state TEXT,browser TEXT,updated REAL,PRIMARY KEY(owner,run_id,seller));
-            CREATE INDEX IF NOT EXISTS browser_source_owner_seller ON browser_source_scans(owner,seller);
-            CREATE TABLE IF NOT EXISTS browser_source_pages(
-             owner TEXT,run_id TEXT,seller TEXT,page INTEGER,digest TEXT,content_hash TEXT,
-             body TEXT,at REAL,PRIMARY KEY(owner,run_id,seller,page));
-            CREATE TABLE IF NOT EXISTS browser_source_failures(
-             owner TEXT,run_id TEXT,seller TEXT,page INTEGER,reason TEXT,at REAL);
-            ''')
+        def initialize():
+            with db.connect() as c:
+                c.executescript('''
+                CREATE TABLE IF NOT EXISTS browser_source_scans(
+                 owner TEXT,run_id TEXT,seller TEXT,roots TEXT,next_url TEXT,page INTEGER,
+                 state TEXT,browser TEXT,updated REAL,PRIMARY KEY(owner,run_id,seller));
+                CREATE INDEX IF NOT EXISTS browser_source_owner_seller ON browser_source_scans(owner,seller);
+                CREATE TABLE IF NOT EXISTS browser_source_pages(
+                 owner TEXT,run_id TEXT,seller TEXT,page INTEGER,digest TEXT,content_hash TEXT,
+                 body TEXT,at REAL,PRIMARY KEY(owner,run_id,seller,page));
+                CREATE TABLE IF NOT EXISTS browser_source_failures(
+                 owner TEXT,run_id TEXT,seller TEXT,page INTEGER,reason TEXT,at REAL);
+                ''')
+        db.schema_once('browser_source', initialize)
 
     def prepare(self, owner, run_id, manifest):
         with self.db.connect() as c:
