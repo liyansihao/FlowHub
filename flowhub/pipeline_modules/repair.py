@@ -5,6 +5,7 @@ from ..maozi import MaoziPublisher
 from ..source_library import SourceLibrary
 from ..evaluation_requirements import sale_price
 from ..plugin_detail import positive
+from .database_work import run as database_work
 
 
 def missing_fields(product):
@@ -148,7 +149,7 @@ class PriceRepairModule:
             p=await supplement(db,owner,sku,seller,p,review,context,evidence,require_dossier)
         if stage=='facts':
             evidence['after']=missing_fields(p)
-            save_progress(db,owner,sku,seller,p,evidence)
+            await database_work(save_progress,db,owner,sku,seller,p,evidence)
             if purpose=='valuation' and valuation_ready(p):
                 return {'state':'ready','reason':'valuation_inputs_ready','missing_fields':evidence['after']}
             return {'state':'progress','reason':'basic_facts_checkpointed','next_stage':'source','missing_fields':evidence['after']}
@@ -164,7 +165,7 @@ class PriceRepairModule:
                         'missing_fields':missing_fields(p)}
         if stage=='source':
             missing=missing_fields(p);evidence['after']=missing
-            save_progress(db,owner,sku,seller,p,evidence)
+            await database_work(save_progress,db,owner,sku,seller,p,evidence)
             if purpose=='valuation' and valuation_ready(p):
                 return {'state':'ready','reason':'valuation_inputs_ready','missing_fields':missing}
             failed=any(step.get('source')=='maozi-draft' for step in evidence['steps'])
@@ -179,7 +180,7 @@ class PriceRepairModule:
             missing=list(dict.fromkeys(missing+official_missing))
             evidence['steps'].append({'source':'official-dossier-validation','missing_fields':official_missing})
         evidence['after']=missing
-        save_progress(db,owner,sku,seller,p,evidence)
+        await database_work(save_progress,db,owner,sku,seller,p,evidence)
         reason='missing:'+','.join(missing) if missing else 'complete_dossier'
         if missing and any('采集箱已满' in str((step.get('diagnostic') or {}).get('api_message','')) for step in evidence['steps']):
             reason='maozi_collection_box_full: '+reason
