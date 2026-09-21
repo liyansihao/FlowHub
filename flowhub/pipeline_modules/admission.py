@@ -7,16 +7,18 @@ from . import control
 
 
 def schema(db):
-    from ..plugin_pipeline import schema as queue_schema
-    queue_schema(db)
-    with db.connect() as c:
-        c.executescript('''
-        CREATE TABLE IF NOT EXISTS pipeline_capabilities(name TEXT PRIMARY KEY,state TEXT,body TEXT,updated REAL);
-        CREATE TABLE IF NOT EXISTS pipeline_campaigns(owner TEXT PRIMARY KEY,enabled INTEGER NOT NULL,body TEXT NOT NULL,updated REAL NOT NULL);
-        CREATE TABLE IF NOT EXISTS pipeline_admissions(owner TEXT,sku TEXT,seller TEXT,at REAL,body TEXT,PRIMARY KEY(owner,sku));
-        CREATE TABLE IF NOT EXISTS plugin_routes(owner TEXT,sku TEXT,seller TEXT,store_id TEXT,expires REAL,run_id TEXT,PRIMARY KEY(owner,sku,seller));
-        CREATE TABLE IF NOT EXISTS plugin_publication_permissions(owner TEXT,sku TEXT,seller TEXT,expires REAL,reason TEXT,PRIMARY KEY(owner,sku,seller));
-        ''')
+    def initialize():
+        from ..plugin_pipeline import schema as queue_schema
+        queue_schema(db)
+        with db.connect() as c:
+            c.executescript('''
+            CREATE TABLE IF NOT EXISTS pipeline_capabilities(name TEXT PRIMARY KEY,state TEXT,body TEXT,updated REAL);
+            CREATE TABLE IF NOT EXISTS pipeline_campaigns(owner TEXT PRIMARY KEY,enabled INTEGER NOT NULL,body TEXT NOT NULL,updated REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS pipeline_admissions(owner TEXT,sku TEXT,seller TEXT,at REAL,body TEXT,PRIMARY KEY(owner,sku));
+            CREATE TABLE IF NOT EXISTS plugin_routes(owner TEXT,sku TEXT,seller TEXT,store_id TEXT,expires REAL,run_id TEXT,PRIMARY KEY(owner,sku,seller));
+            CREATE TABLE IF NOT EXISTS plugin_publication_permissions(owner TEXT,sku TEXT,seller TEXT,expires REAL,reason TEXT,PRIMARY KEY(owner,sku,seller));
+            ''')
+    db.schema_once('pipeline_modules.admission', initialize)
 
 
 def asking_price(product):

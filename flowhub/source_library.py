@@ -138,8 +138,9 @@ def ranking_product(row, observed_at):
 class SourceLibrary:
     def __init__(self, db):
         self.db = db
-        with db.connect() as c:
-            c.executescript("""
+        def initialize():
+            with db.connect() as c:
+                c.executescript("""
             CREATE TABLE IF NOT EXISTS sourcing_products(
               id INTEGER PRIMARY KEY,owner TEXT NOT NULL,sku TEXT NOT NULL,seller TEXT NOT NULL,
               body TEXT NOT NULL,first_seen REAL NOT NULL,updated REAL NOT NULL,UNIQUE(owner,sku,seller));
@@ -172,7 +173,8 @@ class SourceLibrary:
             CREATE INDEX IF NOT EXISTS sourcing_attempt_task ON sourcing_attempts(owner,task,id);
             CREATE TABLE IF NOT EXISTS sourcing_settings(owner TEXT PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 0,
               body TEXT NOT NULL DEFAULT '{}',secret TEXT NOT NULL);
-            """)
+                """)
+        db.schema_once('source_library', initialize)
 
     def enqueue(self, owner, kind, body, priority=0, connection=None):
         key = fingerprint([owner, kind, body])

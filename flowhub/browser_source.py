@@ -19,8 +19,9 @@ class BrowserSource:
     def __init__(self, db):
         self.db=db
         self.library=SourceLibrary(db)
-        with db.connect() as c:
-            c.executescript('''
+        def initialize():
+            with db.connect() as c:
+                c.executescript('''
             CREATE TABLE IF NOT EXISTS browser_source_scans(
              owner TEXT,run_id TEXT,seller TEXT,roots TEXT,next_url TEXT,page INTEGER,
              state TEXT,browser TEXT,updated REAL,PRIMARY KEY(owner,run_id,seller));
@@ -29,7 +30,8 @@ class BrowserSource:
              body TEXT,at REAL,PRIMARY KEY(owner,run_id,seller,page));
             CREATE TABLE IF NOT EXISTS browser_source_failures(
              owner TEXT,run_id TEXT,seller TEXT,page INTEGER,reason TEXT,at REAL);
-            ''')
+                ''')
+        db.schema_once('browser_source', initialize)
 
     def prepare(self, owner, run_id, manifest):
         with self.db.connect() as c:
