@@ -165,10 +165,12 @@ def renew_campaign(c, owner, policy, now):
     """Only an active continuous campaign authorizes a new write window; keep every old one."""
     if not policy.get('continuous'):return
     expiry=min(now+policy.get('write_window_seconds',21600),policy.get('until') or float('inf'))
-    for r in c.execute('SELECT * FROM plugin_routes WHERE owner=? AND run_id=? AND expires<=?',(owner,policy['run_id'],now)).fetchall():
+    for r in c.execute('''SELECT r.* FROM plugin_routes r
+        JOIN plugin_pipeline q USING(owner,sku,seller)
+        WHERE r.owner=? AND r.run_id=? AND r.expires<=?
+          AND (q.state IS NULL OR q.state NOT IN ('selling','rejected'))''',
+        (owner,policy['run_id'],now)).fetchall():
         key=(owner,r['sku'],r['seller'])
-        q=c.execute("SELECT state FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?",key).fetchone()
-        if not q or q['state'] in ('selling','rejected'):continue
         old=c.execute('SELECT body FROM plugin_publications WHERE owner=? AND sku=? AND seller=?',key).fetchone() if c.execute("SELECT 1 FROM sqlite_master WHERE name='plugin_publications'").fetchone() else None
         if old:
             record=json.loads(old[0]);record.setdefault('continuations',[]).append({'at':now,'previous_write_deadline':record.get('write_deadline'),'write_deadline':expiry,'reason':'active_continuous_campaign'})

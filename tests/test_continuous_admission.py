@@ -322,3 +322,25 @@ def test_admission_payload_failure_rolls_back_all_related_writes(tmp_path,monkey
         for table in ('pipeline_admissions','plugin_routes','plugin_publication_permissions','plugin_pipeline'):
             assert c.execute('SELECT count(*) FROM '+table).fetchone()[0]==0
         assert c.execute("SELECT body FROM sourcing_products WHERE sku='1'").fetchone()[0]==before
+
+
+def test_campaign_renewal_filters_terminal_and_missing_queues_without_losing_history(tmp_path):
+    from flowhub.pipeline_modules.admission import renew_campaign
+    db,owner=setup(tmp_path)
+    with db.connect() as c:
+        c.execute('CREATE TABLE IF NOT EXISTS plugin_publications(owner TEXT,sku TEXT,seller TEXT,body TEXT,updated REAL,PRIMARY KEY(owner,sku,seller))')
+        for sku,state in [('active','publishing'),('sold','selling'),('rejected','rejected'),('null',None),('missing',None),('future','queued'),('other','queued')]:
+            if sku!='missing':c.execute('INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)',(owner,sku,'3',state,'{}',0,0))
+            c.execute('INSERT INTO plugin_routes VALUES(?,?,?,?,?,?)',(owner,sku,'3','test',500 if sku=='future' else 1,'other' if sku=='other' else 'test'))
+            c.execute('INSERT INTO plugin_publication_permissions VALUES(?,?,?,?,?)',(owner,sku,'3',1,'test'))
+            c.execute('INSERT INTO plugin_publications VALUES(?,?,?,?,?)',(owner,sku,'3',json.dumps({'write_deadline':1,'continuations':[{'previous':'preserved'}]}),0))
+    with db.connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        renew_campaign(c,owner,{'continuous':True,'run_id':'test','write_window_seconds':50,'until':130},100)
+    with db.connect() as c:
+        for sku in ('active','null','sold','rejected','missing','future','other'):
+            expected=130 if sku in ('active','null') else 500 if sku=='future' else 1
+            assert c.execute('SELECT expires FROM plugin_routes WHERE sku=?',(sku,)).fetchone()[0]==expected
+            b=json.loads(c.execute('SELECT body FROM plugin_publications WHERE sku=?',(sku,)).fetchone()[0])
+            assert b['continuations'][0]=={'previous':'preserved'}
+            assert len(b['continuations'])==(2 if sku in ('active','null') else 1)
