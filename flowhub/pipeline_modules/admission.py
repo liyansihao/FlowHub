@@ -92,7 +92,9 @@ def admit_one(db, owner, now=None):
         # newest-first queue and a large oldest-first backlog. All gates above
         # and exclusions below still apply to these SKUs.
         cohort=json.dumps([str(s) for s in policy.get('acceptance_skus',[])][:100])
-        rows=c.execute('''SELECT p.* FROM sourcing_products p WHERE p.owner=?
+        # Sort only identities while holding the admission write transaction;
+        # load each inspected payload by primary key in that same transaction.
+        rows=c.execute('''SELECT p.id FROM sourcing_products p WHERE p.owner=?
           AND json_extract(p.body,'$.coverage') IN ('storefront-page','maozi-exact-seller-page')
           AND json_extract(p.body,'$.source_relation.seller_id')=json_extract(p.body,'$.seller_id')
           AND json_array_length(json_extract(p.body,'$.source_relation.root_seeds'))>0
@@ -102,7 +104,8 @@ def admit_one(db, owner, now=None):
           AND NOT EXISTS(SELECT 1 FROM blocks b WHERE b.owner=p.owner AND b.source_key=p.sku)
           ORDER BY CASE WHEN p.sku IN (SELECT value FROM json_each(?)) THEN 0 ELSE 1 END,
           p.id '''+order,(owner,cohort))
-        for row in rows:
+        for candidate in rows:
+            row=c.execute('SELECT * FROM sourcing_products WHERE id=?',(candidate['id'],)).fetchone()
             p=json.loads(row['body']);relation=p.get('source_relation') or {}
             if relation.get('seller_id')!=p.get('seller_id') or not relation.get('root_seeds'):continue
             # All source provenance and live delist checks still run before matching and writing.

@@ -291,3 +291,34 @@ def test_official_dossier_backlog_does_not_starve_bounded_fresh_repairs(tmp_path
             c.execute('INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)',(owner,str(i+200),'3','needs_fields','{}',0,0))
     result=admit_one(db,owner)
     assert result['state']=='backpressure' and result['repair_pending']==8 and result['publication_repair_pending']==60
+
+
+@pytest.mark.parametrize('fresh,cohort,expected',[(False,[],['1','2']),(True,[],['2','1']),(True,['1'],['1','2'])])
+def test_payload_lookup_preserves_order_and_exclusions(tmp_path,fresh,cohort,expected):
+    db,owner=setup(tmp_path)
+    with db.connect() as c:
+        policy=json.loads(c.execute('SELECT body FROM pipeline_campaigns').fetchone()[0])
+        policy.update(mix_fresh_sources=fresh,acceptance_skus=cohort)
+        c.execute('UPDATE pipeline_campaigns SET body=?',(json.dumps(policy),))
+    seen=[]
+    for _ in expected:
+        result=admit_one(db,owner);seen.append(result['sku'])
+        with db.connect() as c:c.execute("UPDATE plugin_pipeline SET state='selling'")
+    assert seen==expected
+
+
+def test_admission_payload_failure_rolls_back_all_related_writes(tmp_path,monkeypatch):
+    db,owner=setup(tmp_path)
+    with db.connect() as c:
+        before=c.execute("SELECT body FROM sourcing_products WHERE sku='1'").fetchone()[0]
+    original=SourceLibrary.put
+    def fail_after_put(self,*args,**kwargs):
+        result=original(self,*args,**kwargs)
+        if kwargs.get('connection') is not None:raise RuntimeError('synthetic persistence failure')
+        return result
+    monkeypatch.setattr(SourceLibrary,'put',fail_after_put)
+    with pytest.raises(RuntimeError,match='synthetic persistence failure'):admit_one(db,owner)
+    with db.connect() as c:
+        for table in ('pipeline_admissions','plugin_routes','plugin_publication_permissions','plugin_pipeline'):
+            assert c.execute('SELECT count(*) FROM '+table).fetchone()[0]==0
+        assert c.execute("SELECT body FROM sourcing_products WHERE sku='1'").fetchone()[0]==before
