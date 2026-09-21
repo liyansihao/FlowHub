@@ -60,8 +60,8 @@ async def tick(db, lane=None, *, target=None, run_paused=False):
     if run_paused and (target is None or lane not in ('seed_repair','review')):
         raise ValueError('paused_execution_requires_exact_repair_or_review_target')
     schema(db)
-    with db.connect() as c:
-        c.execute('BEGIN IMMEDIATE')
+    source_library = SourceLibrary(db)
+    with db.write_transaction() as c:
         if lane not in (None, 'review', 'submit', 'reconcile', 'reconcile_history', 'seed_repair'):
             raise ValueError('unknown pipeline lane')
         module = 'seed' if lane == 'seed_repair' else 'review' if lane == 'review' else 'publication'
@@ -114,8 +114,7 @@ async def tick(db, lane=None, *, target=None, run_paused=False):
                 state='queued';body.pop('error',None);body.pop('reason',None)
                 if body.get('repair_retry'):
                     body.setdefault('repair_history',[]).append(body.pop('repair_retry'))
-                with db.connect() as c:
-                    c.execute('BEGIN IMMEDIATE')
+                with db.write_transaction() as c:
                     if c.execute("SELECT 1 FROM sqlite_master WHERE name='plugin_reviews'").fetchone():
                         from .pipeline_modules.dossier import synchronize_repaired_review
                         if synchronize_repaired_review(c,key,allow_manual=True):
@@ -228,8 +227,7 @@ async def tick(db, lane=None, *, target=None, run_paused=False):
     else:body.pop('repair_wait_started_at',None)
     if lane=='reconcile_history' and state=='awaiting_remote' and body.get('phase')=='manual_review':delay=max(delay,900)
     body['updated_at']=time.time()
-    with db.connect() as c:
-        c.execute('BEGIN IMMEDIATE')
+    with db.write_transaction() as c:
         if not c.execute('SELECT 1 FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=? AND token=?',(*key,token)).fetchone():
             return False
         if state=='needs_review' and body.get('same_product_only'):
@@ -245,6 +243,6 @@ async def tick(db, lane=None, *, target=None, run_paused=False):
                 r.update(label='来源价格已过期，待补价后重新测算',publication_ready=False,missing_fields=['fresh_sale_price'])
             if body.get('error')=='target_quota_unavailable':
                 r.update(label='店铺额度不足，发布请求未发送',publication_ready=False)
-            SourceLibrary(db).put(key[0],p,{'channel':'plugin-pipeline','state':state},connection=c)
+            source_library.put(key[0],p,{'channel':'plugin-pipeline','state':state},connection=c)
     control.record(db,'seed' if row['state']=='needs_fields' else 'review' if row['state'] in ('queued','evaluating') else 'publication',key[0],key[1],started,'waiting_lock' if lock_wait else 'waiting_dependency' if dependency_wait else state,{'lane':lane,'phase':body.get('phase'),'reason':body.get('dependency_wait') if dependency_wait else None if lock_wait else body.get('error')})
     return not lock_wait

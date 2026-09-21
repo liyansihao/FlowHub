@@ -10,6 +10,11 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows development fallback
+    fcntl = None
+
 ROOT = Path(__file__).resolve().parents[1]
 DATA = Path(os.environ.get("FLOWHUB_DATA", ROOT / "data"))
 DEFAULT_RULES = dict(
@@ -43,6 +48,10 @@ class Database:
         self._schema_lock = threading.RLock()
         self._journal_configured = False
         self._journal_lock = threading.Lock()
+        self._writer_lock = threading.RLock()
+        self._writer_lock_path = self.directory / "flowhub.sqlite3.writer.lock"
+        self._writer_lock_path.touch(mode=0o600, exist_ok=True)
+        os.chmod(self._writer_lock_path, 0o600)
         key = self.directory / "master.key"
         if not key.exists():
             private_write(key, Fernet.generate_key().decode())
@@ -132,6 +141,27 @@ class Database:
                 return
             initializer()
             self._schema_ready.add(name)
+
+    @contextmanager
+    def write_transaction(self):
+        """Serialize a bounded SQLite write transaction across threads/processes.
+
+        Callers must keep the body short and must not nest this context. Reads
+        continue to use :meth:`connect`; this boundary is for claim/update
+        transactions that must not race across FlowHub workers.
+        """
+        with self._writer_lock:
+            fd = os.open(self._writer_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                with self.connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    yield db
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
 
     def seal(self, value):
         return self.cipher.encrypt(json.dumps(value).encode()).decode()
