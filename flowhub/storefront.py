@@ -238,7 +238,8 @@ class StorefrontCollector:
     def control(self, owner, seller, action):
         if action not in ("pause", "resume", "retry"):
             raise StorefrontError("invalid_action")
-        with self.db.write_transaction() as c:
+        with self.db.connect() as c:
+            c.execute("BEGIN IMMEDIATE")
             row = c.execute(
                 "SELECT * FROM storefront_tasks WHERE owner=? AND seller=?", (owner, seller)
             ).fetchone()
@@ -257,7 +258,8 @@ class StorefrontCollector:
     def ingest(self, owner, seller, html, requested_url, artifact="browser-upload"):
         digest = hashlib.sha256(html.encode()).hexdigest()
         now = time.time()
-        with self.db.write_transaction() as c:
+        with self.db.connect() as c:
+            c.execute("BEGIN IMMEDIATE")
             task = c.execute(
                 "SELECT * FROM storefront_tasks WHERE owner=? AND seller=?", (owner, seller)
             ).fetchone()

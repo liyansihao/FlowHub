@@ -197,7 +197,8 @@ async def clean_account(db,owner,account,items,settings,client=None):
         if not isinstance(detail,dict) or not detail.get('skus'):continue
         backup={'source_snapshot':item['snapshot'],'fresh_detail':detail,'draft_row':row,'online':online,
                 'at':time.time(),'source_record':item['source_record'],'scope':'source draft only'}
-        with db.write_transaction() as c:
+        with db.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
             q=c.execute('SELECT state,body FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?',(owner,sku,item['seller'])).fetchone()
             if not q or q['state']!='selling' or json.loads(q['body']).get('offer_id')!=offer:continue
             if c.execute('SELECT 1 FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=? AND expires>?',(owner,sku,item['seller'],time.time())).fetchone():continue

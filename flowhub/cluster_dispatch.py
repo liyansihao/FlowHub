@@ -41,13 +41,14 @@ def device_for(directory, policy, key):
             return policy['device']
         return None
     hub=Coordinator(directory/'cluster');relay=ERPRelay(hub)
-    with hub.write_transaction() as c:
+    with hub.connect() as c:
         c.execute('''CREATE TABLE IF NOT EXISTS erp_assignments(
             id INTEGER PRIMARY KEY,device TEXT,owner TEXT,sku TEXT,seller TEXT,
             state TEXT,created REAL,finished REAL)''')
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_erp_device ON erp_assignments(device) WHERE state='active'")
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_erp_product ON erp_assignments(owner,sku,seller) WHERE state='active'")
         c.execute('CREATE INDEX IF NOT EXISTS erp_commands_device_created ON erp_commands(device,created)')
+        c.execute('BEGIN IMMEDIATE')
         prod=sqlite3.connect(f'file:{directory / "flowhub.sqlite3"}?mode=ro',uri=True,timeout=10)
         try:
             def product(identity):

@@ -213,7 +213,8 @@ class ContinuousWorker(Worker):
         clause = "j.phase='queued'" if lane == "screening" else "j.phase!='queued'"
         now = time.time()
         lease = secrets.token_hex(16)
-        with self.db.write_transaction() as db:
+        with self.db.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             row = db.execute(
                 "SELECT j.* FROM jobs j JOIN users u ON u.id=j.owner JOIN workflows w ON w.owner=j.owner "
                 "WHERE u.active=1 AND (w.enabled=1 OR j.phase IN ('publishing','reconciling','stock_ready','stock_pending','checking')) "

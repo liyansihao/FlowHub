@@ -204,7 +204,8 @@ def claim_listing(db, *, target=None):
   raise ValueError("exact_listing_identity_required")
  scope=" AND owner=? AND sku=? AND seller=?" if target else ""
  schema(db)
- with db.write_transaction() as c:
+ with db.connect() as c:
+  c.execute('BEGIN IMMEDIATE')
   c.execute("UPDATE product_listing_controls SET state='waiting' WHERE state='running' AND updated<? AND NOT EXISTS(SELECT 1 FROM plugin_pipeline_leases l WHERE l.owner=product_listing_controls.owner AND l.sku=product_listing_controls.sku AND l.seller=product_listing_controls.seller AND l.expires>?)",(time.time()-360,time.time()))
   row=c.execute("SELECT * FROM product_listing_controls WHERE (state='queued' OR (state='waiting' AND updated<?)) AND COALESCE(json_extract(body,'$.next_attempt_at'),0)<=CAST(strftime('%s','now') AS REAL) AND NOT EXISTS(SELECT 1 FROM plugin_pipeline_leases l WHERE l.owner=product_listing_controls.owner AND l.sku=product_listing_controls.sku AND l.seller=product_listing_controls.seller AND l.expires>strftime('%s','now')) "+scope+" ORDER BY CASE state WHEN 'queued' THEN 0 ELSE 1 END,CASE action WHEN 'unlist' THEN 0 ELSE 1 END,updated LIMIT 1",(time.time()-5,*(target or ()))).fetchone()
   if not row:return False

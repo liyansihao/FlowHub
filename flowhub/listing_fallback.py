@@ -37,7 +37,8 @@ async def choose(db,key,body,api,original,quota):
             raise ValueError('发现本店导入记录，需回查原结果，暂停换店避免重复发布')
         now=time.time()
         event={'at':now,'from_store_id':original['id'],'from_store_name':original['name'],'to_store_id':store['id'],'to_store_name':store['name'],'reason':'target_quota_unavailable','quota':available}
-        with db.write_transaction() as c:
+        with db.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
             if c.execute('SELECT 1 FROM plugin_publications WHERE owner=? AND sku=?',(key[0],key[1])).fetchone() or c.execute('SELECT 1 FROM jobs WHERE owner=? AND source_key=?',(key[0],key[1])).fetchone():raise ValueError('发布状态已变化，取消自动换店')
             changed=c.execute('UPDATE plugin_routes SET store_id=?,expires=?,run_id=? WHERE owner=? AND sku=? AND seller=? AND store_id=?',(store['id'],now+86400,body['id'],*key,original['id'])).rowcount
             if changed!=1:raise ValueError('目标店铺已变化，请重新回查')

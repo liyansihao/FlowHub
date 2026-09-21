@@ -35,7 +35,7 @@ class BrowserSource:
         db.schema_once('browser_source', initialize)
 
     def prepare(self, owner, run_id, manifest):
-        with self.db.write_transaction() as c:
+        with self.db.connect() as c:
             for seller,roots in manifest.items():
                 url=shop_url(f'/seller/{seller}/products/',seller)
                 if not roots:raise ValueError('root_seeds_required')
@@ -44,7 +44,8 @@ class BrowserSource:
 
     def control(self, owner, run_id, seller, action):
         if action not in ('pause','resume','retry'):raise ValueError('invalid_action')
-        with self.db.write_transaction() as c:
+        with self.db.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
             r=c.execute('SELECT state FROM browser_source_scans WHERE owner=? AND run_id=? AND seller=?',(owner,run_id,seller)).fetchone()
             if not r:raise KeyError(seller)
             if r[0]=='done':return
@@ -55,7 +56,8 @@ class BrowserSource:
     def fail(self, owner, run_id, seller, reason):
         # Browser transport errors preserve the current page and require explicit retry.
         if not reason or len(reason)>120:raise ValueError('invalid_reason')
-        with self.db.write_transaction() as c:
+        with self.db.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
             r=c.execute('SELECT page,state FROM browser_source_scans WHERE owner=? AND run_id=? AND seller=?',(owner,run_id,seller)).fetchone()
             if not r:raise KeyError(seller)
             if r['state']=='ready':
@@ -74,7 +76,8 @@ class BrowserSource:
 
     def ingest(self, owner, run_id, seller, requested_url, html, artifact):
         digest=hashlib.sha256(html.encode()).hexdigest();now=time.time();key=(owner,run_id,seller)
-        with self.db.write_transaction() as c:
+        with self.db.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
             task=c.execute('SELECT * FROM browser_source_scans WHERE owner=? AND run_id=? AND seller=?',key).fetchone()
             if not task:raise KeyError(seller)
             replay=c.execute('SELECT 1 FROM browser_source_pages WHERE owner=? AND run_id=? AND seller=? AND digest=?',(*key,digest)).fetchone()

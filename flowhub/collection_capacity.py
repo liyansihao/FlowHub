@@ -34,8 +34,8 @@ def observe(db, scope, header, read_started):
         raise Pending('collection_capacity_unavailable')
     used, limit = int(used), int(limit)
     cfg = settings(db)
-    with db.write_transaction() as c:
-        schema(c)
+    with db.connect() as c:
+        c.execute('BEGIN IMMEDIATE'); schema(c)
         old = c.execute('SELECT * FROM collection_capacity WHERE account=?', (scope,)).fetchone()
         if old and old['observed'] > read_started:
             return  # A slow stale response must not overwrite a later observation.
@@ -58,7 +58,8 @@ async def guard(collector, *, reserve=False):
         started = time.time()
         header = await collector.call('/api.product.collect/lists', query={'page': 1, 'page_size': 1})
         observe(db, scope, header, started)
-    with db.write_transaction() as c:
+    with db.connect() as c:
+        c.execute('BEGIN IMMEDIATE')
         row = c.execute('SELECT * FROM collection_capacity WHERE account=?', (scope,)).fetchone()
         if not row or not 0 <= time.time() - row['observed'] < cfg['max_age']:
             raise Pending('collection_capacity_unavailable')

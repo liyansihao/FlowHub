@@ -47,7 +47,7 @@ class Worker:
         )
 
     def move(self, job, phase, note="", data=None, delay=0, plan=None, store=None):
-        with self.db.write_transaction() as db:
+        with self.db.connect() as db:
             db.execute(
                 "UPDATE jobs SET phase=?,note=?,data=COALESCE(?,data),plan=COALESCE(?,plan),store_id=COALESCE(?,store_id),next_at=?,updated=? WHERE id=? AND lease=?",
                 (
@@ -133,7 +133,7 @@ class Worker:
                     raise ModuleError("quota store mismatch")
             except Exception:
                 continue
-            with self.db.write_transaction() as db:
+            with self.db.connect() as db:
                 pending = db.execute(
                     "SELECT COUNT(*) FROM jobs WHERE store_id=? AND phase NOT IN ('selling','rejected','attention')",
                     (row["id"],),
@@ -318,7 +318,8 @@ class Worker:
     def claim(self):
         now = time.time()
         lease = secrets.token_hex(16)
-        with self.db.write_transaction() as db:
+        with self.db.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             r = db.execute(
                 "SELECT j.* FROM jobs j JOIN users u ON u.id=j.owner JOIN workflows w ON w.owner=j.owner WHERE u.active=1 AND (w.enabled=1 OR j.phase IN ('publishing','reconciling','stock_ready','stock_pending','checking')) AND j.phase NOT IN ('selling','rejected','attention') AND j.next_at<=? AND j.lease_until<=? ORDER BY CASE WHEN j.phase IN ('publishing','reconciling','stock_ready','stock_pending','checking') THEN 0 WHEN j.phase IN ('ready','prepared','qualified','matched') THEN 1 ELSE 2 END,j.next_at,j.created LIMIT 1",
                 (now, now),
@@ -337,7 +338,7 @@ class Worker:
             job=await claim_task
             if job:
                 def release():
-                    with self.db.write_transaction() as c:
+                    with self.db.connect() as c:
                         c.execute("UPDATE jobs SET lease=NULL,lease_until=0 WHERE id=? AND lease=?",(job['id'],job['lease']))
                 await database_work(release)
             raise
@@ -362,13 +363,13 @@ class Worker:
                 "外部响应未确认，保留原任务等待回查" if unknown else "模块暂不可用，稍后自动重试",
                 delay=min(300, 2 ** min(count, 8)),
             )
-            with self.db.write_transaction() as db:
+            with self.db.connect() as db:
                 db.execute("UPDATE jobs SET attempts=? WHERE id=?", (count, job["id"]))
                 self.db.event(
                     db, job["owner"], type(error).__name__, "模块调用未完成；敏感响应未记录", job["id"]
                 )
         finally:
-            with self.db.write_transaction() as db:
+            with self.db.connect() as db:
                 db.execute(
                     "UPDATE jobs SET lease=NULL,lease_until=0 WHERE id=? AND lease=?",
                     (job["id"], job["lease"]),
@@ -430,7 +431,7 @@ class Worker:
                     if any(len(p["dimensions_cm"]) != 3 for p in items):
                         raise ModuleError("dimensions missing")
                 capacity = min(30 - pending, (rules["max_items"] - total) if rules.get("max_items") else 30)
-                with self.db.write_transaction() as db:
+                with self.db.connect() as db:
                     for p in items[:capacity]:
                         if not p["pure_fbs"] and not library_source:
                             continue
@@ -461,7 +462,7 @@ class Worker:
                             (str(r["cursor"])[:1000], "候选已更新", w["owner"]),
                         )
             except Exception as error:
-                with self.db.write_transaction() as db:
+                with self.db.connect() as db:
                     db.execute(
                         "UPDATE workflows SET notice=? WHERE owner=?",
                         ("候选模块暂不可用，将自动重试", w["owner"]),

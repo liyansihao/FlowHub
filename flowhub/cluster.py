@@ -12,11 +12,6 @@ from pathlib import Path
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows development fallback
-    fcntl = None
-
 
 def digest(value):return hashlib.sha256(value.encode()).hexdigest()
 
@@ -33,10 +28,6 @@ class Coordinator:
     def __init__(self,directory,clock=time.time):
         self.directory=Path(directory);self.directory.mkdir(parents=True,exist_ok=True,mode=0o700)
         self.path=self.directory/'cluster.sqlite3';self.clock=clock
-        import threading
-        self._writer_lock=threading.RLock()
-        self._writer_lock_path=self.directory/'cluster.sqlite3.writer.lock'
-        self._writer_lock_path.touch(mode=0o600,exist_ok=True);self._writer_lock_path.chmod(0o600)
         with self.connect() as c:
             # Device heartbeats/results must not wait behind status readers.
             # WAL keeps reads concurrent with the single durable writer.
@@ -57,26 +48,15 @@ class Coordinator:
             with c:yield c
         finally:c.close()
 
-    @contextmanager
-    def write_transaction(self):
-        with self._writer_lock:
-            fd=self._writer_lock_path.open('a+')
-            try:
-                if fcntl is not None:fcntl.flock(fd,fcntl.LOCK_EX)
-                with self.connect() as c:
-                            yield c
-            finally:
-                if fcntl is not None:fcntl.flock(fd,fcntl.LOCK_UN)
-                fd.close()
-
     def invitation(self,name):
         code=secrets.token_urlsafe(32)
-        with self.write_transaction() as c:c.execute('INSERT INTO enrollments(hash,name,expires) VALUES(?,?,?)',(digest(code),name,self.clock()+1800))
+        with self.connect() as c:c.execute('INSERT INTO enrollments(hash,name,expires) VALUES(?,?,?)',(digest(code),name,self.clock()+1800))
         return code
 
     def enroll(self,code,platform):
         now=self.clock()
-        with self.write_transaction() as c:
+        with self.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
             invite=c.execute('SELECT * FROM enrollments WHERE hash=? AND used=0 AND expires>?',(digest(code),now)).fetchone()
             if not invite:raise HTTPException(401,'Enrollment expired or already used')
             device=secrets.token_hex(16);token=secrets.token_urlsafe(48)
@@ -91,15 +71,15 @@ class Coordinator:
         return row['id']
 
     def enqueue(self,dedupe):
-        with self.write_transaction() as c:
+        with self.connect() as c:
             c.execute('INSERT OR IGNORE INTO tasks(id,dedupe,kind,payload,state,created) VALUES(?,?,?,?,?,?)',
                       (secrets.token_hex(16),dedupe,'probe',json.dumps({'challenge':secrets.token_hex(16)}),'queued',self.clock()))
             return c.execute('SELECT id FROM tasks WHERE dedupe=?',(dedupe,)).fetchone()[0]
 
     def claim(self,token):
         now=self.clock()
-        with self.write_transaction() as c:
-            device=self.auth(c,token)
+        with self.connect() as c:
+            c.execute('BEGIN IMMEDIATE');device=self.auth(c,token)
             # A lost claim response returns the SAME lease to that device.
             row=c.execute("SELECT * FROM tasks WHERE device=? AND state='leased' AND expires>?",(device,now)).fetchone()
             if not row:
@@ -111,8 +91,8 @@ class Coordinator:
             return {'id':row['id'],'kind':row['kind'],'payload':json.loads(row['payload']),'lease':row['lease'],'expires':row['expires']}
 
     def heartbeat(self,token,task_id=None,lease=None):
-        with self.write_transaction() as c:
-            device=self.auth(c,token)
+        with self.connect() as c:
+            c.execute('BEGIN IMMEDIATE');device=self.auth(c,token)
             if task_id:
                 changed=c.execute("UPDATE tasks SET expires=? WHERE id=? AND device=? AND lease=? AND state='leased' AND expires>?",
                                   (self.clock()+120,task_id,device,lease,self.clock())).rowcount
@@ -121,8 +101,8 @@ class Coordinator:
 
     def complete(self,token,task_id,lease,result):
         encoded=json.dumps(result,sort_keys=True,separators=(',',':'));hashed=digest(encoded)
-        with self.write_transaction() as c:
-            device=self.auth(c,token)
+        with self.connect() as c:
+            c.execute('BEGIN IMMEDIATE');device=self.auth(c,token)
             r=c.execute('SELECT * FROM tasks WHERE id=?',(task_id,)).fetchone()
             if not r or r['device']!=device or r['lease']!=lease:raise HTTPException(409,'Lease no longer current')
             if r['state']=='done':
@@ -140,7 +120,7 @@ class Coordinator:
                     'tasks':dict(c.execute('SELECT state,count(*) FROM tasks GROUP BY state').fetchall())}
 
     def revoke(self,device):
-        with self.write_transaction() as c:
+        with self.connect() as c:
             if not c.execute('UPDATE devices SET enabled=0 WHERE id=?',(device,)).rowcount:raise ValueError('Unknown device')
 
 

@@ -71,7 +71,8 @@ def claim(db, lane=None, *, target=None, run_paused=False, repair_kind=None, rep
     if run_paused and (target is None or lane not in ('seed_repair','review')):
         raise ValueError('paused_execution_requires_exact_repair_or_review_target')
     schema(db)
-    with db.write_transaction() as c:
+    with db.connect() as c:
+        c.execute('BEGIN IMMEDIATE')
         if lane not in (None, 'review', 'submit', 'reconcile', 'reconcile_history', 'seed_repair'):
             raise ValueError('unknown pipeline lane')
         module = 'seed' if lane == 'seed_repair' else 'review' if lane == 'review' else 'publication'
@@ -162,7 +163,8 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
                     body.pop('phase',None)
                 if body.get('repair_retry'):
                     body.setdefault('repair_history',[]).append(body.pop('repair_retry'))
-                with db.write_transaction() as c:
+                with db.connect() as c:
+                    c.execute('BEGIN IMMEDIATE')
                     if c.execute("SELECT 1 FROM sqlite_master WHERE name='plugin_reviews'").fetchone():
                         from .pipeline_modules.dossier import synchronize_repaired_review
                         if synchronize_repaired_review(c,key,allow_manual=True):
@@ -319,7 +321,8 @@ def finish(db,row,key,token,state,body,attempts,delay,lane,started,lock_wait,dep
     track(body,row['state'],state,time.time(),attempted=not (lock_wait or dependency_wait))
     if repair_progress:body['lifecycle']['last_progress_at']=time.time()
     body['updated_at']=time.time()
-    with db.write_transaction() as c:
+    with db.connect() as c:
+        c.execute('BEGIN IMMEDIATE')
         if not c.execute('SELECT 1 FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=? AND token=?',(*key,token)).fetchone():
             return False
         if state=='needs_review' and body.get('same_product_only') and not body.get('repair_manual'):

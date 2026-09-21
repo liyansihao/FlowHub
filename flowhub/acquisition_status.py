@@ -50,7 +50,8 @@ def snapshot(db):
 
 def retry_read(db, key):
     """Operator recovery clears a local read hold, never a remote write intent."""
-    with db.write_transaction() as c:
+    with db.connect() as c:
+        c.execute("BEGIN IMMEDIATE")
         row = c.execute("SELECT * FROM acquisition_tasks WHERE key=?", (key,)).fetchone()
         if not row:
             raise ValueError("acquisition_task_missing")

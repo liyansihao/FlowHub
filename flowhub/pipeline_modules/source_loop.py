@@ -36,7 +36,7 @@ def sync_stores(db, owner, run_id, now=None):
     """Only evidenced roots enter discovery; collected products are not invented roots."""
     now=time.time() if now is None else now
     service=BrowserSource(db);manifest={}
-    with db.write_transaction() as c:
+    with db.connect() as c:
         # Reuse the original exact SKU/offer bindings, not an inferred offer ID.
         for scan in c.execute('SELECT seller,roots FROM browser_source_scans WHERE owner=? AND run_id=?',(owner,run_id)).fetchall():
             for root in json.loads(scan['roots']):
@@ -66,7 +66,7 @@ def sync_stores(db, owner, run_id, now=None):
         existing=[dict(r) for r in c.execute('SELECT * FROM browser_source_scans WHERE owner=? AND run_id=?',(owner,run_id))]
     service.prepare(owner,run_id,manifest)
     enrolled=0
-    with db.write_transaction() as c:
+    with db.connect() as c:
         for seller in set(manifest)|{r['seller'] for r in existing}:
             inserted=c.execute('INSERT OR IGNORE INTO source_loop_stores VALUES(?,?,?,0,0,?,?)',(owner,seller,run_id,'enrolled',now)).rowcount
             if inserted:
@@ -109,7 +109,8 @@ async def resolve_one(db,owner,request=erp_request,now=None):
     except Exception as error:
         from ..source_acquisition import AcquisitionError
         seller=None;reason=str(error)[:120] if isinstance(error,(ValueError,AcquisitionError)) else type(error).__name__
-    with db.write_transaction() as c:
+    with db.connect() as c:
+        c.execute('BEGIN IMMEDIATE')
         c.execute('''INSERT INTO source_seed_resolutions VALUES(?,?,?,?,?,?,1,?,?)
          ON CONFLICT(owner,sku) DO UPDATE SET state=excluded.state,seller=excluded.seller,
          reason=excluded.reason,due=excluded.due,attempts=attempts+1,evidence=excluded.evidence,updated=excluded.updated''',
@@ -135,7 +136,7 @@ def finish(db,task,now=None):
     now=time.time() if now is None else now
     service=BrowserSource(db);key=(task['owner'],task['run_id'],task['seller'])
     state=service.next_request(*key)['state'];reason=None;failures=task['failures']
-    with db.write_transaction() as c:
+    with db.connect() as c:
         if state=='blocked':
             r=c.execute('SELECT reason FROM browser_source_failures WHERE owner=? AND run_id=? AND seller=? ORDER BY at DESC LIMIT 1',key).fetchone()
             reason=r[0] if r else 'unknown';failures+=1
@@ -156,14 +157,11 @@ async def collect(db,task,config):
         run_id='source-refresh-'+str(time.time_ns())
         service.prepare(task['owner'],run_id,{task['seller']:json.loads(task['roots'])})
         service.control(task['owner'],run_id,task['seller'],'resume')
-        with db.write_transaction() as c:c.execute('UPDATE source_loop_stores SET run_id=? WHERE owner=? AND seller=?',(run_id,task['owner'],task['seller']))
+        with db.connect() as c:c.execute('UPDATE source_loop_stores SET run_id=? WHERE owner=? AND seller=?',(run_id,task['owner'],task['seller']))
         task=dict(task)|{'run_id':run_id};key=(task['owner'],run_id,task['seller'])
     root=Path(__file__).resolve().parents[2]
-    browser_env={'FLOWHUB_SOURCE_PROFILE':config['profile'],'FLOWHUB_DATA':str(db.directory.resolve())}
-    if config.get('extension_dir'):browser_env['FLOWHUB_SOURCE_EXTENSION_DIR']=str(config['extension_dir'])
-    if config.get('chromium_executable'):browser_env['FLOWHUB_SOURCE_CHROMIUM_EXECUTABLE']=str(config['chromium_executable'])
     process=await asyncio.create_subprocess_exec('node',str(root/'bridges/playwright-source.mjs'),*key,str(config.get('pages_per_store',3)),
-        cwd=root,env=os.environ|browser_env,
+        cwd=root,env=os.environ|{'FLOWHUB_SOURCE_PROFILE':config['profile'],'FLOWHUB_DATA':str(db.directory.resolve())},
         stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
     try:
         await asyncio.wait_for(process.communicate(),240)
@@ -210,7 +208,7 @@ async def tick(db,config):
             await database_work(other_sellers.schema,db)
             await database_work(other_sellers.prepare_samples,db,owner)
             await database_work(other_sellers.promote_qualified,db,owner)
-            with db.write_transaction() as c:
+            with db.connect() as c:
                 due=c.execute('SELECT due FROM source_discovery_clock WHERE owner=?',(owner,)).fetchone()
                 discovery_due=not due or now>=due[0]
                 if discovery_due:

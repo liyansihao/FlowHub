@@ -48,8 +48,8 @@ def fingerprint(queue,store):
 async def run_one(module,db,owner,sku,seller):
     key=(owner,sku,seller);cfg=config(db);began=time.time()
     def prepare_work():
-        with db.write_transaction() as c:
-            schema(c)
+        with db.connect() as c:
+            c.execute('BEGIN IMMEDIATE');schema(c)
             row=c.execute('SELECT body FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?',key).fetchone()
             route=c.execute('SELECT store_id FROM plugin_routes WHERE owner=? AND sku=? AND seller=?',key).fetchone()
             if not row or not route:return {'state':'waiting','reason':'repair_binding_missing','failure_class':'identity_mismatch'}
@@ -102,7 +102,8 @@ async def run_one(module,db,owner,sku,seller):
         work.update(state='manual' if manual else 'waiting',next_at=now+delay)
         result.update(state='manual' if manual else 'waiting',retry_after=delay)
     def checkpoint():
-        with db.write_transaction() as c:
+        with db.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
             current=c.execute('SELECT token FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=?',key).fetchone()
             q=c.execute('SELECT body FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?',key).fetchone()
             r=c.execute('SELECT store_id FROM plugin_routes WHERE owner=? AND sku=? AND seller=?',key).fetchone()

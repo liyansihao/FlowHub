@@ -11,7 +11,8 @@ def cleanup(db, *, now=None):
     schema(db)
     now=time.time() if now is None else now
     parked=[]
-    with db.write_transaction() as c:
+    with db.connect() as c:
+        c.execute('BEGIN IMMEDIATE')
         if c.execute("SELECT 1 FROM pipeline_module_control WHERE module='seed' AND paused=1").fetchone():
             return {'state':'paused','parked':0}
         c.execute('''CREATE TABLE IF NOT EXISTS repair_cleanup_receipts(

@@ -139,7 +139,7 @@ class SourceAcquirer:
             task=await claim_task
             if task:
                 def release():
-                    with self.library.db.write_transaction() as c:
+                    with self.library.db.connect() as c:
                         c.execute('UPDATE sourcing_tasks SET lease=NULL,lease_until=0 WHERE id=? AND lease=?',(task['id'],task['lease']))
                 await database_work(release)
             raise
@@ -261,7 +261,8 @@ class SourceAcquirer:
         if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
             raise AcquisitionError("schema")
         terms = keyword_terms(rows)
-        with self.library.db.write_transaction() as c:
+        with self.library.db.connect() as c:
+            c.execute("BEGIN IMMEDIATE")
             if not c.execute(
                 "SELECT 1 FROM sourcing_tasks WHERE id=? AND lease=? AND lease_until>?",
                 (task["id"], task["lease"], now),
@@ -307,7 +308,8 @@ class SourceAcquirer:
         from .source_library import fingerprint
 
         signature = fingerprint(sorted(str(r.get("id")) for r in rows))
-        with self.library.db.write_transaction() as c:
+        with self.library.db.connect() as c:
+            c.execute("BEGIN IMMEDIATE")
             if not c.execute(
                 "SELECT 1 FROM sourcing_tasks WHERE id=? AND lease=? AND lease_until>?",
                 (task["id"], task["lease"], now),
@@ -422,7 +424,8 @@ class SourceAcquirer:
         from .source_library import fingerprint
 
         signature = fingerprint(sorted(str(r.get("posting_number")) for r in rows))
-        with self.library.db.write_transaction() as c:
+        with self.library.db.connect() as c:
+            c.execute("BEGIN IMMEDIATE")
             if not c.execute(
                 "SELECT 1 FROM sourcing_tasks WHERE id=? AND lease=? AND lease_until>?",
                 (task["id"], task["lease"], now),
@@ -482,7 +485,8 @@ class SourceAcquirer:
 
     def evaluate_seller(self, task, now):
         seller = str(task["body"]["seller_id"])
-        with self.library.db.write_transaction() as c:
+        with self.library.db.connect() as c:
+            c.execute("BEGIN IMMEDIATE")
             if not c.execute(
                 "SELECT 1 FROM sourcing_tasks WHERE id=? AND lease=? AND lease_until>?",
                 (task["id"], task["lease"], now),

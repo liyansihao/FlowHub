@@ -136,7 +136,8 @@ def receipt(db,account,favorite):
 def prepare_archive(db,owner,account,item,favorite,online):
     # The durable archive and intent are one drained unit. Cancellation must not
     # release the account lock or reach the remote write while this is running.
-    with db.write_transaction() as c:
+    with db.connect() as c:
+        c.execute('BEGIN IMMEDIATE')
         if control.paused(db,'seed') or not config(db)['enabled']:return 'paused',None
         if not c.execute('SELECT 1 FROM pipeline_campaigns p JOIN users u ON p.owner=u.id WHERE p.owner=? AND p.enabled=1 AND u.active=1',(owner,)).fetchone():return 'disabled',None
         fid=str(favorite['id'])

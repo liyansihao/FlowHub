@@ -45,7 +45,8 @@ class Compute:
         if not config.get('enabled'):return None
         if kind not in config.get('kinds',['rank','screen']):return None
         allowed=config.get('devices',[])
-        with self.hub.write_transaction() as c:
+        with self.hub.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
             c.execute("UPDATE compute_jobs SET state='expired',payload=NULL WHERE deadline<=? AND state IN ('queued','running')",(now,))
             def speed(device):
                 measured=c.execute('SELECT samples,mean_seconds FROM compute_metrics WHERE device=? AND kind=?',(device,kind)).fetchone()
@@ -69,8 +70,8 @@ class Compute:
         return None
 
     def claim(self,token):
-        with self.hub.write_transaction() as c:
-            device=self.hub.auth(c,token)
+        with self.hub.connect() as c:
+            c.execute('BEGIN IMMEDIATE');device=self.hub.auth(c,token)
             r=c.execute("SELECT * FROM compute_jobs WHERE device=? AND state='queued' AND deadline>? ORDER BY created LIMIT 1",(device,self.hub.clock()+10)).fetchone()
             if not r:return None
             c.execute("UPDATE compute_jobs SET state='running',payload=NULL WHERE id=?",(r['id'],))
@@ -79,8 +80,8 @@ class Compute:
 
     def complete(self,token,identity,lease,digest,result):
         if len(json.dumps(result))>2_000_000:raise HTTPException(413,'Result too large')
-        with self.hub.write_transaction() as c:
-            device=self.hub.auth(c,token)
+        with self.hub.connect() as c:
+            c.execute('BEGIN IMMEDIATE');device=self.hub.auth(c,token)
             r=c.execute('SELECT * FROM compute_jobs WHERE id=? AND device=? AND lease=? AND digest=?',(identity,device,lease,digest)).fetchone()
             if not r:raise HTTPException(409,'Compute identity mismatch')
             if r['state']=='done':
