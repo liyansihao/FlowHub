@@ -145,6 +145,7 @@ class SourceLibrary:
               id INTEGER PRIMARY KEY,owner TEXT NOT NULL,sku TEXT NOT NULL,seller TEXT NOT NULL,
               body TEXT NOT NULL,first_seen REAL NOT NULL,updated REAL NOT NULL,UNIQUE(owner,sku,seller));
             CREATE INDEX IF NOT EXISTS sourcing_product_lookup ON sourcing_products(owner,updated,id);
+            CREATE INDEX IF NOT EXISTS sourcing_product_seller ON sourcing_products(owner,seller);
             CREATE INDEX IF NOT EXISTS sourcing_filter_price ON sourcing_products(owner,json_extract(body,'$.average_price_rub'),id);
             CREATE INDEX IF NOT EXISTS sourcing_filter_category ON sourcing_products(owner,json_extract(body,'$.category_id'),id);
             CREATE INDEX IF NOT EXISTS sourcing_admission_candidates ON sourcing_products(owner,id)
