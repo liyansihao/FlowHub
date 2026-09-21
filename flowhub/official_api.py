@@ -83,7 +83,7 @@ class OfficialTransport(httpx.AsyncBaseTransport):
         schema(db)
 
     def metric(self, path, *, cached=False, error=False, elapsed=0):
-        with self.db.connect() as c:
+        with self.db.write_transaction() as c:
             c.execute(
                 """INSERT INTO official_api_metrics VALUES(?,?,?,?,?,?,?)
                 ON CONFLICT(account,path) DO UPDATE SET calls=calls+excluded.calls,
@@ -216,8 +216,8 @@ class OfficialTransport(httpx.AsyncBaseTransport):
 
     def _reserve(self,request,path,lane,cache_key):
         now = time.time()
-        with self.db.connect() as c:
-            c.execute("BEGIN IMMEDIATE")
+        cached_result = None
+        with self.db.write_transaction() as c:
             blocked = c.execute(
                 "SELECT * FROM official_api_accounts WHERE account=?", (self.account,)
             ).fetchone()
@@ -229,27 +229,29 @@ class OfficialTransport(httpx.AsyncBaseTransport):
                     (self.account, cache_key, now),
                 ).fetchone()
                 if cached:
-                    result = self.db.open(cached["body"])
-                    # End the transaction before the metrics write.
-                    c.commit()
-                    self.metric(path, cached=True)
-                    return httpx.Response(200, json=result, request=request)
-            slot = c.execute(
-                "SELECT next_at FROM official_api_slots WHERE account=? AND lane=?", (self.account, lane)
-            ).fetchone()
-            at = max(now, slot[0] if slot else now)
-            if at - now > 2:
-                raise OfficialDeferred(at, "official_rate_wait")
-            c.execute(
-                """INSERT INTO official_api_slots(account,lane,next_at) VALUES(?,?,?)
-                ON CONFLICT(account,lane) DO UPDATE SET next_at=excluded.next_at""",
-                (self.account, lane, at + self.interval),
-            )
+                    cached_result = self.db.open(cached["body"])
+            if cached_result is not None:
+                pass
+            else:
+                slot = c.execute(
+                    "SELECT next_at FROM official_api_slots WHERE account=? AND lane=?", (self.account, lane)
+                ).fetchone()
+                at = max(now, slot[0] if slot else now)
+                if at - now > 2:
+                    raise OfficialDeferred(at, "official_rate_wait")
+                c.execute(
+                    """INSERT INTO official_api_slots(account,lane,next_at) VALUES(?,?,?)
+                    ON CONFLICT(account,lane) DO UPDATE SET next_at=excluded.next_at""",
+                    (self.account, lane, at + self.interval),
+                )
+        if cached_result is not None:
+            self.metric(path, cached=True)
+            return httpx.Response(200, json=cached_result, request=request)
         return at
 
     def _check_blocked(self):
         # Another process can encounter authentication/rate failures during the wait.
-        with self.db.connect() as c:
+        with self.db.write_transaction() as c:
             blocked = c.execute(
                 "SELECT * FROM official_api_accounts WHERE account=?", (self.account,)
             ).fetchone()
@@ -258,7 +260,7 @@ class OfficialTransport(httpx.AsyncBaseTransport):
 
     def _failed(self,path,lane,elapsed):
         self.metric(path, error=True, elapsed=elapsed)
-        with self.db.connect() as c:
+        with self.db.write_transaction() as c:
             c.execute(
                 "UPDATE official_api_slots SET next_at=MAX(next_at,?),failures=failures+1 WHERE account=? AND lane=?",
                 (time.time() + 10, self.account, lane),

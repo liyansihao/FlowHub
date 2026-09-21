@@ -194,7 +194,7 @@ class SourceLibrary:
         if connection is not None:
             save(connection)
         else:
-            with self.db.connect() as c:
+            with self.db.write_transaction() as c:
                 save(c)
         return key
 
@@ -242,14 +242,13 @@ class SourceLibrary:
 
         if connection is not None:
             return save(connection)
-        with self.db.connect() as c:
+        with self.db.write_transaction() as c:
             return save(c)
 
     def control_task(self, owner, task_id, action):
         if action not in ("pause", "resume", "retry"):
             raise ValueError("invalid action")
-        with self.db.connect() as c:
-            c.execute("BEGIN IMMEDIATE")
+        with self.db.write_transaction() as c:
             row = c.execute(
                 "SELECT * FROM sourcing_tasks WHERE owner=? AND id=?", (owner, task_id)
             ).fetchone()
@@ -287,8 +286,7 @@ class SourceLibrary:
 
     def claim(self, owner, now=None, kinds=None):
         now = time.time() if now is None else now
-        with self.db.connect() as c:
-            c.execute("BEGIN IMMEDIATE")
+        with self.db.write_transaction() as c:
             # Reserve a turn for each pipeline stage; thousands of seeds cannot starve discovery.
             completed = c.execute(
                 "SELECT COALESCE(SUM(successes),0) FROM sourcing_tasks WHERE owner=?", (owner,)
@@ -326,8 +324,7 @@ class SourceLibrary:
         now = time.time() if now is None else now
         page = task["page"]
         signature = fingerprint(sorted(str(r.get("sku") or r.get("id")) for r in rows))
-        with self.db.connect() as c:
-            c.execute("BEGIN IMMEDIATE")
+        with self.db.write_transaction() as c:
             held = c.execute(
                 "SELECT 1 FROM sourcing_tasks WHERE id=? AND lease=? AND lease_until>?",
                 (task["id"], task["lease"], now),
@@ -483,8 +480,7 @@ class SourceLibrary:
     def fail(self, task, kind, now=None, diagnostic=None):
         now = time.time() if now is None else now
         attempts = task["failures"] + 1
-        with self.db.connect() as c:
-            c.execute("BEGIN IMMEDIATE")
+        with self.db.write_transaction() as c:
             held = c.execute(
                 "SELECT state FROM sourcing_tasks WHERE id=? AND lease=?", (task["id"], task["lease"])
             ).fetchone()

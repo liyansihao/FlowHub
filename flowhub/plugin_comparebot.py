@@ -107,8 +107,7 @@ async def evaluate(db, owner, sku, seller, *, force=False):
 
 
 def reserve_review(db,owner,sku,seller,force,started,digest):
-    with db.connect() as c:
-        c.execute('BEGIN IMMEDIATE')
+    with db.write_transaction() as c:
         prior = c.execute('SELECT * FROM plugin_reviews WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()
         if prior and not force and 0 <= time.time()-prior['updated'] < (600 if prior['state']=='running' else 21600) and prior['state']!='error':
             saved=json.loads(prior['body'])

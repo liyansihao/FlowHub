@@ -43,8 +43,7 @@ def admit_one(db, owner, now=None):
     now=time.time() if now is None else now
     schema(db)
     if control.paused(db,'seed'):return {'state':'paused'}
-    with db.connect() as c:
-        c.execute('BEGIN IMMEDIATE')
+    with db.write_transaction() as c:
         row=c.execute('SELECT * FROM pipeline_campaigns WHERE owner=? AND enabled=1',(owner,)).fetchone()
         if not row:return {'state':'disabled'}
         policy=json.loads(row['body'])

@@ -97,8 +97,7 @@ def replenish(db,owner,limit=20,now=None,explore_pending=False):
 def ingest(db,owner,sku,html,artifact,now=None):
     now=time.time() if now is None else now
     packet=parse_offers(html,sku);digest=hashlib.sha256(html.encode()).hexdigest()
-    with db.connect() as c:
-        c.execute('BEGIN IMMEDIATE')
+    with db.write_transaction() as c:
         if c.execute("SELECT 1 FROM sqlite_master WHERE name='pipeline_module_control'").fetchone():
             paused=c.execute("SELECT paused FROM pipeline_module_control WHERE module='seed'").fetchone()
             if paused and paused[0]:raise ValueError('seed_paused')
@@ -137,7 +136,11 @@ async def discover_one(db,owner,config,now=None):
     try:
         process=await asyncio.create_subprocess_exec('node',str(root/'bridges/other-sellers.mjs'),seed['sku'],
             str(root/'output/playwright/other-seller-expansion'),str(min(40,8*(seed['attempts']+1))),
-            cwd=root,env=os.environ|{'FLOWHUB_SOURCE_PROFILE':config['profile']},
+            cwd=root,env=os.environ|{
+                'FLOWHUB_SOURCE_PROFILE':config['profile'],
+                **({'FLOWHUB_SOURCE_EXTENSION_DIR':str(config['extension_dir'])} if config.get('extension_dir') else {}),
+                **({'FLOWHUB_SOURCE_CHROMIUM_EXECUTABLE':str(config['chromium_executable'])} if config.get('chromium_executable') else {}),
+            },
             stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
         output,error=await asyncio.wait_for(process.communicate(),120)
         if process.returncode:

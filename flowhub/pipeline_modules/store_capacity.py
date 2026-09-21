@@ -14,7 +14,7 @@ def observe(db,owner,store_id,quota,now=None):
     now=time.time() if now is None else now
     try:require_quota(quota);state='ready'
     except ValueError:state='blocked'
-    with db.connect() as c:
+    with db.write_transaction() as c:
         schema(c)
         c.execute('INSERT OR REPLACE INTO store_publication_capacity VALUES(?,?,?,?,?)',
                   (owner,store_id,state,json.dumps({'at':now,'quota':quota}),now+900))
@@ -26,7 +26,7 @@ def claim_check(db):
     if paused(db,'publication'):return None
     now=time.time()
     with db.connect() as c:
-        schema(c);c.execute('BEGIN IMMEDIATE')
+        schema(c)
         row=c.execute('''SELECT q.*,s.config,s.secret FROM store_publication_capacity q
             JOIN stores s ON s.owner=q.owner AND s.id=q.store_id
             WHERE q.state='blocked' AND q.next_check<=? AND s.verified=1

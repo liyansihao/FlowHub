@@ -237,8 +237,7 @@ def decide(db,owner,actor,sku,seller,action,note,expected,*,replay=False,review_
         return audit_decide(db,owner,actor,sku,seller,action,note,expected,replay=replay)
     if not isinstance(note,str) or not note.strip() or len(note)>1000:raise ValueError('请填写1至1000字的审核理由')
     note=note.strip()
-    with db.connect() as c:
-        c.execute('BEGIN IMMEDIATE')
+    with db.write_transaction() as c:
         prior=c.execute('SELECT body FROM human_reviews WHERE owner=? AND sku=? AND seller=? AND actor=? AND action=? AND note=? AND revision=?',(owner,sku,seller,actor,action,note,expected)).fetchone() if replay else None
         if prior:
             identity_only=json.loads(json.loads(prior[0])['queue']).get('same_product_only')

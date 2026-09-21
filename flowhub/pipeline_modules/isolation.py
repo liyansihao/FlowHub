@@ -69,8 +69,7 @@ def cleanup(db, *, now=None):
         return {'isolated': 0}
     now = time.time() if now is None else now
     count = 0
-    with db.connect() as c:
-        c.execute('BEGIN IMMEDIATE')
+    with db.write_transaction() as c:
         schema(c)
         paused = {r['module'] for r in c.execute('SELECT module FROM pipeline_module_control WHERE paused=1')}
         rows = c.execute('''SELECT q.* FROM plugin_pipeline q JOIN users u ON u.id=q.owner
@@ -117,8 +116,7 @@ class ReadBudgetTransport(httpx.AsyncBaseTransport):
         return await self.inner.handle_async_request(request)
 
     def reserve(self):
-        with self.db.connect() as c:
-            c.execute('BEGIN IMMEDIATE')
+        with self.db.write_transaction() as c:
             row = c.execute('SELECT * FROM queue_isolation_budget WHERE id=1').fetchone()
             if row is None:
                 raise BudgetDeferred('budget_not_initialized')
@@ -194,8 +192,8 @@ def claim_inspection(db):
     if not enabled(db):
         return False
     now = time.time(); token = secrets.token_hex(16)
-    with db.connect() as c:
-        c.execute('BEGIN IMMEDIATE'); schema(c)
+    with db.write_transaction() as c:
+        schema(c)
         if c.execute("SELECT 1 FROM pipeline_module_control WHERE module='publication' AND paused=1").fetchone():
             return False
         budget = c.execute('SELECT * FROM queue_isolation_budget WHERE id=1').fetchone()
@@ -239,8 +237,7 @@ async def tick(db):
         await database_work(release_lease,db,key,token)
 
 def finish_inspection(db,key,token,result,library):
-    with db.connect() as c:
-        c.execute('BEGIN IMMEDIATE')
+    with db.write_transaction() as c:
         current = c.execute('SELECT * FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?', key).fetchone()
         lease = c.execute('SELECT token FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=?', key).fetchone()
         if not current or current['state'] != 'quarantined' or not lease or lease[0] != token:

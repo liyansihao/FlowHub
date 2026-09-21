@@ -63,8 +63,7 @@ class ERPRelay:
     def submit(self, device, request, product=None):
         validate(request)
         now = self.hub.clock()
-        with self.hub.connect() as c:
-            c.execute('BEGIN IMMEDIATE')
+        with self.hub.write_transaction() as c:
             ready = c.execute('''SELECT 1 FROM devices d JOIN erp_devices e ON e.device=d.id
                 WHERE d.id=? AND d.enabled=1 AND e.version=2 AND e.last_seen>?''',
                 (device, now - 10)).fetchone()
@@ -82,8 +81,7 @@ class ERPRelay:
 
     def claim(self, token):
         now = self.hub.clock()
-        with self.hub.connect() as c:
-            c.execute('BEGIN IMMEDIATE')
+        with self.hub.write_transaction() as c:
             device = self.hub.auth(c, token)
             c.execute('INSERT OR REPLACE INTO erp_devices VALUES(?,?,?)', (device, 2, now))
             c.execute("UPDATE erp_commands SET state='unknown',payload=NULL WHERE deadline<=? AND state IN ('queued','claimed','executing')", (now,))
@@ -95,8 +93,7 @@ class ERPRelay:
             return {'id': row['id'], 'lease': row['lease']}
 
     def begin(self, token, identity, lease):
-        with self.hub.connect() as c:
-            c.execute('BEGIN IMMEDIATE')
+        with self.hub.write_transaction() as c:
             device = self.hub.auth(c, token)
             row = c.execute("SELECT * FROM erp_commands WHERE id=? AND device=? AND lease=? AND state='claimed' AND deadline>?", (identity, device, lease, self.hub.clock() + 16)).fetchone()
             if not row:
@@ -107,8 +104,7 @@ class ERPRelay:
     def complete(self, token, identity, lease, result):
         if len(json.dumps(result)) > 8_000_000:
             raise HTTPException(413, 'ERP result too large')
-        with self.hub.connect() as c:
-            c.execute('BEGIN IMMEDIATE')
+        with self.hub.write_transaction() as c:
             device = self.hub.auth(c, token)
             row = c.execute('SELECT * FROM erp_commands WHERE id=? AND device=? AND lease=?', (identity, device, lease)).fetchone()
             if not row:

@@ -24,11 +24,11 @@ def set_paused(db, module, value):
     if module not in MODULES:
         raise ValueError('unknown module')
     schema(db)
-    with db.connect() as c:
+    with db.write_transaction() as c:
         c.execute('INSERT OR REPLACE INTO pipeline_module_control VALUES(?,?,?)', (module, int(value), time.time()))
 
 
 def record(db, module, owner, sku, started, outcome, details=None):
-    with db.connect() as c:
+    with db.write_transaction() as c:
         c.execute('INSERT INTO pipeline_module_events(module,owner,sku,started,finished,outcome,details) VALUES(?,?,?,?,?,?,?)',
                   (module, owner, sku, started, time.time(), outcome, json.dumps(details or {})))

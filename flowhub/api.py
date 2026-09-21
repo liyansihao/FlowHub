@@ -394,8 +394,7 @@ def create_app(database=None):
     def workflow_action(action: str, p: StartSelection | None = None, owner=Depends(scope)):
         if action not in ("start", "pause"):
             raise HTTPException(404)
-        with db.connect() as c:
-            c.execute("BEGIN IMMEDIATE")
+        with db.write_transaction() as c:
             w = c.execute("SELECT * FROM workflows WHERE owner=?", (owner,)).fetchone()
             rules = json.loads(w["rules"])
             if action == "start":

@@ -116,8 +116,7 @@ async def retry_authorized(db, context, identifiers, authorization_id, client=No
         if not isinstance(detail,dict) or not detail.get('skus'):raise ValueError('incomplete source backup')
         backup={'draft_row':present[identifier],'fresh_detail':detail,'at':time.time(),
                 'scope':'explicit-authorized-retry','authorization_id':authorization_id,'previous_receipt':dict(old)}
-        with db.connect() as c:
-            c.execute('BEGIN IMMEDIATE')
+        with db.write_transaction() as c:
             if any(not c.execute('SELECT paused FROM pipeline_module_control WHERE module=?',(m,)).fetchone()[0] for m in control.MODULES):
                 raise RuntimeError('maintenance pause changed')
             inserted=c.execute('INSERT OR IGNORE INTO collection_reset_overrides VALUES(?,?,?,?,?)',
@@ -153,8 +152,7 @@ async def maintenance(db, context, *, automatic=False):
         # A crashed maintenance run leaves pauses in place; never guess prior intent.
         if receipt_path.exists() and json.loads(receipt_path.read_text()).get('state') in ('draining','clearing'):
             raise RuntimeError('unfinished maintenance: inspect saved pauses before resume')
-        with db.connect() as c:
-            c.execute('BEGIN IMMEDIATE')
+        with db.write_transaction() as c:
             prior=dict(c.execute('SELECT module,paused FROM pipeline_module_control'))
             if automatic and any(prior.values()):return {'state':'paused'}
             receipt['prior_paused']=prior

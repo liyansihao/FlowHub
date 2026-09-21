@@ -154,8 +154,7 @@ class Acquisition:
 
     def claim(self):
         now = time.time()
-        with self.db.connect() as c:
-            c.execute("BEGIN IMMEDIATE")
+        with self.db.write_transaction() as c:
             if c.execute("SELECT 1 FROM sqlite_master WHERE name='pipeline_module_control'").fetchone():
                 if c.execute(
                     "SELECT 1 FROM pipeline_module_control WHERE module='seed' AND paused=1"
@@ -212,8 +211,7 @@ class Acquisition:
 
     def save(self, *, legacy=None):
         now = time.time()
-        with self.db.connect() as c:
-            c.execute("BEGIN IMMEDIATE")
+        with self.db.write_transaction() as c:
             if not self.owned(c):
                 raise AcquisitionPending("acquisition_ownership_changed", delay=5)
             if legacy:
@@ -430,8 +428,7 @@ class Acquisition:
                 # The next tick checks the fresh observation; no second request.
                 await asyncio.to_thread(self.save)
                 return
-            with self.db.connect() as c:
-                c.execute("BEGIN IMMEDIATE")
+            with self.db.write_transaction() as c:
                 row = c.execute(
                     "SELECT * FROM collection_capacity WHERE account=?", (self.account,)
                 ).fetchone()

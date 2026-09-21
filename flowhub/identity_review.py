@@ -82,8 +82,7 @@ async def evaluate(db,owner,sku,seller):
         if ranked and ranked.get('candidates') and verdict(cb)!='mismatch':
             cb=await screen(candidate,keys.get('dashscope_api_key',''),ranking=ranked)
     identity=identity_result(cb,candidate,reused=reusable,observed_at=report.get('finished_at') if reusable else None)
-    with db.connect() as c:
-        c.execute('BEGIN IMMEDIATE')
+    with db.write_transaction() as c:
         latest=c.execute('SELECT body FROM sourcing_products WHERE owner=? AND sku=? AND seller=?',key).fetchone()
         if fingerprint(envelope(json.loads(latest[0])))!=fingerprint(candidate):raise ValueError('comparison_input_changed')
         latest_report=c.execute('SELECT body FROM plugin_reviews WHERE owner=? AND sku=? AND seller=?',key).fetchone()
