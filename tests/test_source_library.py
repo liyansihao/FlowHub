@@ -600,4 +600,4 @@ def test_admission_index_keeps_exact_source_binding_rules(tmp_path):
         actual=[tuple(r) for r in c.execute('SELECT sku FROM sourcing_products WHERE '+condition+' ORDER BY id',('o',))]
         assert actual==expected==[('0',),('5',)]
         plan=' '.join(str(tuple(r)) for r in c.execute('EXPLAIN QUERY PLAN SELECT * FROM sourcing_products WHERE '+condition,('o',)))
-        assert 'sourcing_admission_candidates' in plan
+        assert any(name in plan for name in ('sourcing_admission_candidates','sourcing_admission_candidate_keys'))

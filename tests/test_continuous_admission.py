@@ -344,3 +344,37 @@ def test_campaign_renewal_filters_terminal_and_missing_queues_without_losing_his
             b=json.loads(c.execute('SELECT body FROM plugin_publications WHERE sku=?',(sku,)).fetchone()[0])
             assert b['continuations'][0]=={'previous':'preserved'}
             assert len(b['continuations'])==(2 if sku in ('active','null') else 1)
+
+
+def test_upgraded_admission_filters_identities_without_reading_product_table(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    db, owner = setup(tmp_path)
+    # Simulate an existing release, retaining its older competing partial index.
+    with db.connect() as c:
+        c.execute('DROP INDEX sourcing_admission_candidate_keys')
+        c.execute('DROP INDEX plugin_pipeline_owner_state_keys')
+    db = Database(tmp_path)
+    original = db.connect
+    statements = []
+
+    @contextmanager
+    def traced():
+        with original() as c:
+            c.set_trace_callback(statements.append)
+            yield c
+
+    monkeypatch.setattr(db, 'connect', traced)
+    assert admit_one(db, owner)['sku'] == '1'
+    query = next(q for q in statements if q.startswith('SELECT p.id FROM sourcing_products'))
+    with original() as c:
+        root = c.execute("SELECT rootpage FROM sqlite_master WHERE name='sourcing_products'").fetchone()[0]
+        ops = c.execute('EXPLAIN ' + query).fetchall()
+        table_cursors = {r[2] for r in ops if r[1] == 'OpenRead' and r[3] == root}
+        assert not any(r[1] == 'Column' and r[2] in table_cursors for r in ops)
+        assert c.execute("SELECT 1 FROM sqlite_master WHERE name='sourcing_admission_candidates'").fetchone()
+        plan = c.execute('''EXPLAIN QUERY PLAN SELECT r.* FROM plugin_routes r
+            JOIN plugin_pipeline q USING(owner,sku,seller)
+            WHERE r.owner=? AND r.run_id=? AND r.expires<=?
+              AND (q.state IS NULL OR q.state NOT IN ('selling','rejected'))''',
+            (owner, 'test', 100)).fetchall()
+        assert any('COVERING INDEX plugin_pipeline_owner_state_keys' in r[3] for r in plan)

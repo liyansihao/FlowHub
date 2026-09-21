@@ -8,6 +8,7 @@ from . import control
 
 def schema(db):
     def initialize():
+        SourceLibrary(db)
         from ..plugin_pipeline import schema as queue_schema
         queue_schema(db)
         with db.connect() as c:
@@ -94,7 +95,8 @@ def admit_one(db, owner, now=None):
         cohort=json.dumps([str(s) for s in policy.get('acceptance_skus',[])][:100])
         # Sort only identities while holding the admission write transaction;
         # load each inspected payload by primary key in that same transaction.
-        rows=c.execute('''SELECT p.id FROM sourcing_products p WHERE p.owner=?
+        # Keep identity exclusions index-only even when the older partial index exists.
+        rows=c.execute('''SELECT p.id FROM sourcing_products p INDEXED BY sourcing_admission_candidate_keys WHERE p.owner=?
           AND json_extract(p.body,'$.coverage') IN ('storefront-page','maozi-exact-seller-page')
           AND json_extract(p.body,'$.source_relation.seller_id')=json_extract(p.body,'$.seller_id')
           AND json_array_length(json_extract(p.body,'$.source_relation.root_seeds'))>0

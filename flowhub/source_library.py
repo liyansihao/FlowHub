@@ -152,6 +152,10 @@ class SourceLibrary:
               WHERE json_extract(body,'$.coverage') IN ('storefront-page','maozi-exact-seller-page')
               AND json_extract(body,'$.source_relation.seller_id')=json_extract(body,'$.seller_id')
               AND json_array_length(json_extract(body,'$.source_relation.root_seeds'))>0;
+            CREATE INDEX IF NOT EXISTS sourcing_admission_candidate_keys ON sourcing_products(owner,id,sku)
+              WHERE json_extract(body,'$.coverage') IN ('storefront-page','maozi-exact-seller-page')
+              AND json_extract(body,'$.source_relation.seller_id')=json_extract(body,'$.seller_id')
+              AND json_array_length(json_extract(body,'$.source_relation.root_seeds'))>0;
             CREATE TABLE IF NOT EXISTS sourcing_evidence(
               owner TEXT NOT NULL,hash TEXT NOT NULL,sku TEXT NOT NULL,body TEXT NOT NULL,at REAL NOT NULL,
               PRIMARY KEY(owner,hash));
