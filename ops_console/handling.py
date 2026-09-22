@@ -1,7 +1,6 @@
 """Internal handling flags and a credential-free cloud snapshot mirror."""
 import asyncio
 import hashlib
-import hmac
 import json
 import time
 from pathlib import Path
@@ -46,8 +45,7 @@ class Handling:
     def cloud_link(self):
         if not self.config:
             return ''
-        token = hmac.new(self.config['token'].encode(), b'flowhub-operations-access-v1', hashlib.sha256).hexdigest()
-        return 'https://flowhub-review.vercel.app/operations/#access=' + token
+        return 'https://flowhub-review.vercel.app/operations/'
 
     async def request(self, mode='view', body=None):
         lines = ['url = ' + json.dumps(self.config['url'] + '?mode=' + mode),

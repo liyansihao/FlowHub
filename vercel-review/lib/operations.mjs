@@ -1,23 +1,15 @@
-import {createHmac,timingSafeEqual} from 'node:crypto';
-export const accessToken=secret=>createHmac('sha256',secret).update('flowhub-operations-access-v1').digest('hex');
+import {timingSafeEqual} from 'node:crypto';
 const equal=(a,b)=>typeof a==='string'&&Buffer.byteLength(a)===Buffer.byteLength(b)&&timingSafeEqual(Buffer.from(a),Buffer.from(b));
 const json=(data,status=200,headers={})=>Response.json(data,{status,headers:{'cache-control':'no-store',...headers}});
 export const rowKey=r=>JSON.stringify([r.kind,r.store_id,String(r.scheme||''),String(r.id)]);
 export async function serveOperations(c,request,secret){
  const url=new URL(request.url),mode=url.searchParams.get('mode')||'view';
- const token=accessToken(secret),sync=equal(request.headers.get('x-sync-token'),secret);
- const cookie=(request.headers.get('cookie')||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('ops_access='))?.slice(11);
- const auth=sync||equal(request.headers.get('x-ops-access'),token)||equal(cookie,token);
+ const sync=equal(request.headers.get('x-sync-token'),secret);
  if(!['GET','POST'].includes(request.method))return json({error:'method_not_allowed'},405);
- if(request.method==='POST'&&!sync&&!request.headers.has('x-ops-access')){
+ if(request.method==='POST'&&!sync){
   if(request.headers.get('origin')!==url.origin||request.headers.get('x-ops-request')!=='1')return json({error:'请求来源校验失败'},403);
  }
  let input={};if(request.method==='POST'){try{input=await request.json();}catch{return json({error:'invalid_json'},422);}}
- if(mode==='session'&&request.method==='POST'){
-  if(!equal(input.token,token))return json({error:'访问凭证无效，请从本机运营工作台打开云端运营'},401);
-  return json({ok:true},200,{'set-cookie':`ops_access=${token}; Path=/api/operations; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000`});
- }
- if(!auth)return json({error:'请从本机运营工作台点击「云端运营」，授权此浏览器访问。'},401);
  const get=async key=>(await c.query('SELECT value FROM flowhub_review_blobs WHERE key=$1',[key])).rows[0]?.value;
  const put=async(key,value)=>c.query('INSERT INTO flowhub_review_blobs(key,value) VALUES($1,$2::jsonb) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value',[key,JSON.stringify(value)]);
  if(mode==='snapshot'&&request.method==='POST'){
