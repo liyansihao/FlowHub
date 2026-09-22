@@ -3,6 +3,7 @@ import asyncio,json,time,uuid
 from .maozi import MaoziPublisher
 from .source_delists import read_delists
 from .official_api import OfficialDeferred
+from .pipeline_modules.database_work import run as database_work
 
 
 def schema(db):
@@ -95,7 +96,7 @@ async def remove(db,key,body):
   if str(row.get('archived_type','')).lower() in ('manual','archived','archive','deleted') or row.get('online_status') in ('archived','deleted','disabled'):
    target['archived_verified']=True;continue
   if not target.get('archive_dispatched'):
-   target['archive_dispatched']=True;save(db,key,'running',body)
+   target['archive_dispatched']=True;await database_work(save,db,key,'running',body)
    await api.erp('POST','/api.product.online/archive',body={'ids':[int(row['id'])]})
    await api.erp('POST','/api.product.online/sync_shop',body={'ids':[int(target['shop_id'])],'type':'all'})
   pending=True;target['phase']='archive_readback'
@@ -194,7 +195,6 @@ async def prepare_listing(db,key,body):
    c.execute('INSERT OR REPLACE INTO plugin_publication_permissions VALUES(?,?,?,?,?)',(*key,expiry,'用户要求网站同款上架'))
    q=json.loads(c.execute('SELECT body FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?',key).fetchone()[0]);q.update(listing_control_id=body['id'],same_product_only=True);q.pop('repair_retry',None);q.pop('error',None);q.pop('reason',None)
    c.execute("UPDATE plugin_pipeline SET state='publishing',body=?,due=0,attempts=0 WHERE owner=? AND sku=? AND seller=?",(json.dumps(q),*key))
- from .pipeline_modules.database_work import run as database_work
  await database_work(persist_ready)
  return 'waiting',body|{'phase':'publication_pipeline'}
 
@@ -218,12 +218,11 @@ def claim_listing(db, *, target=None):
 
 
 async def tick(db, *, target=None):
- from .pipeline_modules.database_work import run as database_work
- task=asyncio.create_task(asyncio.to_thread(claim_listing,db,target=target))
+ from .pipeline_modules.database_work import run as database_work, cancelled_claim, cancelled_cleanup
+ task=asyncio.create_task(database_work(claim_listing,db,target=target))
  try:claimed=await asyncio.shield(task)
  except asyncio.CancelledError:
-  claimed=await task
-  if claimed:await database_work(finish_listing,db,claimed[1],'waiting',claimed[2],claimed[3])
+  await cancelled_claim(task, lambda claimed: database_work(finish_listing,db,claimed[1],'waiting',claimed[2],claimed[3]))
   raise
  if not claimed:return False
  row,key,body,token=claimed
@@ -238,7 +237,7 @@ async def tick(db, *, target=None):
  except OfficialDeferred as e:
   state='waiting';body['next_attempt_at']=e.until;body['dependency_wait']=e.reason
  except asyncio.CancelledError:
-  await database_work(finish_listing,db,key,'waiting',body,token)
+  await cancelled_cleanup(database_work(finish_listing,db,key,'waiting',body,token))
   raise
  except Exception as e:state='blocked';body['error']=(str(e) or type(e).__name__)[:220]
  if state=='waiting' and body.get('phase') not in ('publication_pipeline','capacity_wait') and time.time()-max(body['requested_at'],body.get('workflow_repaired_at',0))>1800:state='blocked';body['error']='上下架回查尚未完成，请查看原记录后重试'
@@ -247,14 +246,18 @@ async def tick(db, *, target=None):
 
 
 async def run(db):
- schema(db)
- with db.connect() as c:c.execute("UPDATE product_listing_controls SET state='waiting' WHERE state='running' AND updated<?",(time.time()-360,))
+ from .pipeline_modules.database_work import run as database_work
+ from .pipeline_modules.control import paused
+ def initialize():
+  schema(db)
+  with db.connect() as c:c.execute("UPDATE product_listing_controls SET state='waiting' WHERE state='running' AND updated<?",(time.time()-360,))
+ await database_work(initialize)
  while True:
-  from .pipeline_modules.control import paused
-  if paused(db,'publication'):
+  if await database_work(paused,db,'publication'):
    await asyncio.sleep(2);continue
-  try:worked=await tick(db)
-  except Exception:db.health('listing-control-error');worked=False
+  # Per-item business failures are persisted by tick. Infrastructure failures
+  # propagate to this loop's supervisor, without another SQLite health write.
+  worked=await tick(db)
   await asyncio.sleep(.2 if worked else 2)
 
 
@@ -268,7 +271,7 @@ async def restore(db,key,body,api,cfg,targets,blocks):
   if str(row.get('sku')) in blocks['skus'] or (target['shop_id'],target['offer_id']) in prohibited or ('*',target['offer_id']) in prohibited:raise ValueError('该商品在飞书明确下架清单中')
   if row.get('online_status')=='archived' or row.get('archived_type') in ('manual','auto'):
    if not target.get('restore_dispatched'):
-    target['restore_dispatched']=True;save(db,key,'running',body)
+    target['restore_dispatched']=True;await database_work(save,db,key,'running',body)
     await api.erp('POST','/api.product.online/unarchive',body={'ids':[int(row['id'])]})
     await api.erp('POST','/api.product.online/sync_shop',body={'ids':[int(target['shop_id'])],'type':'all'})
    pending=True;continue

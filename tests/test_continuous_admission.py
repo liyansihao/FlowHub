@@ -372,9 +372,10 @@ def test_upgraded_admission_filters_identities_without_reading_product_table(tmp
         table_cursors = {r[2] for r in ops if r[1] == 'OpenRead' and r[3] == root}
         assert not any(r[1] == 'Column' and r[2] in table_cursors for r in ops)
         assert c.execute("SELECT 1 FROM sqlite_master WHERE name='sourcing_admission_candidates'").fetchone()
-        plan = c.execute('''EXPLAIN QUERY PLAN SELECT r.* FROM plugin_routes r
-            JOIN plugin_pipeline q USING(owner,sku,seller)
+        plan = c.execute('''EXPLAIN QUERY PLAN SELECT r.* FROM plugin_pipeline q INDEXED BY plugin_pipeline_renewable_keys
+            CROSS JOIN plugin_routes r INDEXED BY plugin_routes_campaign_keys USING(owner,sku,seller)
             WHERE r.owner=? AND r.run_id=? AND r.expires<=?
               AND (q.state IS NULL OR q.state NOT IN ('selling','rejected'))''',
             (owner, 'test', 100)).fetchall()
-        assert any('COVERING INDEX plugin_pipeline_owner_state_keys' in r[3] for r in plan)
+        assert any('COVERING INDEX plugin_routes_campaign_keys' in r[3] and 'expires<?' in r[3] for r in plan)
+        assert any('plugin_pipeline_renewable_keys' in r[3] for r in plan)

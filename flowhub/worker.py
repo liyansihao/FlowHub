@@ -330,17 +330,17 @@ class Worker:
             return dict(r) | {"lease": lease}
 
     async def step(self):
-        from .pipeline_modules.database_work import run as database_work
-        claim_task=asyncio.create_task(asyncio.to_thread(self.claim))
+        from .pipeline_modules.database_work import run as database_work, cancelled_claim
+        claim_task=asyncio.create_task(database_work(self.claim))
         try:
             job=await asyncio.shield(claim_task)
         except asyncio.CancelledError:
-            job=await claim_task
-            if job:
+            async def cleanup(job):
                 def release():
                     with self.db.connect() as c:
-                        c.execute("UPDATE jobs SET lease=NULL,lease_until=0 WHERE id=? AND lease=?",(job['id'],job['lease']))
+                        c.execute('UPDATE jobs SET lease=NULL,lease_until=0 WHERE id=? AND lease=?',(job['id'],job['lease']))
                 await database_work(release)
+            await cancelled_claim(claim_task, cleanup)
             raise
         except sqlite3.OperationalError as error:
             if 'locked' not in str(error).lower() and 'busy' not in str(error).lower():raise

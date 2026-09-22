@@ -11,7 +11,7 @@ from pathlib import Path
 from ..browser_source import BrowserSource
 from ..source_acquisition import erp_request
 from . import control
-from .database_work import run as database_work
+from .database_work import run as database_work, read as database_read
 
 SEED_RESOLUTION_MAX_ATTEMPTS = 4  # Initial read plus three delayed retries.
 
@@ -211,7 +211,7 @@ async def tick(db,config):
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:return {'state':'busy'}
         enrolled=await database_work(sync_stores,db,owner,config['run_id'])
-        last,backlog=await database_work(backlog_state,db,owner)
+        last,backlog=await database_read(backlog_state,db,owner)
         if now-last>=config.get('resolve_interval_seconds',120):
             result=await resolve_one(db,owner)
             await database_work(control.record,db,'seed',owner,result.get('sku',''),now,result['state'],result)

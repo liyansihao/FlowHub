@@ -1,7 +1,7 @@
 """Durable queue isolation. Remote inspection is strictly read-only and request-budgeted."""
 import json
 import asyncio
-from .database_work import run as database_work
+from .database_work import run as database_work, cancelled_claim, cancelled_cleanup
 import secrets
 import time
 from dataclasses import asdict
@@ -218,11 +218,10 @@ def claim_inspection(db):
 
 async def tick(db):
     from ..plugin_pipeline import release_lease
-    task=asyncio.create_task(asyncio.to_thread(claim_inspection,db))
+    task=asyncio.create_task(database_work(claim_inspection,db))
     try:claimed=await asyncio.shield(task)
     except asyncio.CancelledError:
-        claimed=await task
-        if claimed:await database_work(release_lease,db,claimed[1],claimed[2])
+        await cancelled_claim(task, lambda claimed: database_work(release_lease,db,claimed[1],claimed[2]))
         raise
     if not claimed:return False
     row,key,token=claimed
@@ -235,8 +234,12 @@ async def tick(db):
         except Exception as error:
             result = {'result': 'read_deferred', 'error_type': type(error).__name__}
         return await database_work(finish_inspection,db,key,token,result,library)
+    except asyncio.CancelledError:
+        await cancelled_cleanup(database_work(release_lease,db,key,token))
+        raise
     finally:
-        await database_work(release_lease,db,key,token)
+        if not asyncio.current_task().cancelling():
+            await database_work(release_lease,db,key,token)
 
 def finish_inspection(db,key,token,result,library):
     with db.connect() as c:

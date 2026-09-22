@@ -7,7 +7,7 @@ import time
 
 import httpx
 from .review_transport import request as review_request
-from .pipeline_modules.database_work import run as database_work
+from .pipeline_modules.database_work import run as database_work, read as database_read
 
 
 def current_snapshot(db, owner):
@@ -87,7 +87,7 @@ async def sync_once(db, config, *, refresh=True):
             except Exception:
                 await database_work(db.health,"remote-review-ack-error")
         if decisions or refresh:
-            snapshot=await database_work(current_snapshot,db,owner)
+            snapshot=await database_read(current_snapshot,db,owner)
             if config.get('FLOWHUB_REVIEW_PROTOCOL')=='delta-v1' and remote.get('protocol')=='delta-v1':
                 from .review_delta import upload
                 await upload(db,config,client,snapshot,remote.get('cursor',''),review_request)

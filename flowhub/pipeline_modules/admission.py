@@ -18,6 +18,9 @@ def schema(db):
             CREATE TABLE IF NOT EXISTS pipeline_admissions(owner TEXT,sku TEXT,seller TEXT,at REAL,body TEXT,PRIMARY KEY(owner,sku));
             CREATE TABLE IF NOT EXISTS plugin_routes(owner TEXT,sku TEXT,seller TEXT,store_id TEXT,expires REAL,run_id TEXT,PRIMARY KEY(owner,sku,seller));
             CREATE TABLE IF NOT EXISTS plugin_publication_permissions(owner TEXT,sku TEXT,seller TEXT,expires REAL,reason TEXT,PRIMARY KEY(owner,sku,seller));
+            CREATE INDEX IF NOT EXISTS plugin_routes_campaign_keys ON plugin_routes(owner,run_id,sku,seller,expires,store_id);
+            CREATE INDEX IF NOT EXISTS plugin_pipeline_renewable_keys ON plugin_pipeline(owner,sku,seller) WHERE state IS NULL OR state NOT IN ('selling','rejected');
+            CREATE INDEX IF NOT EXISTS pipeline_admissions_run ON pipeline_admissions(owner,json_extract(body,'$.run_id'));
             ''')
     db.schema_once('pipeline_modules.admission', initialize)
 
@@ -167,8 +170,8 @@ def renew_campaign(c, owner, policy, now):
     """Only an active continuous campaign authorizes a new write window; keep every old one."""
     if not policy.get('continuous'):return
     expiry=min(now+policy.get('write_window_seconds',21600),policy.get('until') or float('inf'))
-    for r in c.execute('''SELECT r.* FROM plugin_routes r
-        JOIN plugin_pipeline q USING(owner,sku,seller)
+    for r in c.execute('''SELECT r.* FROM plugin_pipeline q INDEXED BY plugin_pipeline_renewable_keys
+        CROSS JOIN plugin_routes r INDEXED BY plugin_routes_campaign_keys USING(owner,sku,seller)
         WHERE r.owner=? AND r.run_id=? AND r.expires<=?
           AND (q.state IS NULL OR q.state NOT IN ('selling','rejected'))''',
         (owner,policy['run_id'],now)).fetchall():
@@ -191,7 +194,7 @@ async def run(db):
         for owner in owners:
             started=time.time()
             try:
-                result=await asyncio.to_thread(admit_one,db,owner)
+                result=await database_work(admit_one,db,owner)
             except Exception as error:
                 result={'state':'error','reason':type(error).__name__}
             await database_work(control.record,db,'seed',owner,'',started,result['state'],result)

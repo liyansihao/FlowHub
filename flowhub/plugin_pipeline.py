@@ -123,14 +123,13 @@ def claim(db, lane=None, *, target=None, run_paused=False, repair_kind=None, rep
 
 
 async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None, repair_stage=None, acquisition_route=None):
-    from .pipeline_modules.database_work import run as database_work
-    claim_task=asyncio.create_task(asyncio.to_thread(claim,db,lane,target=target,run_paused=run_paused,
+    from .pipeline_modules.database_work import run as database_work, cancelled_claim, cancelled_cleanup
+    claim_task=asyncio.create_task(database_work(claim,db,lane,target=target,run_paused=run_paused,
         repair_kind=repair_kind,repair_stage=repair_stage,acquisition_route=acquisition_route))
     try:
         claimed=await asyncio.shield(claim_task)
     except asyncio.CancelledError:
-        claimed=await claim_task
-        if claimed:await database_work(release_lease,db,claimed[1],claimed[2])
+        await cancelled_claim(claim_task, lambda claimed: database_work(release_lease,db,claimed[1],claimed[2]))
         raise
     if not claimed:return False
     row,key,token=claimed
@@ -279,7 +278,7 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
         # An uncertain publication remains resumable in its immutable ERP journal.
         if state not in ('publishing','awaiting_remote') and attempts>=8:state='needs_review'
     except asyncio.CancelledError:
-        await database_work(release_lease,db,key,token)
+        await cancelled_cleanup(database_work(release_lease,db,key,token))
         raise
     finally:
         heartbeat.cancel()

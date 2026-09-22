@@ -1,6 +1,6 @@
 """Bounded independent lanes; pending stock/readback has reserved capacity."""
 import asyncio
-from . import control
+from . import control, supervision
 
 
 async def publication_tick(db, name, index, tick):
@@ -14,7 +14,7 @@ async def publication_tick(db, name, index, tick):
 
 
 async def run(db, *, review_workers=2, submit_workers=2, reconcile_workers=2, seed_workers=1):
-    from .database_work import run as database_work, health as database_health
+    from .database_work import run as database_work, drain
     from ..plugin_pipeline import tick
     from ..comparebot_process import close_workers
     if not all(1 <= n <= 4 for n in (review_workers, submit_workers, reconcile_workers)):
@@ -42,68 +42,59 @@ async def run(db, *, review_workers=2, submit_workers=2, reconcile_workers=2, se
                 if not await database_work(can_expand,db):
                     await asyncio.sleep(5)
                     continue
-            try:
-                if name=='repair_validation':
-                    worked=await tick(db,lane='seed_repair',repair_kind='publication',repair_stage='validate')
-                elif name in ('repair_publication','repair_acquisition') and operation_repairs:
-                    worked=await tick(db,lane='seed_repair',repair_kind='publication',repair_stage='acquire',acquisition_route=name=='repair_acquisition')
-                elif name in ('repair_valuation','repair_publication'):
-                    worked=await tick(db,lane='seed_repair',repair_kind=name.removeprefix('repair_'))
-                elif name=='seed_repair' and seed_workers==2:
-                    from .repair_queue import tick_repair
-                    worked=await tick_repair(db,index,tick)
-                elif name in ('submit','reconcile'):
-                    worked = await publication_tick(db,name,index,tick)
-                else:
-                    worked = await tick(db, lane='review' if name=='remote_review' else name)
-            except Exception:
-                await database_health(db,'pipeline-' + name + '-error')
-                worked = False
+            if name=='repair_validation':
+                worked=await tick(db,lane='seed_repair',repair_kind='publication',repair_stage='validate')
+            elif name in ('repair_publication','repair_acquisition') and operation_repairs:
+                worked=await tick(db,lane='seed_repair',repair_kind='publication',repair_stage='acquire',acquisition_route=name=='repair_acquisition')
+            elif name in ('repair_valuation','repair_publication'):
+                worked=await tick(db,lane='seed_repair',repair_kind=name.removeprefix('repair_'))
+            elif name=='seed_repair' and seed_workers==2:
+                from .repair_queue import tick_repair
+                worked=await tick_repair(db,index,tick)
+            elif name in ('submit','reconcile'):
+                worked = await publication_tick(db,name,index,tick)
+            else:
+                worked = await tick(db, lane='review' if name=='remote_review' else name)
             await asyncio.sleep(60 if name=='reconcile_history' and worked else 5 if name=='reconcile_history' else .05 if worked else .5)
 
     async def repair_maintenance():
         from .repair_cleanup import cleanup
         while True:
-            try:
-                await asyncio.to_thread(cleanup,db)
-            except Exception:
-                await database_health(db,'repair-cleanup-error')
+            await database_work(cleanup,db)
             await asyncio.sleep(60)
 
     async def isolated_readback():
         from .isolation import tick as inspect_isolated
         while True:
-            try:
-                await inspect_isolated(db)
-            except Exception:
-                await database_health(db,"queue-isolation-read-error")
+            await inspect_isolated(db)
             await asyncio.sleep(15)
 
     repairs=[('repair_valuation',repair_policy['valuation_workers']),('repair_publication',repair_policy['publication_workers'])] if repair_policy['enabled'] else [('seed_repair',seed_workers)]
     if operation_repairs and repair_policy['enabled']:repairs.extend([('repair_validation',1),('repair_acquisition',1)])
-    tasks = [asyncio.create_task(lane(name,index)) for name, count in
-             repairs+[('review', review_workers), ('submit', submit_workers), ('reconcile', reconcile_workers), ('reconcile_history',1)] for index in range(count)]
-    tasks.extend(asyncio.create_task(lane('remote_review',index)) for index in range(2))
-    tasks.append(asyncio.create_task(repair_maintenance()))
-    tasks.append(asyncio.create_task(isolated_readback()))
+    tasks = []
+    def start(name, factory):
+        tasks.append(asyncio.create_task(supervision.run(name, factory, db.directory), name=name))
+    for name, count in repairs+[('review', review_workers), ('submit', submit_workers), ('reconcile', reconcile_workers), ('reconcile_history',1), ('remote_review',2)]:
+        for index in range(count):
+            start(f'{name}:{index}', lambda name=name, index=index: lane(name,index))
+    start('repair_maintenance', repair_maintenance)
+    start('isolated_readback', isolated_readback)
     from ..listing_controls import run as listing_control_loop
-    tasks.append(asyncio.create_task(listing_control_loop(db)))
     from .admission import run as admission_loop
-    tasks.append(asyncio.create_task(admission_loop(db)))
     from .source_loop import run as source_loop
-    tasks.append(asyncio.create_task(source_loop(db)))
     from .draft_cleanup import run as draft_cleanup
-    tasks.append(asyncio.create_task(draft_cleanup(db)))
     from .favorite_cleanup import run as favorite_cleanup
-    tasks.append(asyncio.create_task(favorite_cleanup(db)))
     from .store_capacity import run as capacity_loop
-    tasks.append(asyncio.create_task(capacity_loop(db)))
+    for name, factory in [('listing_controls',listing_control_loop),('admission',admission_loop),
+                          ('source',source_loop),('draft_cleanup',draft_cleanup),
+                          ('favorite_cleanup',favorite_cleanup),('store_capacity',capacity_loop)]:
+        start(name, lambda factory=factory: factory(db))
     try:
         await asyncio.gather(*tasks)
     finally:
         for task in tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await drain(asyncio.gather(*tasks, return_exceptions=True))
         from ..acquisition import close_runners
         await close_runners()
         await close_workers()

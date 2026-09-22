@@ -51,25 +51,30 @@ async def guard(collector, *, reserve=False):
     if not cfg['enabled']:
         return
     scope = account(collector.c)
-    with db.connect() as c:
-        schema(c)
-        row = c.execute('SELECT * FROM collection_capacity WHERE account=?', (scope,)).fetchone()
+    from .pipeline_modules.database_work import run as database_work
+    def read_observation():
+        with db.connect() as c:
+            schema(c)
+            return c.execute('SELECT * FROM collection_capacity WHERE account=?', (scope,)).fetchone()
+    row = await database_work(read_observation)
     if not row or not 0 <= time.time() - row['observed'] < cfg['max_age']:
         started = time.time()
         header = await collector.call('/api.product.collect/lists', query={'page': 1, 'page_size': 1})
-        observe(db, scope, header, started)
-    with db.connect() as c:
-        c.execute('BEGIN IMMEDIATE')
-        row = c.execute('SELECT * FROM collection_capacity WHERE account=?', (scope,)).fetchone()
-        if not row or not 0 <= time.time() - row['observed'] < cfg['max_age']:
-            raise Pending('collection_capacity_unavailable')
-        pending = c.execute('SELECT count(*) FROM collection_reservations WHERE account=?', (scope,)).fetchone()[0]
-        if row['blocked'] or row['used'] + pending >= row['capacity'] * cfg['stop_ratio']:
-            raise Pending('collection_box_full: capacity admission paused')
-        if reserve:
-            if not c.execute('INSERT OR IGNORE INTO collection_reservations VALUES(?,?,?,?)',
-                             (scope, collector.key, 'unknown', time.time())).rowcount:
-                raise Pending('source draft outcome unresolved; reservation retained')
+        await database_work(observe, db, scope, header, started)
+    def reserve_capacity():
+        with db.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            row = c.execute('SELECT * FROM collection_capacity WHERE account=?', (scope,)).fetchone()
+            if not row or not 0 <= time.time() - row['observed'] < cfg['max_age']:
+                raise Pending('collection_capacity_unavailable')
+            pending = c.execute('SELECT count(*) FROM collection_reservations WHERE account=?', (scope,)).fetchone()[0]
+            if row['blocked'] or row['used'] + pending >= row['capacity'] * cfg['stop_ratio']:
+                raise Pending('collection_box_full: capacity admission paused')
+            if reserve:
+                if not c.execute('INSERT OR IGNORE INTO collection_reservations VALUES(?,?,?,?)',
+                                 (scope, collector.key, 'unknown', time.time())).rowcount:
+                    raise Pending('source draft outcome unresolved; reservation retained')
+    await database_work(reserve_capacity)
 
 
 def finish(collector, *, rejected=False):

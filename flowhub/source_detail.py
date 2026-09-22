@@ -222,7 +222,7 @@ class SourceCollector:
                    'recovery':{'source':'exact-ozon-draft-list','at':time.time()}}
         await database_work(self.save,'ready',data)
         from .collection_capacity import finish
-        finish(self)
+        await database_work(finish,self)
         return data
 
     async def collect(self):
@@ -365,14 +365,14 @@ class SourceCollector:
                     and '采集箱已满' in str(diagnostic.get('api_message',''))):
                 data['last_rejection']=diagnostic
                 await database_work(self.save,'draft_rejected',data)
-                finish(self, rejected=True)
+                await database_work(finish,self, rejected=True)
             raise
         draft_id = int(draft.get("jump_id") or draft.get("id") or 0)
         if draft_id <= 0:
             raise ModuleError("source draft acknowledgement missing")
         data["draft_id"] = draft_id
         await database_work(self.save,"draft_ready", data)
-        finish(self)
+        await database_work(finish,self)
         detail = await self.call("/api.product.collect/detail", query={"id": draft_id, "is_online": 0})
         data |= {"detail": detail, "observed_at": time.time()}
         await database_work(self.save,"ready", data)
