@@ -65,3 +65,33 @@ def test_pending_second_generation_requires_explicit_exploration_policy(tmp_path
     with db.connect() as c:
         body=json.loads(c.execute('SELECT body FROM source_discovery_seeds').fetchone()[0])
         assert body['exploration_only'] and body['assessment']['state']=='needs_review'
+
+
+def test_unchanged_source_assessments_do_not_take_a_write_transaction(tmp_path,monkeypatch):
+    from contextlib import contextmanager
+    from flowhub.other_sellers import promote_qualified
+    db=Database(tmp_path);BrowserSource(db);schema(db)
+    with db.connect() as c:c.execute('INSERT INTO source_discovery_seeds VALUES(?,?,?,0,0,?,?)',('o','123','queued','{}',time.time()))
+    ingest(db,'o','123',page(ids=('10',),count=1),'file');prepare_samples(db,'o')
+    with db.connect() as c:c.execute("UPDATE source_discovered_stores SET state='awaiting_qualified_product'")
+    assert promote_qualified(db,'o')==0
+    original=db.connect;changes=[]
+    @contextmanager
+    def observed():
+        with original() as c:
+            before=c.total_changes
+            yield c
+            changes.append(c.total_changes-before)
+    monkeypatch.setattr(db,'connect',observed)
+    assert promote_qualified(db,'o')==0
+    assert sum(changes)==0
+    SourceLibrary(db).put('o',{'sku':'123','seller_id':'10','title':'incomplete','collected_at':time.time()},{'channel':'test'})
+    changes.clear()
+    assert promote_qualified(db,'o')==0
+    assert sum(changes)==1
+    with db.connect() as c:
+        row=c.execute('SELECT state,body FROM source_discovered_stores').fetchone()
+        assert row['state']=='awaiting_qualified_product'
+        assert json.loads(row['body'])['source_assessments'][0]['sku']=='123'
+    changes.clear()
+    assert promote_qualified(db,'o')==0 and sum(changes)==0

@@ -8,6 +8,7 @@ from . import control
 
 def schema(db):
     def initialize():
+        SourceLibrary(db)
         from ..plugin_pipeline import schema as queue_schema
         queue_schema(db)
         with db.connect() as c:
@@ -80,7 +81,10 @@ def admit_one(db, owner, now=None):
         # newest-first queue and a large oldest-first backlog. All gates above
         # and exclusions below still apply to these SKUs.
         cohort=json.dumps([str(s) for s in policy.get('acceptance_skus',[])][:100])
-        rows=c.execute('''SELECT p.* FROM sourcing_products p WHERE p.owner=?
+        # Sort only identities while holding the admission write transaction;
+        # load each inspected payload by primary key in that same transaction.
+        # Keep identity exclusions index-only even when the older partial index exists.
+        rows=c.execute('''SELECT p.id FROM sourcing_products p INDEXED BY sourcing_admission_candidate_keys WHERE p.owner=?
           AND json_extract(p.body,'$.coverage') IN ('storefront-page','maozi-exact-seller-page')
           AND json_extract(p.body,'$.source_relation.seller_id')=json_extract(p.body,'$.seller_id')
           AND json_array_length(json_extract(p.body,'$.source_relation.root_seeds'))>0
@@ -90,7 +94,8 @@ def admit_one(db, owner, now=None):
           AND NOT EXISTS(SELECT 1 FROM blocks b WHERE b.owner=p.owner AND b.source_key=p.sku)
           ORDER BY CASE WHEN p.sku IN (SELECT value FROM json_each(?)) THEN 0 ELSE 1 END,
           p.id '''+order,(owner,cohort))
-        for row in rows:
+        for candidate in rows:
+            row=c.execute('SELECT * FROM sourcing_products WHERE id=?',(candidate['id'],)).fetchone()
             p=json.loads(row['body']);relation=p.get('source_relation') or {}
             if relation.get('seller_id')!=p.get('seller_id') or not relation.get('root_seeds'):continue
             # All source provenance and live delist checks still run before matching and writing.
@@ -149,10 +154,12 @@ def renew_campaign(c, owner, policy, now):
     """Only an active continuous campaign authorizes a new write window; keep every old one."""
     if not policy.get('continuous'):return
     expiry=min(now+policy.get('write_window_seconds',21600),policy.get('until') or float('inf'))
-    for r in c.execute('SELECT * FROM plugin_routes WHERE owner=? AND run_id=? AND expires<=?',(owner,policy['run_id'],now)).fetchall():
+    for r in c.execute('''SELECT r.* FROM plugin_routes r
+        JOIN plugin_pipeline q USING(owner,sku,seller)
+        WHERE r.owner=? AND r.run_id=? AND r.expires<=?
+          AND (q.state IS NULL OR q.state NOT IN ('selling','rejected'))''',
+        (owner,policy['run_id'],now)).fetchall():
         key=(owner,r['sku'],r['seller'])
-        q=c.execute("SELECT state FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?",key).fetchone()
-        if not q or q['state'] in ('selling','rejected'):continue
         old=c.execute('SELECT body FROM plugin_publications WHERE owner=? AND sku=? AND seller=?',key).fetchone() if c.execute("SELECT 1 FROM sqlite_master WHERE name='plugin_publications'").fetchone() else None
         if old:
             record=json.loads(old[0]);record.setdefault('continuations',[]).append({'at':now,'previous_write_deadline':record.get('write_deadline'),'write_deadline':expiry,'reason':'active_continuous_campaign'})

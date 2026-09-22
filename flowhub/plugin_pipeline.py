@@ -19,6 +19,7 @@ def schema(db):
         control.schema(db)
         with db.connect() as c:
             c.execute('CREATE TABLE IF NOT EXISTS plugin_pipeline(owner TEXT,sku TEXT,seller TEXT,state TEXT,body TEXT,due REAL,attempts INTEGER DEFAULT 0,PRIMARY KEY(owner,sku,seller))')
+            c.execute('CREATE INDEX IF NOT EXISTS plugin_pipeline_owner_state_keys ON plugin_pipeline(owner,state,sku,seller)')
             c.execute('CREATE TABLE IF NOT EXISTS plugin_pipeline_leases(owner TEXT,sku TEXT,seller TEXT,token TEXT,expires REAL,PRIMARY KEY(owner,sku,seller))')
     db.schema_once('plugin_pipeline', initialize)
 

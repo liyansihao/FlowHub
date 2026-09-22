@@ -468,6 +468,7 @@ class Worker:
                 await asyncio.sleep(2)
 
         async def collect_sources():
+            from .pipeline_modules.database_work import run as database_work, health as record_health
             from .pipeline_modules.seed import SeedModule
             from .pipeline_modules import control
             from .source_library import SourceLibrary
@@ -486,9 +487,9 @@ class Worker:
                     started=time.time()
                     try:
                         result=await acquirer.run(setting["owner"], self.db.open(setting["secret"])["erp_token"])
-                        control.record(self.db,"seed",setting["owner"],"",started,result.get("state","complete"))
+                        await database_work(control.record,self.db,"seed",setting["owner"],"",started,result.get("state","complete"))
                     except Exception:
-                        self.db.health("source-collector-error")
+                        await record_health(self.db,"source-collector-error")
                 await asyncio.sleep(5)
 
         async def plugin_publications():

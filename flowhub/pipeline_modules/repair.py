@@ -10,6 +10,7 @@ from ..evaluation_requirements import sale_price
 from ..plugin_detail import positive
 from .pricing import approved_price_intent
 from .repair_reads import RepairReads
+from .database_work import run as database_work
 
 
 def missing_fields(product):
@@ -213,11 +214,7 @@ class PriceRepairModule:
             except Exception as error:
                 evidence['steps'].append({'source':'maozi-draft','reason':str(error) if getattr(error,'diagnostic',None) is not None else type(error).__name__,'diagnostic':getattr(error,'diagnostic',{})})
         missing=missing_fields(p);evidence['after']=missing
-        p['collection_evidence']=(p.get('collection_evidence') or {})|{'missing_fields':missing,'last_repair':evidence}
-        with db.connect() as c:
-            c.execute('CREATE TABLE IF NOT EXISTS plugin_repair_events(id INTEGER PRIMARY KEY,owner TEXT,sku TEXT,seller TEXT,at REAL,body TEXT)')
-            c.execute('INSERT INTO plugin_repair_events(owner,sku,seller,at,body) VALUES(?,?,?,?,?)',(owner,sku,seller,time.time(),json.dumps(evidence)))
-            SourceLibrary(db).put(owner,p,{'channel':'maozi-field-repair'},connection=c)
+        await database_work(save_progress,db,owner,sku,seller,p,evidence)
         reason='missing:'+','.join(missing) if missing else 'complete_dossier'
         if missing and any('采集箱已满' in str((step.get('diagnostic') or {}).get('api_message','')) for step in evidence['steps']):
             reason='maozi_collection_box_full: '+reason
@@ -226,3 +223,12 @@ class PriceRepairModule:
         from .repair_retry import classify
         return {'state':'ready' if ready else 'waiting','reason':'valuation_inputs_ready' if ready and missing else reason,
                 'missing_fields':missing,'failure_class':None if ready else classify(evidence)}
+
+
+def save_progress(db,owner,sku,seller,p,evidence):
+    missing=evidence['after']
+    p['collection_evidence']=(p.get('collection_evidence') or {})|{'missing_fields':missing,'last_repair':evidence}
+    with db.connect() as c:
+        c.execute('CREATE TABLE IF NOT EXISTS plugin_repair_events(id INTEGER PRIMARY KEY,owner TEXT,sku TEXT,seller TEXT,at REAL,body TEXT)')
+        c.execute('INSERT INTO plugin_repair_events(owner,sku,seller,at,body) VALUES(?,?,?,?,?)',(owner,sku,seller,time.time(),json.dumps(evidence)))
+        SourceLibrary(db).put(owner,p,{'channel':'maozi-field-repair'},connection=c)

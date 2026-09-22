@@ -222,7 +222,9 @@ def promote_qualified(db,owner):
             products=c.execute('SELECT body FROM sourcing_products WHERE owner=? AND seller=?',(owner,r['seller'])).fetchall()
             qualified=next((json.loads(p[0]) for p in products if assess(json.loads(p[0]),filters)['state']=='qualified'),None)
             if not qualified:
-                body=json.loads(r['body']);body['source_assessments']=[{'sku':json.loads(p[0])['sku'],**assess(json.loads(p[0]),filters)} for p in products[:8]]
+                body=json.loads(r['body']);assessments=[{'sku':json.loads(p[0])['sku'],**assess(json.loads(p[0]),filters)} for p in products[:8]]
+                if body.get('source_assessments')==assessments:continue
+                body['source_assessments']=assessments
                 c.execute('UPDATE source_discovered_stores SET body=? WHERE owner=? AND seller=?',(json.dumps(body),owner,r['seller']))
                 continue
             scan=c.execute('SELECT state FROM browser_source_scans WHERE owner=? AND seller=? AND run_id=?',(owner,r['seller'],r['run_id'])).fetchone()

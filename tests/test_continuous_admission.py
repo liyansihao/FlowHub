@@ -268,3 +268,94 @@ async def test_explicit_single_repair_runs_without_resuming_campaign(tmp_path,mo
     assert seen==['2'] and admit_one(db,owner)['state']=='paused'
     with pytest.raises(ValueError):await pipeline.tick(db,lane='seed_repair',run_paused=True)
     with pytest.raises(ValueError):await pipeline.tick(db,lane='submit',target=(owner,'2','3'),run_paused=True)
+
+
+@pytest.mark.parametrize('fresh,cohort,expected',[(False,[],['1','2']),(True,[],['2','1']),(True,['1'],['1','2'])])
+def test_payload_lookup_preserves_order_and_exclusions(tmp_path,fresh,cohort,expected):
+    db,owner=setup(tmp_path)
+    with db.connect() as c:
+        policy=json.loads(c.execute('SELECT body FROM pipeline_campaigns').fetchone()[0])
+        policy.update(mix_fresh_sources=fresh,acceptance_skus=cohort)
+        c.execute('UPDATE pipeline_campaigns SET body=?',(json.dumps(policy),))
+    seen=[]
+    for _ in expected:
+        result=admit_one(db,owner);seen.append(result['sku'])
+        with db.connect() as c:c.execute("UPDATE plugin_pipeline SET state='selling'")
+    assert seen==expected
+
+
+def test_admission_payload_failure_rolls_back_all_related_writes(tmp_path,monkeypatch):
+    db,owner=setup(tmp_path)
+    with db.connect() as c:
+        before=c.execute("SELECT body FROM sourcing_products WHERE sku='1'").fetchone()[0]
+    original=SourceLibrary.put
+    def fail_after_put(self,*args,**kwargs):
+        result=original(self,*args,**kwargs)
+        if kwargs.get('connection') is not None:raise RuntimeError('synthetic persistence failure')
+        return result
+    monkeypatch.setattr(SourceLibrary,'put',fail_after_put)
+    with pytest.raises(RuntimeError,match='synthetic persistence failure'):admit_one(db,owner)
+    with db.connect() as c:
+        for table in ('pipeline_admissions','plugin_routes','plugin_publication_permissions','plugin_pipeline'):
+            assert c.execute('SELECT count(*) FROM '+table).fetchone()[0]==0
+        assert c.execute("SELECT body FROM sourcing_products WHERE sku='1'").fetchone()[0]==before
+
+
+def test_campaign_renewal_filters_terminal_and_missing_queues_without_losing_history(tmp_path):
+    from flowhub.pipeline_modules.admission import renew_campaign
+    db,owner=setup(tmp_path)
+    with db.connect() as c:
+        c.execute('CREATE TABLE IF NOT EXISTS plugin_publications(owner TEXT,sku TEXT,seller TEXT,body TEXT,updated REAL,PRIMARY KEY(owner,sku,seller))')
+        for sku,state in [('active','publishing'),('sold','selling'),('rejected','rejected'),('null',None),('missing',None),('future','queued'),('other','queued')]:
+            if sku!='missing':c.execute('INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)',(owner,sku,'3',state,'{}',0,0))
+            c.execute('INSERT INTO plugin_routes VALUES(?,?,?,?,?,?)',(owner,sku,'3','test',500 if sku=='future' else 1,'other' if sku=='other' else 'test'))
+            c.execute('INSERT INTO plugin_publication_permissions VALUES(?,?,?,?,?)',(owner,sku,'3',1,'test'))
+            c.execute('INSERT INTO plugin_publications VALUES(?,?,?,?,?)',(owner,sku,'3',json.dumps({'write_deadline':1,'continuations':[{'previous':'preserved'}]}),0))
+    with db.connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        renew_campaign(c,owner,{'continuous':True,'run_id':'test','write_window_seconds':50,'until':130},100)
+    with db.connect() as c:
+        for sku in ('active','null','sold','rejected','missing','future','other'):
+            expected=130 if sku in ('active','null') else 500 if sku=='future' else 1
+            assert c.execute('SELECT expires FROM plugin_routes WHERE sku=?',(sku,)).fetchone()[0]==expected
+            b=json.loads(c.execute('SELECT body FROM plugin_publications WHERE sku=?',(sku,)).fetchone()[0])
+            assert b['continuations'][0]=={'previous':'preserved'}
+            assert len(b['continuations'])==(2 if sku in ('active','null') else 1)
+
+
+def test_upgraded_admission_filters_identities_without_reading_product_table(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    db, owner = setup(tmp_path)
+    # Simulate an existing release, retaining its older competing partial index.
+    with db.connect() as c:
+        c.execute("""CREATE INDEX sourcing_admission_candidates ON sourcing_products(owner,id)
+            WHERE json_extract(body,'$.coverage') IN ('storefront-page','maozi-exact-seller-page')
+              AND json_extract(body,'$.source_relation.seller_id')=json_extract(body,'$.seller_id')
+              AND json_array_length(json_extract(body,'$.source_relation.root_seeds'))>0""")
+        c.execute('DROP INDEX sourcing_admission_candidate_keys')
+        c.execute('DROP INDEX plugin_pipeline_owner_state_keys')
+    db = Database(tmp_path)
+    original = db.connect
+    statements = []
+
+    @contextmanager
+    def traced():
+        with original() as c:
+            c.set_trace_callback(statements.append)
+            yield c
+
+    monkeypatch.setattr(db, 'connect', traced)
+    assert admit_one(db, owner)['sku'] == '1'
+    query = next(q for q in statements if q.startswith('SELECT p.id FROM sourcing_products'))
+    with original() as c:
+        root = c.execute("SELECT rootpage FROM sqlite_master WHERE name='sourcing_products'").fetchone()[0]
+        ops = c.execute('EXPLAIN ' + query).fetchall()
+        table_cursors = {r[2] for r in ops if r[1] == 'OpenRead' and r[3] == root}
+        assert not any(r[1] == 'Column' and r[2] in table_cursors for r in ops)
+        assert c.execute("SELECT 1 FROM sqlite_master WHERE name='sourcing_admission_candidates'").fetchone()
+        plan = c.execute('''EXPLAIN QUERY PLAN SELECT r.* FROM plugin_routes r
+            JOIN plugin_pipeline q USING(owner,sku,seller)
+            WHERE r.owner=? AND r.run_id=? AND r.expires<=?
+              AND (q.state IS NULL OR q.state NOT IN ('selling','rejected'))''',
+            (owner, 'test', 100)).fetchall()
+        assert any('COVERING INDEX plugin_pipeline_owner_state_keys' in r[3] for r in plan)
