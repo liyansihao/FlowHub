@@ -25,7 +25,7 @@ export async function serveOperations(c,request,secret){
   if(!Array.isArray(input.items)||input.items.length>20000||!Array.isArray(input.stores)||!input.items.every(r=>['returns','inventory'].includes(r.kind)&&typeof r.id==='string'&&typeof r.store_id==='string'&&(r.kind!=='inventory'||r.present===0)))return json({error:'invalid_snapshot'},422);
   if(new Set(input.items.map(rowKey)).size!==input.items.length)return json({error:'duplicate_rows'},422);
   // Whitelist public operating fields; shop API keys and chat content never belong here.
-  const fields=['kind','id','scheme','store_id','store_name','name','offer_id','sku','order','created_at','price','currency','state','state_label','closed','reason','present','synced','stale'];
+  const fields=['kind','id','scheme','store_id','store_name','name','offer_id','sku','order','created_at','price','currency','state','state_label','closed','reason','reason_cn','reason_source','buyer_comment','order_cancel_reason','return_stage','return_stage_label','stage_evidence','detail_checked_at','detail_error','present','synced','stale'];
   const items=input.items.map(r=>Object.fromEntries(fields.filter(k=>k in r).map(k=>[k,r[k]])));
   const stores=input.stores.map(s=>({id:String(s.id),name:String(s.name),channels:s.channels}));
   const old=await get('operations:snapshot'),keys=new Set(items.map(rowKey));

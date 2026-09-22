@@ -21,4 +21,12 @@ Vercel 仍为原 `liyansihaos-projects/flowhub-review` 项目、原 Neon 数据�
 
 ## 回退
 
+### 原因与订单阶段补充（同日）
+
+新增只读 `/v2/returns/rfbs/get` 与 `/v3/posting/fbs/get`，详情缓存 1 小时，读取失败 10 分钟重试。保留平台原因原文，使用逐项中文释义，分别展示原因来源、订单取消原因、订单阶段、核验依据和时间。故障记录显示待核实，不根据处置/退款状态猜测签收。特别是 `fact_delivery_date` 在取消订单上也出现，不能单独作为签收证据。
+
+本次 62 条均取得原因：按核验规则 16 条交付时拒收、12 条订单状态 delivered、31 条确认运输/发货后取消但签收未确认、3 条阶段待核实。5 条订单详情读取失败，其中 2 条可通过明确拒收原因分类。平台原因“未按时发货”共 21 条，不将此原因自动转换为发货前取消，因为关联订单可能明确标记 cancelled_after_ship=true。原因描述不代表卖家责任认定。
+
+部署：独立运营 `20260922-reasons-1`；Vercel `dpl_324Cqcm9GaQSzKoNqcsFqJZpbN6M`。核验与备份 `output/deployment-reasons-20260922`。20 项运营测试、5 项云端/审核测试通过。原平台列表同步时间在补充原因时保留，未冒充重新采集。
+
 只恢复独立运营服务上一版 LaunchAgent 的 WorkingDirectory，并重启其服务。保留现有运营 SQLite、cloud.json 及云端 `operations:` 记录，不恢复旧数据库覆盖新标记。Vercel 可以回到前一审核部署；新记录保留，不删除审核数据。不要重启退役发布器或改动主生产基线。

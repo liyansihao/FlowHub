@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 READS = {
+    '/v2/returns/rfbs/get', '/v3/posting/fbs/get',
     '/v1/returns/list', '/v2/returns/rfbs/list', '/v4/product/info/stocks',
     '/v3/product/info/list', '/v3/chat/list', '/v3/chat/history',
 }
@@ -206,6 +207,8 @@ def return_row(item, scheme):
 class Monitor:
     def __init__(self, state, stores, api=None):
         self.state, self.stores, self.api = state, stores, api or Ozon()
+        from .return_details import ReturnDetails
+        self.return_details = ReturnDetails(state, self.api)
         self.busy = set()
         self.shop_slots = {k: asyncio.Semaphore(2 if k == 'chats' else 1) for k in INTERVALS}
         self.send_locks = {}
@@ -277,7 +280,8 @@ class Monitor:
                 seen.add(str(cursor))
             else:
                 raise APIError('售后超出单次同步上限，保留上次数据')
-        return list({(x['scheme'], x['id']): x for x in result}.values())
+        rows = list({(x['scheme'], x['id']): x for x in result}.values())
+        return [await self.return_details.enrich(store, row) for row in rows]
 
     async def fetch_inventory(self, store):
         result, cursor, cursors = [], None, set()
