@@ -103,3 +103,59 @@ async def test_completed_store_new_generation_preserves_receipts(tmp_path,monkey
         assert c.execute("SELECT state FROM browser_source_scans WHERE run_id='scan'").fetchone()[0]=='done'
         assert c.execute('SELECT count(*) FROM browser_source_pages').fetchone()[0]==1
         assert c.execute('SELECT run_id FROM source_loop_stores').fetchone()[0]!='scan'
+
+
+@pytest.mark.asyncio
+async def test_seed_resolution_exhaustion_survives_restart_and_allows_next_seed(tmp_path):
+    db=setup(tmp_path)
+    with db.connect() as c:
+        c.execute("UPDATE sourcing_seeds SET body='{}'")
+        c.execute('INSERT INTO sourcing_settings VALUES(?,1,?,?)',('a','{}',db.seal({'erp_token':'test'})))
+    calls=[]
+    async def failed(path,query,token):
+        calls.append(query['sku'])
+        return {'data':{'sku':query['sku']}}
+    for attempt in range(loop.SEED_RESOLUTION_MAX_ATTEMPTS):
+        result=await loop.resolve_one(db,'a',failed,100+attempt*21600)
+        assert result['state']==('retry_exhausted' if attempt==3 else 'waiting')
+    with db.connect() as c:
+        old=dict(c.execute('SELECT * FROM source_seed_resolutions').fetchone())
+        c.execute('INSERT INTO sourcing_seeds VALUES(?,?,?,?,?,0,0,?)',('a','shop','next','124','{}',100))
+    db=Database(tmp_path);loop.schema(db)
+    async def good(path,query,token):
+        assert query['sku']=='124'
+        return {'data':{'sku':'124','sellerId':13}}
+    assert (await loop.resolve_one(db,'a',good,1000000))['state']=='resolved'
+    assert (await loop.resolve_one(db,'a',failed,2000000))['state']=='no_due_seed'
+    assert len(calls)==4
+    with db.connect() as c:
+        assert dict(c.execute("SELECT * FROM source_seed_resolutions WHERE sku='123'").fetchone())==old
+        assert c.execute("SELECT count(*) FROM sourcing_seeds WHERE sku='123'").fetchone()[0]==1
+
+
+@pytest.mark.asyncio
+async def test_historical_excess_attempts_stop_without_another_remote_read(tmp_path):
+    db=setup(tmp_path)
+    with db.connect() as c:
+        c.execute("UPDATE sourcing_seeds SET body='{}'")
+        c.execute('INSERT INTO sourcing_settings VALUES(?,1,?,?)',('a','{}',db.seal({'erp_token':'test'})))
+        c.execute('INSERT INTO source_seed_resolutions VALUES(?,?,?,?,?,?,?,?,?)',('a','123','waiting',None,'network',0,24,'{"historical":"retained"}',1))
+    async def forbidden(*args):pytest.fail('exhausted seed must not call ERP')
+    assert (await loop.resolve_one(db,'a',forbidden,100))['state']=='retry_exhausted'
+    with db.connect() as c:
+        r=c.execute('SELECT * FROM source_seed_resolutions').fetchone()
+        assert r['attempts']==24 and r['reason']=='network' and r['evidence']=='{"historical":"retained"}'
+    assert (await loop.resolve_one(db,'a',forbidden,1000000))['state']=='no_due_seed'
+
+
+@pytest.mark.asyncio
+async def test_seed_resolution_can_succeed_on_final_budgeted_attempt(tmp_path):
+    db=setup(tmp_path)
+    with db.connect() as c:
+        c.execute("UPDATE sourcing_seeds SET body='{}'")
+        c.execute('INSERT INTO sourcing_settings VALUES(?,1,?,?)',('a','{}',db.seal({'erp_token':'test'})))
+        c.execute('INSERT INTO source_seed_resolutions VALUES(?,?,?,?,?,?,?,?,?)',('a','123','waiting',None,'network',0,3,'{}',1))
+    async def good(*args):return {'data':{'sku':'123','sellerId':13}}
+    assert (await loop.resolve_one(db,'a',good,100))['state']=='resolved'
+    with db.connect() as c:
+        assert json.loads(c.execute('SELECT body FROM sourcing_seeds').fetchone()[0])['seller_id']=='13'
