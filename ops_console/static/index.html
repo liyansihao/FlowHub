@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#17684b"><title>Ozon · 店铺运营</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%2317684b'/%3E%3Ccircle cx='20' cy='20' r='10' stroke='white' stroke-width='4' fill='none'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/assets/app.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/" aria-label="Ozon运营首页"><span class="brand-mark">o.</span><span>Ozon<span class="brand-sub">店铺运营工作台</span></span></a>
+    <div class="workspace-label">WORKSPACE <span class="live-dot"></span></div>
+    <div class="workspace-switch"><a id="cloud-operations" hidden href="#" target="_blank" rel="noreferrer">云端运营 ↗</a><a href="https://flowhub-review.vercel.app/" target="_blank" rel="noreferrer">商品审核 ↗</a></div>
+    <nav aria-label="主导航">
+      <button data-nav="overview" class="nav active"><span class="nav-icon">▦</span>运营总览</button>
+      <button data-nav="returns" class="nav"><span class="nav-icon">↩</span>退款与售后<span id="returns-nav" class="nav-count"></span></button>
+      <button data-nav="inventory" class="nav"><span class="nav-icon">▤</span>库存预警<span id="stock-nav" class="nav-count"></span></button>
+      <button data-nav="messages" class="nav"><span class="nav-icon">▱</span>买家消息<span id="messages-nav" class="nav-count"></span></button>
+    </nav>
+    <div class="shop-heading"><span>店铺</span><span id="shop-count">—</span></div>
+    <input id="shop-search" class="shop-search" type="search" placeholder="搜索店铺" aria-label="搜索店铺">
+    <div id="shop-list" class="shop-list"></div>
+    <div class="sidebar-footer">
+      <button id="notify-button" class="notify-button"><span>◉</span><span id="notify-label">开启浏览器通知</span><span>↗</span></button>
+      <button data-nav="settings" class="nav"><span class="nav-icon">⚙</span>店铺与设置</button>
+      <div class="local-note"><span class="live-dot"></span>本机工作台 <span>LOCAL</span></div>
+    </div>
+  </aside>
+  <div class="shell">
+    <header class="topbar"><div><button id="mobile-menu" class="icon-button" aria-label="展开菜单">☰</button><span class="breadcrumb">工作台</span><span class="slash">/</span><span id="crumb">运营总览</span></div><div class="topbar-right"><span id="network-state" class="connection">正在连接</span><span class="avatar">店</span></div></header>
+    <main>
+      <div id="demo-banner" class="banner hidden">演示环境 · 所有数字均为测试数据，回复不会发送给真实买家</div>
+      <section class="page-heading"><div><div class="eyebrow" id="eyebrow">STORE OPERATIONS</div><h1 id="page-title">运营总览</h1><p id="page-description">把售后、库存和消息，放在一起处理。</p></div><div class="heading-actions"><span id="scope-label" class="scope-label">全部店铺</span><button id="refresh-button" class="button"><span>↻</span>立即同步</button></div></section>
+      <div id="error-banner" class="banner error hidden" role="alert"></div>
+      <div id="content" aria-live="polite"><div class="loading">正在读取店铺数据…</div></div>
+    </main>
+    <footer class="page-footer"><span>Ozon 店铺运营</span><span>平台登记库存 · 仅提醒，不自动改库存</span></footer>
+  </div>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <dialog id="detail-dialog"><div id="dialog-content"></div><button class="button" id="close-dialog">关闭</button></dialog>
+</body>
+</html>
