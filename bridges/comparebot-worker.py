@@ -6,9 +6,15 @@ import json
 import os
 import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from flowhub.runtime_identity import capture, save
+
+RUNTIME = capture('local-comparebot-' + str(os.getpid()), Path(__file__).resolve().parents[1])
+RUNTIME_DIRECTORY = Path(os.environ.get('FLOWHUB_DATA', Path(__file__).resolve().parents[1] / 'data'))
 
 
 async def main():
+    save(RUNTIME_DIRECTORY, RUNTIME)
     rankers = {}
     while line := await asyncio.to_thread(sys.stdin.readline):
         try:
@@ -21,6 +27,8 @@ async def main():
                     device = args.get('device')
                     if device not in rankers:
                         rankers[device] = DinoV2Ranker(device=device)
+                        RUNTIME.update(model_name=rankers[device]._model_name,model_revision=rankers[device]._model_revision)
+                        save(RUNTIME_DIRECTORY, RUNTIME)
                     cli.DinoV2Ranker = lambda device=None: rankers[device]
                     function = cli._run
                 elif request['mode'] == 'screen':

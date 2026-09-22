@@ -108,13 +108,14 @@ class Compute:
 
 
 async def remote(kind,payload):
+    from .pipeline_modules.database_work import run as database_work
     from .db import DATA
     if not (DATA/'cluster/compute-policy.json').exists():return None
-    hub=Compute(Coordinator(DATA/'cluster'))
-    identity=hub.submit(kind,payload)
+    hub=await database_work(lambda:Compute(Coordinator(DATA/'cluster')))
+    identity=await database_work(hub.submit,kind,payload)
     if identity is None:return None
     while True:
-        value=hub.result(identity)
+        value=await database_work(hub.result,identity)
         if value is not None:
             if value.get('error'):
                 from .modules import ModuleError

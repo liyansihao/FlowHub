@@ -30,6 +30,7 @@ READS = set(METADATA_TTL) | {
     "/v2/warehouse/list",
     "/v3/product/info/list",
     "/v4/product/info/limit",
+    "/v5/product/info/prices",
     "/v1/product/import/info",
     "/v2/product/info/stocks-by-warehouse/fbs",
 }
@@ -198,6 +199,22 @@ class OfficialTransport(httpx.AsyncBaseTransport):
             raise ValueError("unsupported_official_endpoint")
         lane = path  # A read backlog cannot reserve the inventory/import lane.
         cache_key = hashlib.sha256(path.encode() + request.content).hexdigest()
+        from .pipeline_modules.database_work import run as database_work
+        reservation=await database_work(self._reserve,request,path,lane,cache_key)
+        if isinstance(reservation,httpx.Response):return reservation
+        await asyncio.sleep(max(0,reservation-time.time()))
+        await database_work(self._check_blocked)
+        started=time.monotonic()
+        try:
+            response=await self.inner.handle_async_request(request)
+            await response.aread()
+        except (httpx.TransportError,asyncio.CancelledError):
+            await database_work(self._failed,path,lane,(time.monotonic()-started)*1000)
+            raise
+        await database_work(self._observed,response,path,lane,cache_key,(time.monotonic()-started)*1000)
+        return response
+
+    def _reserve(self,request,path,lane,cache_key):
         now = time.time()
         with self.db.connect() as c:
             c.execute("BEGIN IMMEDIATE")
@@ -228,7 +245,9 @@ class OfficialTransport(httpx.AsyncBaseTransport):
                 ON CONFLICT(account,lane) DO UPDATE SET next_at=excluded.next_at""",
                 (self.account, lane, at + self.interval),
             )
-        await asyncio.sleep(max(0, at - time.time()))
+        return at
+
+    def _check_blocked(self):
         # Another process can encounter authentication/rate failures during the wait.
         with self.db.connect() as c:
             blocked = c.execute(
@@ -236,19 +255,17 @@ class OfficialTransport(httpx.AsyncBaseTransport):
             ).fetchone()
             if blocked and blocked["blocked_until"] > time.time():
                 raise OfficialDeferred(blocked["blocked_until"], blocked["reason"])
-        started = time.monotonic()
-        try:
-            response = await self.inner.handle_async_request(request)
-            await response.aread()
-        except (httpx.TransportError, asyncio.CancelledError):
-            self.metric(path, error=True, elapsed=(time.monotonic() - started) * 1000)
-            with self.db.connect() as c:
-                c.execute(
-                    "UPDATE official_api_slots SET next_at=MAX(next_at,?),failures=failures+1 WHERE account=? AND lane=?",
-                    (time.time() + 10, self.account, lane),
-                )
-            raise
-        self.metric(path, error=response.status_code >= 400, elapsed=(time.monotonic() - started) * 1000)
+
+    def _failed(self,path,lane,elapsed):
+        self.metric(path, error=True, elapsed=elapsed)
+        with self.db.connect() as c:
+            c.execute(
+                "UPDATE official_api_slots SET next_at=MAX(next_at,?),failures=failures+1 WHERE account=? AND lane=?",
+                (time.time() + 10, self.account, lane),
+            )
+
+    def _observed(self,response,path,lane,cache_key,elapsed):
+        self.metric(path, error=response.status_code >= 400, elapsed=elapsed)
         with self.db.connect() as c:
             if response.status_code in (401, 403, 429):
                 duration = (
@@ -282,7 +299,6 @@ class OfficialTransport(httpx.AsyncBaseTransport):
                             "INSERT OR REPLACE INTO official_api_cache VALUES(?,?,?,?)",
                             (self.account, cache_key, time.time() + METADATA_TTL[path], self.db.seal(value)),
                         )
-        return response
 
     async def aclose(self):
         await self.inner.aclose()

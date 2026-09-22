@@ -56,7 +56,7 @@ def port(tmp_path):
             "/v1/description-category/attribute": {
                 "result": [{"id": 85, "name": "Бренд", "is_required": True, "dictionary_id": 1}]
             },
-            "/v1/description-category/attribute/values/search": {
+            "/v1/description-category/attribute/values": {
                 "result": [{"id": 5, "value": "Нет бренда"}]
             },
             "/v4/product/info/limit": {
@@ -360,3 +360,30 @@ async def test_title_repair_never_overwrites_blocked_or_unrelated_product(port, 
     else:
         assert (await port.invoke("reconcile"))["issue"]
     assert all(p != "/v3/product/import" for p, _ in port.calls)
+
+
+def test_vat_profile_requires_three_exact_consistent_cny_samples():
+    from flowhub.store_vat import verified_sample_profile
+    offers=['a','b','c']
+    items=[{'offer_id':o,'price':{'vat':0,'currency_code':'CNY'}} for o in offers]
+    assert verified_sample_profile('123',offers,items)['vat']=='0'
+    for bad in (items[:2],items+[items[0]],items[:2]+[{'offer_id':'other','price':items[2]['price']}],
+                items[:2]+[{'offer_id':'c','price':{'vat':0.2,'currency_code':'CNY'}}],
+                items[:2]+[{'offer_id':'c','price':{'vat':0,'currency_code':'RUB'}}]):
+        with pytest.raises(ValueError):verified_sample_profile('123',offers,bad)
+
+
+@pytest.mark.parametrize('returned', ['2','other'])
+async def test_single_character_dictionary_uses_exact_id_without_search(port,returned):
+    port.c['candidate']['origin']['ozon_dossier']['attributes'][0]['values'][0]['value']='2'
+    original=port.seller
+    async def seller(path,body):
+        assert not path.endswith('/values/search')
+        if path.endswith('/attribute/values'):
+            assert body['last_value_id']==4
+            return {'result':[{'id':5,'value':returned}]}
+        return await original(path,body)
+    port.seller=seller
+    result=await port.invoke('prepare')
+    assert result['ready']==(returned=='2')
+    assert not any(path=='/v3/product/import' for path,_ in port.calls)

@@ -80,7 +80,7 @@ async def test_repair_backoff_persists_and_exhausts_without_publication(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_repair_success_returns_to_measurement_and_removes_stale_cache(tmp_path,monkeypatch):
+async def test_repair_success_preserves_review_and_forces_fresh_measurement(tmp_path,monkeypatch):
     from flowhub.pipeline_modules.repair import PriceRepairModule
     db=Database(tmp_path);SourceLibrary(db);pipeline.schema(db)
     with db.connect() as c:
@@ -94,7 +94,11 @@ async def test_repair_success_returns_to_measurement_and_removes_stale_cache(tmp
     with db.connect() as c:
         r=c.execute('SELECT state,body FROM plugin_pipeline').fetchone()
         assert r['state']=='queued' and 'repair_retry' not in json.loads(r['body'])
-        assert c.execute('SELECT count(*) FROM plugin_reviews').fetchone()[0]==0
+        assert c.execute('SELECT count(*) FROM plugin_reviews').fetchone()[0]==1
+        body=json.loads(r['body'])
+        assert body['force_full_evaluation'] is True
+        archived=c.execute('SELECT body FROM repair_review_history WHERE id=?',(body['repair_review_revision'],)).fetchone()
+        assert db.open(archived[0])=={}
 
 
 @pytest.mark.asyncio
@@ -127,3 +131,64 @@ async def test_weight_first_profit_is_retained_while_publication_fields_are_repa
     assert r['state']=='needs_fields'
     assert b['evaluation_state']=='matched'
     assert 'dimensions_mm' in b['pending_publication_fields']
+
+
+@pytest.mark.asyncio
+async def test_new_approved_product_must_enter_dossier_gate(tmp_path,monkeypatch):
+    db=Database(tmp_path);lib=SourceLibrary(db)
+    (tmp_path/'acquisition-policy.json').write_text('{"enabled":true}')
+    with db.connect() as c:owner=c.execute('SELECT id FROM users').fetchone()[0]
+    lib.put(owner,{'sku':'1','seller_id':'2','title':'x','collected_at':100},{'channel':'test'})
+    pipeline.enqueue(db,owner,'1','2')
+    async def evaluate(*args):return {'state':'matched'}
+    async def publish(*args):pytest.fail('publication before dossier gate')
+    monkeypatch.setattr(pipeline,'evaluate',evaluate);monkeypatch.setattr(pipeline,'advance',publish)
+    await pipeline.tick(db)
+    with db.connect() as c:
+        r=c.execute('SELECT state,body FROM plugin_pipeline').fetchone()
+    assert r['state']=='needs_fields'
+    assert json.loads(r['body'])['official_dossier_pending']
+
+
+@pytest.mark.asyncio
+async def test_canary_acquisition_progresses_while_legacy_repair_is_blocked(tmp_path,monkeypatch):
+    import asyncio
+    from flowhub.pipeline_modules.repair import PriceRepairModule
+    from flowhub.acquisition import schema as acquisition_schema, routing_active
+    db=Database(tmp_path);SourceLibrary(db);pipeline.schema(db)
+    (tmp_path/'repair-workflow.json').write_text('{"enabled":true}')
+    policy=tmp_path/'acquisition-policy.json'
+    policy.write_text('{"enabled":true,"source_keys":["2"]}')
+    with db.connect() as c:
+        owner=c.execute('SELECT id FROM users').fetchone()[0]
+        acquisition_schema(c)
+        c.execute('INSERT INTO acquisition_bindings VALUES(?,?,?)',(owner,'3','persisted-task'))
+        for sku in ('1','2','3'):
+            body={'official_dossier_pending':True,'repair_workflow':{'stage':'source'}}
+            c.execute('INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)',(owner,sku,'9','needs_fields',json.dumps(body),0,0))
+    blocked=asyncio.Event();release=asyncio.Event();calls=[]
+    async def repair(self,db,owner,sku,seller):
+        calls.append(sku)
+        if sku=='1':
+            blocked.set();await release.wait()
+        return {'state':'waiting','reason':'readback','retry_after':60,'workflow':{'stage':'source'}}
+    monkeypatch.setattr(PriceRepairModule,'run',repair)
+    async def tick(route):
+        return await pipeline.tick(db,lane='seed_repair',repair_kind='publication',repair_stage='acquire',acquisition_route=route)
+    legacy=asyncio.create_task(tick(False))
+    try:
+        await asyncio.wait_for(blocked.wait(),1)
+        assert await asyncio.wait_for(tick(True),1)
+        assert calls==['1','2'] and not legacy.done()
+        # Turning off admission must still route persisted intents through the new lane.
+        policy.write_text('{"enabled":false}')
+        assert routing_active(db)
+        assert await asyncio.wait_for(tick(True),1)
+        assert calls==['1','2','3']
+        assert not await tick(False)  # only legacy SKU is already leased
+    finally:
+        release.set();await legacy
+    with db.connect() as c:
+        c.execute("INSERT OR REPLACE INTO pipeline_module_control VALUES('seed',1,0)")
+        c.execute('UPDATE plugin_pipeline SET due=0')
+    assert not await tick(True)

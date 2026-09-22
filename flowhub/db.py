@@ -112,6 +112,9 @@ class Database:
     def connect(self):
         db = sqlite3.connect(self.path, timeout=10)
         db.row_factory = sqlite3.Row
+        # WAL mode is a persistent database property. Re-applying it on every
+        # short-lived connection can itself contend with writers and was a
+        # source of long claim stalls under concurrent lanes.
         if not self._journal_configured:
             with self._journal_lock:
                 if not self._journal_configured:
@@ -126,7 +129,12 @@ class Database:
             db.close()
 
     def schema_once(self, name, initializer):
-        """Run a module schema initializer once per Database instance."""
+        """Run a module schema initializer once per Database instance.
+
+        Schema setup belongs to startup or an explicit migration, not to every
+        claim/admission tick. Keeping the cache on the Database instance avoids
+        global state leaking between test databases and production workers.
+        """
         with self._schema_lock:
             if name in self._schema_ready:
                 return

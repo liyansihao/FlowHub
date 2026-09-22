@@ -60,7 +60,15 @@ def admit_one(db, owner, now=None):
         active=c.execute("SELECT count(*) FROM plugin_pipeline WHERE owner=? AND state IN ('queued','evaluating','publishing') AND NOT ("+remote_sql+")",(owner,)).fetchone()[0]
         if remote>=policy.get('max_remote_pending',40):return {'state':'backpressure','remote_pending':remote}
         repairs=c.execute("SELECT count(*) FROM plugin_pipeline WHERE owner=? AND state='needs_fields'",(owner,)).fetchone()[0]
-        active+=c.execute("SELECT count(*) FROM plugin_pipeline q JOIN plugin_pipeline_leases l USING(owner,sku,seller) WHERE q.owner=? AND q.state='needs_fields' AND l.expires>?",(owner,now)).fetchone()[0]
+        from . import repair_workflow
+        repair_policy=repair_workflow.config(db)
+        publication_repairs=c.execute("SELECT count(*) FROM plugin_pipeline q WHERE owner=? AND state='needs_fields' AND "+(repair_workflow.PUBLICATION_SQL if repair_policy['enabled'] else "json_extract(body,'$.official_dossier_pending')=1"),(owner,)).fetchone()[0]
+        valuation_repairs=repairs-publication_repairs
+        # Existing post-review dossier backlog has its own lane. Admit a small,
+        # bounded fresh cohort instead of letting it stop all new acquisition.
+        repair_limit=min(policy.get('max_repair_pending',48),8) if publication_repairs else policy.get('max_repair_pending',48)
+        if repair_policy['enabled']:repair_limit=repair_policy['valuation_queue_limit']
+        active+=c.execute("SELECT count(*) FROM plugin_pipeline q JOIN plugin_pipeline_leases l USING(owner,sku,seller) WHERE q.owner=? AND q.state='needs_fields' AND l.expires>?"+(' AND NOT '+repair_workflow.PUBLICATION_SQL if repair_policy['enabled'] else ''),(owner,now)).fetchone()[0]
         if active>=max(1,policy.get('max_inflight',12)-(1 if repairs else 0)):return {'state':'backpressure','active':active}
         promoted=promote_ready_candidate(c,db,owner,now)
         if promoted:return promoted
@@ -70,9 +78,13 @@ def admit_one(db, owner, now=None):
         capacity_schema(c)
         stores=[]
         for sid in policy['store_ids']:
-            store=c.execute('SELECT id,config FROM stores WHERE owner=? AND id=? AND verified=1',(owner,sid)).fetchone()
+            store=c.execute('SELECT id,config,secret FROM stores WHERE owner=? AND id=? AND verified=1',(owner,sid)).fetchone()
             if store and not c.execute("SELECT 1 FROM store_publication_capacity WHERE owner=? AND store_id=? AND state='blocked'",(owner,sid)).fetchone():
                 config=json.loads(store['config'])
+                from ..official_publication import backend
+                if backend(config) != 'maozi':
+                    credentials=db.open(store['secret'])
+                    if not credentials.get('client_id') or not credentials.get('api_key'):continue
                 if all(config.get(k) for k in ('shop_id','warehouse_id','watermark_id')):stores.append(store)
         if not stores:return {'state':'blocked','reason':'no_available_target_store'}
         # Alternate fresh discoveries and oldest backlog without starving either.
@@ -107,7 +119,7 @@ def admit_one(db, owner, now=None):
                 p['proposed_sale_price']={**quote,'observed_at':now,'source':'campaign-asking-price-decision','run_id':policy['run_id'],'reference_observed_at':p.get('collected_at')}
             from .repair import valuation_ready
             ready=valuation_ready(p)
-            if not ready and repairs>=policy.get('max_repair_pending',48):continue
+            if not ready and valuation_repairs>=repair_limit:continue
             expires=min(now+policy.get('write_window_seconds',21600),policy.get('until') or float('inf'))
             c.execute('INSERT INTO pipeline_admissions VALUES(?,?,?,?,?)',(*key,now,json.dumps(stamp)))
             c.execute('INSERT INTO plugin_routes VALUES(?,?,?,?,?,?)',(*key,target['id'],expires,policy['run_id']))
@@ -116,7 +128,8 @@ def admit_one(db, owner, now=None):
             c.execute("INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)",(*key,'queued' if ready else 'needs_fields',json.dumps({'requested_at':now,'submitted':False,'campaign_run_id':policy['run_id']}),now,0))
             SourceLibrary(db).put(owner,p,{'channel':'continuous-admission','run_id':policy['run_id']},connection=c)
             return {'state':'admitted','sku':row['sku'],'seller':row['seller']}
-        if repairs>=policy.get('max_repair_pending',48):return {'state':'backpressure','repair_pending':repairs}
+        if valuation_repairs>=repair_limit:
+            return {'state':'backpressure','repair_pending':valuation_repairs,**({'publication_repair_pending':publication_repairs} if publication_repairs else {})}
         return {'state':'source_exhausted','reason':'no_new_bound_source_candidate'}
 
 
@@ -171,14 +184,15 @@ def renew_campaign(c, owner, policy, now):
 
 async def run(db):
     import asyncio
-    schema(db)
+    from .database_work import run as database_work
+    await database_work(schema,db)
     while True:
         with db.connect() as c:owners=[r[0] for r in c.execute('SELECT owner FROM pipeline_campaigns WHERE enabled=1')]
         for owner in owners:
             started=time.time()
             try:
-                result=admit_one(db,owner)
+                result=await asyncio.to_thread(admit_one,db,owner)
             except Exception as error:
                 result={'state':'error','reason':type(error).__name__}
-            control.record(db,'seed',owner,'',started,result['state'],result)
+            await database_work(control.record,db,'seed',owner,'',started,result['state'],result)
         await asyncio.sleep(5)

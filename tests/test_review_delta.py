@@ -32,3 +32,22 @@ def test_idle_backoff_and_reactivation():
     assert delay==600
     assert next_delay(600,30,600,True,False)==30
     assert next_delay(600,30,600,False,True)==30
+
+def test_large_cursor_recovery_uses_bounded_deltas(tmp_path):
+ import asyncio,json
+ from types import SimpleNamespace
+ from flowhub.review_delta import upload,read
+ class Reply:
+  def __init__(self,cursor):self.cursor=cursor
+  def raise_for_status(self):pass
+  def json(self):return {'cursor':self.cursor}
+ calls=[]
+ async def request(client,config,method,*,params,body):
+  calls.append((params,body));return Reply(body['cursor'])
+ snapshot={'owner':'o','generated_at':'now','items':[{'sku':str(i),'seller':'s','revision':'a'*64} for i in range(251)],'local_history':[]}
+ db=SimpleNamespace(directory=tmp_path)
+ asyncio.run(upload(db,{'FLOWHUB_REVIEW_SYNC_URL':'https://example.com'},None,snapshot,'remote-cursor',request))
+ assert len(calls)==3
+ assert all(x[0]['mode']=='delta' and len(x[1]['upserts'])<=100 for x in calls)
+ assert calls[1][1]['base_cursor']==calls[0][1]['cursor']
+ assert read(tmp_path/'review-delta-checkpoint.json')['cursor']==calls[-1][1]['cursor']

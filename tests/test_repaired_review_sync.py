@@ -83,3 +83,65 @@ def test_manual_comparison_receives_dossier_without_approval_or_clock_refresh():
     assert review==original
     p['plugin_detail']['weight_g']=20
     assert repaired_review(review,p,now=101,allow_manual=True) is None
+
+
+def converted_fixture():
+    review,p=fixture()
+    prior={'value':300,'currency':'RUB','source':'original-reference','observed_at':100}
+    review['candidate']['origin']['price_evidence']=prior
+    p['plugin_detail']['monthly_sales']['average_price_rub']=None
+    p['proposed_sale_price']={'value':22.02,'currency':'CNY','observed_at':100,
+        'source':'approved-listing-price-intent','source_quote':prior.copy()}
+    return review,p
+
+
+def test_reference_currency_change_preserves_exact_approved_cny_price():
+    review,p=converted_fixture()
+    synced=repaired_review(review,p,now=101)
+    assert synced and synced['finished_at']==100 and synced['result']==review['result']
+    assert synced['price_basis']['source_quote']==review['candidate']['origin']['price_evidence']
+
+
+@pytest.mark.parametrize('change',['value','timestamp','reference','source','expired'])
+def test_currency_reuse_does_not_allow_repricing_or_approval_refresh(change):
+    review,p=converted_fixture();now=101
+    if change=='value':p['proposed_sale_price']['value']=23
+    if change=='timestamp':p['proposed_sale_price']['observed_at']=101
+    if change=='reference':p['proposed_sale_price']['source_quote']['value']=301
+    if change=='source':p['proposed_sale_price']['source']='other'
+    if change=='expired':now=22000
+    assert repaired_review(review,p,now=now) is None
+
+
+@pytest.mark.parametrize('action',['list','unlist'])
+async def test_unsynchronized_review_is_retained_and_listing_scope_is_checked(tmp_path,monkeypatch,action):
+    import json,time
+    from flowhub.db import Database
+    from flowhub.source_library import SourceLibrary
+    from flowhub import plugin_pipeline as pipeline
+    from flowhub.pipeline_modules.repair import PriceRepairModule
+    from flowhub.listing_controls import schema
+    db=Database(tmp_path);lib=SourceLibrary(db);pipeline.schema(db);schema(db)
+    review,p=fixture();now=time.time();review['finished_at']=now
+    review['website_listing_authorization']={'id':'original-list'}
+    p['collected_at']=now;p['plugin_detail']['observed_at']=now
+    p['plugin_detail']['monthly_sales']['observed_at']=now
+    p['plugin_detail']['weight_g']=20 # genuine economics change: must recalculate
+    with db.connect() as c:
+        owner=c.execute('SELECT id FROM users').fetchone()[0]
+        c.execute('CREATE TABLE plugin_reviews(owner TEXT,sku TEXT,seller TEXT,body TEXT)')
+        c.execute('INSERT INTO plugin_reviews VALUES(?,?,?,?)',(owner,'1','2',json.dumps(review)))
+        q={'same_product_only':True,'listing_control_id':'original-list','official_dossier_pending':True}
+        c.execute('INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)',(owner,'1','2','needs_fields',json.dumps(q),0,0))
+        c.execute('INSERT INTO product_listing_controls VALUES(?,?,?,?,?,?,?)',(owner,'1','2',action,'blocked',json.dumps({'id':'original-list'}),now))
+    lib.put(owner,p,{'channel':'test'})
+    async def repair(*args):return {'state':'ready','reason':'complete_dossier'}
+    monkeypatch.setattr(PriceRepairModule,'run',repair)
+    await pipeline.tick(db,lane='seed_repair')
+    with db.connect() as c:
+        row=c.execute('SELECT state,body FROM plugin_pipeline').fetchone();q=json.loads(row['body'])
+        assert row['state']=='queued'
+        assert q.get('force_full_evaluation',False)==(action=='list')
+        assert q['same_product_only']==(action!='list')
+        assert json.loads(c.execute('SELECT body FROM plugin_reviews').fetchone()[0])==review
+        assert db.open(c.execute('SELECT body FROM repair_review_history').fetchone()[0])==review

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+from .pipeline_modules.database_work import run as database_work
 from pathlib import Path
 
 from .modules import ModuleError, Pending
@@ -71,6 +72,7 @@ class SourceCollector:
             )
 
     async def call(self, path, method="GET", query=None, body=None):
+        self.last_timing={}
         # Old unresolved drafts must not each pay a full timeout during an outage.
         # Writes keep their original one-shot journal semantics and never use this gate.
         scope=(self.c['owner'],hashlib.sha256(self.keys.get('erp_token','').encode()).hexdigest(),path)
@@ -78,10 +80,16 @@ class SourceCollector:
         if method=='GET' and time.monotonic()<until:
             raise SourceAcquisitionFailure('CONNECT_TIMEOUT_BACKOFF',{'operation':path,'retry_after_ms':60000})
         try:
-            result=await request(path, method, self.keys, query, body)
+            from .acquisition import enabled, enrolled
+            if enabled(self.db,self.sku) or enrolled(self.db,self.key):
+                from .source_gateway import request as gateway_request
+                result,self.last_timing=await gateway_request(self.keys,path,method,query,body,proxy=self.c["store"].get("config",{}).get("erp_proxy"))
+            else:
+                result=await request(path, method, self.keys, query, body)
             if method=='GET':self.read_failures.pop(scope,None)
             return result
         except Exception as error:
+            self.last_timing=getattr(error,'diagnostic',{}).get('timing',{})
             code=str(error).lower()
             network=isinstance(error,TimeoutError) or any(v in code for v in ('connect_timeout','etimedout','econnreset','enotfound','fetch failed'))
             if method=='GET' and network:
@@ -135,7 +143,7 @@ class SourceCollector:
             total_seen = 0
             for page in range(1, 101):
                 if claimed:
-                    self.renew_claim()
+                    await database_work(self.renew_claim)
                 response = await self.call(
                     "/api.product.favorite/lists",
                     query={"sku": self.sku, "is_imported": imported, "page": page, "page_size": 100},
@@ -183,33 +191,47 @@ class SourceCollector:
             raise ModuleError("ambiguous source favorite")
         return next(iter(matches.values()), None)
 
-    async def recover_draft(self, data):
+    async def recover_draft(self, data, *, allow_missing=False):
         # Read-only full listing, cached per owner/account. Never infer success from a favorite.
         account=self.c['owner']+':'+hashlib.sha256(self.keys.get('erp_token','').encode()).hexdigest()
         cached=self.recovery_pages.get(account)
-        if not cached or time.time()-cached[0]>60:
-            rows=[];complete=False
+        if allow_missing or not cached or time.time()-cached[0]>60:
+            rows=[];complete=False;expected=None
             for page in range(1,21):
                 response=await self.call('/api.product.collect/lists',query={'page':page,'page_size':100})
                 batch=response if isinstance(response,list) else response.get('data',[])
                 if not isinstance(batch,list):raise Pending('invalid draft recovery listing')
                 rows.extend(batch)
                 total=response.get('total') if isinstance(response,dict) else None
+                if total is not None:
+                    if expected is None:expected=int(total)
+                    elif int(total)!=expected:raise Pending('draft recovery listing changed')
                 if len(batch)<100 or (total is not None and len(rows)>=int(total)):
                     complete=True;break
             if not complete:raise Pending('draft recovery listing incomplete')
+            if expected is not None and len({str(r['id']) for r in rows})!=expected:
+                raise Pending('draft recovery listing unstable')
             self.recovery_pages[account]=(time.time(),rows)
         else:rows=cached[1]
         matches={str(r['id']):r for r in rows if str(r.get('goods_id'))==self.sku and r.get('collect_from')=='ozon' and r.get('id')}
+        if not matches and allow_missing:return None
         if len(matches)!=1:raise Pending('source draft recovery missing or ambiguous; no creation repeated')
         draft_id=int(next(iter(matches)))
         detail=await self.call('/api.product.collect/detail',query={'id':draft_id,'is_online':0})
         data=data|{'source_key':self.sku,'draft_id':draft_id,'detail':detail,'observed_at':time.time(),
                    'recovery':{'source':'exact-ozon-draft-list','at':time.time()}}
-        self.save('ready',data)
+        await database_work(self.save,'ready',data)
+        from .collection_capacity import finish
+        finish(self)
         return data
 
     async def collect(self):
+        from .acquisition import enabled, enrolled, dispatch
+        if enabled(self.db,self.sku) or enrolled(self.db,self.key):
+            return await dispatch(self)
+        return await self.collect_legacy()
+
+    async def collect_legacy(self):
         # Claim once per source/account. A crashed collecting call is not repeated blindly.
         with self.db.connect() as db:
             inserted = (
@@ -225,6 +247,18 @@ class SourceCollector:
                 and isinstance(observed, (int, float)) and not isinstance(observed, bool)
                 and 0 <= time.time() - observed < 21600):
             return data
+        if data.get('draft_id'):
+            from .collection_capacity import account
+            with self.db.connect() as db:
+                exists=db.execute("SELECT 1 FROM sqlite_master WHERE name='draft_cleanup_receipts'").fetchone()
+                deleted=db.execute("SELECT 1 FROM draft_cleanup_receipts WHERE account=? AND draft_id=? AND sku=? AND state='deleted'",
+                    (account(self.c),str(data['draft_id']),self.sku)).fetchone() if exists else None
+                if deleted:
+                    replacement={'source_key':self.sku,'replaces_deleted_draft_id':data['draft_id']}
+                    inserted=db.execute("UPDATE source_details SET state='claimed',body=?,updated=? WHERE key=? AND state=? AND updated=?",
+                        (self.db.seal(replacement),time.time(),self.key,state,updated)).rowcount==1
+                    if not inserted:raise Pending('source acquisition changed during draft reclamation')
+                    state,data='claimed',replacement
         if data.get("draft_id"):
             detail = await self.call(
                 "/api.product.collect/detail", query={"id": data["draft_id"], "is_online": 0}
@@ -232,7 +266,7 @@ class SourceCollector:
             data.pop("mapping", None)
             data.pop("mapping_client", None)
             data |= {"detail": detail, "observed_at": time.time()}
-            self.save("ready", data)
+            await database_work(self.save,"ready", data)
             return data
         if not inserted and state=="draft_started" and time.time()-updated>120:
             return await self.recover_draft(data)
@@ -254,7 +288,7 @@ class SourceCollector:
         self.claim_updated = self.load()[2]
         try:
             favorite = await self.find_favorite(claimed=True)
-            self.renew_claim()
+            await database_work(self.renew_claim)
         except BaseException:
             if data.get("favorite_attempted"):
                 with self.db.connect() as db:
@@ -263,7 +297,7 @@ class SourceCollector:
                         "WHERE key=? AND state='claimed' AND updated=?",
                         (self.db.seal(data), time.time(), self.key, self.claim_updated),
                     )
-            else:
+            elif not data.get('replaces_deleted_draft_id'):
                 with self.db.connect() as db:
                     db.execute(
                         "DELETE FROM source_details WHERE key=? AND state='claimed' AND updated=?",
@@ -272,12 +306,14 @@ class SourceCollector:
             raise
         if favorite is None:
             if data.get("favorite_attempted"):
-                self.save("favorite_started", data)
+                await database_work(self.save,"favorite_started", data)
                 raise Pending("favorite creation not confirmed; lookup again later")
             if self.c.get("existing_favorite_only"):
-                self.save("claimed", data)
+                await database_work(self.save,"claimed", data)
                 raise Pending("source favorite missing; a real price is required before creating one")
-            self.save("favorite_started", {"source_key": self.sku, "favorite_attempted": True})
+            from .collection_capacity import guard
+            await guard(self)
+            await database_work(self.save,"favorite_started", {"source_key": self.sku, "favorite_attempted": True})
             p = self.c["candidate"]
             try:
                 await self.call(
@@ -299,19 +335,27 @@ class SourceCollector:
                         and diagnostic.get('operation')=='/api.product.favorite/toggle'
                         and diagnostic.get('write_outcome_unknown') is False
                         and '收藏数量已达上限' in str(diagnostic.get('api_message',''))):
-                    self.save('favorite_rejected',{'source_key':self.sku,'last_rejection':diagnostic})
+                    await database_work(self.save,'favorite_rejected',{'source_key':self.sku,'last_rejection':diagnostic})
                 raise
             # Keep the unknown marker while renewing the lease for a long lookup.
-            self.save("claimed", {"source_key": self.sku, "favorite_attempted": True})
+            await database_work(self.save,"claimed", {"source_key": self.sku, "favorite_attempted": True})
             self.claim_updated = self.load()[2]
             favorite = await self.find_favorite(claimed=True)
-            self.renew_claim()
+            await database_work(self.renew_claim)
         if favorite is None:
             raise Pending("favorite creation not confirmed; lookup again later")
+        replacement=data.get('replaces_deleted_draft_id')
         data = {"source_key": self.sku, "favorite_id": int(favorite["id"])}
-        self.save("draft_started", data)
-        if str(favorite.get("is_imported")) == "1":
+        if replacement:
+            data['replaces_deleted_draft_id']=replacement
+            recovered=await self.recover_draft(data,allow_missing=True)
+            if recovered:return recovered
+        if str(favorite.get("is_imported")) == "1" and not replacement:
+            await database_work(self.save,"draft_started", data)
             return await self.recover_draft(data)
+        from .collection_capacity import guard, finish
+        await guard(self, reserve=True)
+        await database_work(self.save,"draft_started", data)
         try:
             draft = await self.call("/api.product.favorite/edit_import", "POST", body={"id": data["favorite_id"]})
         except SourceAcquisitionFailure as error:
@@ -320,16 +364,18 @@ class SourceCollector:
             if (diagnostic.get('api_code')==0 and diagnostic.get('operation')=='/api.product.favorite/edit_import'
                     and '采集箱已满' in str(diagnostic.get('api_message',''))):
                 data['last_rejection']=diagnostic
-                self.save('draft_rejected',data)
+                await database_work(self.save,'draft_rejected',data)
+                finish(self, rejected=True)
             raise
         draft_id = int(draft.get("jump_id") or draft.get("id") or 0)
         if draft_id <= 0:
             raise ModuleError("source draft acknowledgement missing")
         data["draft_id"] = draft_id
-        self.save("draft_ready", data)
+        await database_work(self.save,"draft_ready", data)
+        finish(self)
         detail = await self.call("/api.product.collect/detail", query={"id": draft_id, "is_online": 0})
         data |= {"detail": detail, "observed_at": time.time()}
-        self.save("ready", data)
+        await database_work(self.save,"ready", data)
         return data
 
 
@@ -418,7 +464,7 @@ async def map_detail(snapshot, context, seller):
                         brand = detail.get("brand_select") or {}
                         if str(brand.get("id")) == str(identifier):
                             label = brand.get("value")
-                    if isinstance(label, str) and label.strip():
+                    if isinstance(label, str) and len(label.strip()) >= 2:
                         found = await seller(
                             "/v1/description-category/attribute/values/search",
                             {

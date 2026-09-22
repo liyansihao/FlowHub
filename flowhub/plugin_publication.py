@@ -56,7 +56,7 @@ def require_source_modes(modes, monthly, allow_unknown=False, now=None):
         raise ValueError('fresh_fbs_required')
 
 
-def approved(review, rules, now=None, allow_unknown=False):
+def approved(review, rules, now=None, allow_unknown=False, *, native_follow=False):
     now = time.time() if now is None else now
     if review.get('state') != 'matched' or not 0 <= now-review.get('finished_at',0) < 21600:
         raise ValueError('fresh_comparebot_approval_required')
@@ -68,7 +68,7 @@ def approved(review, rules, now=None, allow_unknown=False):
             if approved_price_intent(review,now) is None:raise ValueError('price_evidence_stale')
     website=bool(review.get('website_listing_authorization',{}).get('id') and review.get('identity_review',{}).get('verdict')=='match' and (review.get('identity_review',{}).get('human_review') or review.get('identity_review',{}).get('automatic_review')))
     blockers=list(review.get('publication_blockers') or [])
-    if website:blockers=[b for b in blockers if b!='publication_attributes_missing']
+    if website or native_follow:blockers=[b for b in blockers if b!='publication_attributes_missing']
     if allow_unknown:
         if not unknown_restrictions_allowed(review):raise ValueError('explicit_source_restriction')
         blockers=[b for b in blockers if b not in ('fresh_pure_fbs_required','follow_permission_unverified_or_blocked')]
@@ -102,6 +102,9 @@ async def advance(db, owner, sku, seller):
         for key in ('sku:'+sku,'store:'+str(target)):
             handle=(directory/(hashlib.sha256(key.encode()).hexdigest()+'.lock')).open('a');locks.append(handle)
             fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        from .follow_publication import selected
+        if selected(db,(owner,sku,seller)):
+            return await _advance(db,owner,sku,seller,native_follow=True)
         from .official_publication import advance_if_selected
         official = await advance_if_selected(db,owner,sku,seller)
         if official is not None:return official
@@ -110,7 +113,8 @@ async def advance(db, owner, sku, seller):
         for handle in reversed(locks):handle.close()
 
 
-async def _advance(db, owner, sku, seller):
+async def _advance(db, owner, sku, seller, *, native_follow=False):
+    from .follow_publication import full_dossier_required
     with db.connect() as c:
         c.execute('CREATE TABLE IF NOT EXISTS plugin_publications(owner TEXT,sku TEXT,seller TEXT,body TEXT,updated REAL,PRIMARY KEY(owner,sku,seller))')
         prior=c.execute('SELECT body FROM plugin_publications WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()
@@ -118,6 +122,10 @@ async def _advance(db, owner, sku, seller):
         row=c.execute('SELECT body FROM plugin_reviews WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()
         if wf is None or row is None:raise ValueError('review_missing')
         record=json.loads(prior[0]) if prior else None
+        if native_follow and record and record.get('backend')!='maozi_follow':
+            raise ValueError('historical_publication_backend_mismatch')
+        if native_follow and not record and c.execute('SELECT 1 FROM plugin_publications WHERE sku=?',(sku,)).fetchone():
+            raise ValueError('source_already_claimed')
         c.execute('CREATE TABLE IF NOT EXISTS plugin_routes(owner TEXT,sku TEXT,seller TEXT,store_id TEXT,expires REAL,run_id TEXT,PRIMARY KEY(owner,sku,seller))')
         route=c.execute('SELECT * FROM plugin_routes WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()
         review=record['review'] if record else json.loads(row[0])
@@ -125,21 +133,31 @@ async def _advance(db, owner, sku, seller):
         c.execute('CREATE TABLE IF NOT EXISTS plugin_publication_permissions(owner TEXT,sku TEXT,seller TEXT,expires REAL,reason TEXT,PRIMARY KEY(owner,sku,seller))')
         permission=c.execute('SELECT * FROM plugin_publication_permissions WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()
         allow_unknown=bool(permission and time.time()<permission['expires'] and route and time.time()<route['expires'])
+        require_full_dossier = native_follow and full_dossier_required(db,(owner,sku,seller))
         if record and fingerprint(json.loads(row[0]))!=fingerprint(review):
             phase=TestListingJournal(DATA/'plugin-production.sqlite3').read(record['offer_id'])['phase']
             if phase in ('prepared','ready','favorite_pending','reconciling','sync_pending','stock_ready','stock_pending') or (phase=='manual_review' and TestListingJournal(DATA/'plugin-production.sqlite3').read(record['offer_id'])['details'].get('reason') in ('reconciliation_timeout','platform_issue_requires_review')):
-                latest=json.loads(row[0]);approved(latest,rules,allow_unknown=allow_unknown)
+                latest=json.loads(row[0]);approved(latest,rules,allow_unknown=allow_unknown,native_follow=native_follow)
                 from .pipeline_modules.dossier import refresh_unchanged_plan
                 try:
-                    refresh_unchanged_plan(record,latest)
+                    if native_follow:
+                        from .follow_publication import refresh_review
+                        refresh_review(record,latest)
+                    else:refresh_unchanged_plan(record,latest)
                 except ValueError as error:
-                    if str(error)!='prepared_plan_repricing_required':raise
+                    if native_follow or str(error)!='prepared_plan_repricing_required':raise
                     from .pipeline_modules.dossier import refresh_procurement_plan
                     record=refresh_procurement_plan(c,DATA/'plugin-production.sqlite3',record,latest)
                 review=latest
                 c.execute('UPDATE plugin_publications SET body=?,updated=? WHERE owner=? AND sku=? AND seller=?',
                           (json.dumps(record),time.time(),owner,sku,seller))
-        if not record:approved(review,rules,allow_unknown=allow_unknown)
+        if not record:
+            from .acquisition import enabled as acquisition_enabled
+            from .dossier_gate import valid as dossier_gate_valid
+            if not native_follow and acquisition_enabled(db,sku) and not dossier_gate_valid(c,(owner,sku,seller)):
+                return {'phase':'awaiting_dossier','needs_dossier':True,'verified':False,
+                        'reason':'publication_dossier_gate_required','missing_fields':[]}
+            approved(review,rules,allow_unknown=allow_unknown,native_follow=native_follow)
         target_id=record['store_id'] if record else route['store_id'] if route else wf['active_store']
         if not record and route and time.time()>=route['expires']:raise ValueError('hour_window_closed')
         store=c.execute('SELECT * FROM stores WHERE owner=? AND id=? AND verified=1',(owner,target_id)).fetchone()
@@ -156,11 +174,17 @@ async def _advance(db, owner, sku, seller):
     from .pipeline_modules.request_bridge import PublicationBridge, MeasuredTransport
     bridge=PublicationBridge(ROOT,execute=True,token=keys['erp_token'])
     from .cluster_routing import route_bridge
-    route_bridge(bridge, DATA, (owner, sku, seller))
+    from .pipeline_modules.database_work import run as database_work
+    await database_work(route_bridge,bridge, DATA, (owner, sku, seller))
     def save():
         with db.connect() as c:c.execute('INSERT OR REPLACE INTO plugin_publications VALUES(?,?,?,?,?)',(owner,sku,seller,json.dumps(record),time.time()))
     from .pipeline_modules.transport import StepTransport
-    transport=StepTransport(MeasuredTransport(bridge),ttl=15,namespace=fingerprint({'token':keys['erp_token']}))
+    transport_args={'namespace':fingerprint({'token':keys['erp_token']}),
+                    'circuit_namespace':getattr(bridge,'execution_route','local')}
+    if native_follow:
+        from .follow_execution import FollowBatchTransport
+        transport=FollowBatchTransport(MeasuredTransport(bridge),sku=sku,**transport_args)
+    else:transport=StepTransport(MeasuredTransport(bridge),ttl=15,**transport_args)
     async with httpx.AsyncClient(base_url='https://api.maozierp.com',transport=transport) as client, AsyncExitStack() as observation_clients:
         from .pipeline_modules.favorite_lookup import PublicationSourceAdapter, PublicationAdapter
         base=PublicationSourceAdapter(client)
@@ -183,7 +207,7 @@ async def _advance(db, owner, sku, seller):
             else:
                 q=await MaoziPublisher({'store':{'config':config,'credentials':keys}}).erp('POST','/api.shop/sync_single_product_limit',body={'id':int(plan.shop_id)})
             if record is not None:
-                record['quota']={'at':time.time(),'data':q};save()
+                record['quota']={'at':time.time(),'data':q};await database_work(save)
             from .pipeline_modules.store_capacity import observe
             observe(db,owner,target_id,q)
             require_quota(q)
@@ -196,7 +220,12 @@ async def _advance(db, owner, sku, seller):
             c=review['candidate']|{'price':profit['sell_price_cny']}
             context={'owner':owner,'candidate':c,'match':match,'rules':rules,'store':{'id':store['id'],'config':config,'credentials':keys},'idempotency_key':'plugin-'+sku}
             from .pipeline_modules.dossier import reviewed_snapshot
-            snapshot=reviewed_snapshot(review)
+            if native_follow:
+                from .follow_publication import local_inputs, legacy_source_hold
+                hold=legacy_source_hold(db,owner,sku,keys['erp_token'])
+                if hold:raise ValueError(hold)
+                snapshot=reviewed_snapshot(review) if require_full_dossier else local_inputs(review)
+            else:snapshot=reviewed_snapshot(review)
             if snapshot is None and review.get('website_listing_authorization'):
                 original=review['candidate'];physical=original['origin'].get('plugin_detail') or {}
                 dims=physical.get('dimensions_mm') or []
@@ -212,9 +241,11 @@ async def _advance(db, owner, sku, seller):
             await quota(plan,None)
             offer=journal.prepare(plan)
             if not ownership.acquire(plan.shop_id,offer,sku):raise ValueError('source_claim_conflict')
-            record={'owner':owner,'sku':sku,'seller':seller,'store_id':store['id'],'store_name':store['name'],'review':review,'snapshot':snapshot,'plan':plan.to_dict(),'offer_id':offer,'started_at':time.time(),'events':[],'allow_unknown_shipping_follow':allow_unknown,'pricing_intent':approved_price_intent(review),'permission_reason':permission['reason'] if allow_unknown else None};save()
+            record={'owner':owner,'sku':sku,'seller':seller,'store_id':store['id'],'store_name':store['name'],'review':review,'snapshot':snapshot,'plan':plan.to_dict(),'offer_id':offer,'started_at':time.time(),'events':[],'allow_unknown_shipping_follow':allow_unknown,'pricing_intent':approved_price_intent(review),'permission_reason':permission['reason'] if allow_unknown else None}
+            if native_follow:record['backend']='maozi_follow'
+            await database_work(save)
             if route:
-                record.update(authorized_store_id=target_id,write_deadline=route['expires'],run_id=route['run_id']);save()
+                record.update(authorized_store_id=target_id,write_deadline=route['expires'],run_id=route['run_id']);await database_work(save)
         plan=ZeroStockListingPlan(**record['plan']);offer=record['offer_id']
         async def stock_guard(plan,product):
             blocks,offers=await exclusions()
@@ -225,11 +256,15 @@ async def _advance(db, owner, sku, seller):
                 current=c.execute('SELECT body FROM sourcing_products WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()
             if current is None:raise ValueError('current_source_packet_missing')
             require_unchanged_source(review,json.loads(current[0]))
-            feedback=await bridge.call('feedback',product=review['candidate']['origin']|{'allow_unknown_publication':allow_unknown,'approved_listing_price':approved_price_intent(review),'website_listing_authorization':review.get('candidate',{}).get('origin',{}).get('website_listing_authorization')},source=source)
+            feedback_product=review['candidate']['origin']|{'allow_unknown_publication':allow_unknown,'approved_listing_price':approved_price_intent(review),'website_listing_authorization':review.get('candidate',{}).get('origin',{}).get('website_listing_authorization')}
+            if native_follow:
+                from .follow_publication import feedback as follow_feedback
+                feedback=await follow_feedback(ROOT,feedback_product,source)
+            else:feedback=await bridge.call('feedback',product=feedback_product,source=source)
             if feedback.get('blocked'):raise ValueError('human_feedback_blocked')
             if feedback.get('rejected'):raise ValueError('publication_source_policy_required')
         async def preflight(plan,offer):
-            approved(review,rules,allow_unknown=allow_unknown)
+            approved(review,rules,allow_unknown=allow_unknown,native_follow=native_follow)
             await verify_target(plan)
             await stock_guard(plan,type('Identity',(),{'sku':''})())
             if journal.read(offer)['phase']!='ready':return
@@ -260,7 +295,7 @@ async def _advance(db, owner, sku, seller):
             cause=error.__cause__ or error
             record['phase']=journal.read(offer)['phase']
             record.setdefault('api_timings',[]).append({'at':time.time(),'calls':transport.timings[:]})
-            record['events'].append({'at':time.time(),'from':before,'error':type(error).__name__,'reason':str(cause)[:250]});save()
+            record['events'].append({'at':time.time(),'from':before,'error':type(error).__name__,'reason':str(cause)[:250]});await database_work(save)
             raise
         # Official Maozi UI uses repair_images({ids:[ERP record id]}).
         # Persist intent before dispatch; an unknown outcome is never replayed.
@@ -281,7 +316,7 @@ async def _advance(db, owner, sku, seller):
                         journal.move(offer,'manual_review','manual_review',image_repair_acknowledged_at=time.time())
                     except Exception as error:
                         journal.move(offer,'manual_review','manual_review',image_repair_error=type(error).__name__)
-                    record['phase']='manual_review';save()
+                    record['phase']='manual_review';await database_work(save)
                     return {'sku':sku,'offer_id':offer,'phase':'manual_review','verified':False,'retryable_readback':True,'reason':'image_repair_waiting_for_platform'}
         from .pipeline_modules.platform_recovery import recover_platform_warning
         if not favorite_handled and await recover_platform_warning(port,journal,offer,plan,preflight):
@@ -295,15 +330,16 @@ async def _advance(db, owner, sku, seller):
                 journal.move(offer,'manual_review','stock_verified',reason=None,recovered_at=time.time())
             elif product and not product.issue_codes and product.status in ('ready_to_sell','selling','out_of_stock') and time.time()<record.get('write_deadline',0):
                 # A current approval is required before retrying inventory writes.
-                approved(review,rules,allow_unknown=allow_unknown)
+                approved(review,rules,allow_unknown=allow_unknown,native_follow=native_follow)
                 journal.move(offer,'manual_review','reconciling',reason=None,waiting_since=time.time(),recovered_at=time.time())
             else:
-                record['phase']='manual_review';record['last_reconciliation_at']=time.time();save()
+                record['phase']='manual_review';record['last_reconciliation_at']=time.time();await database_work(save)
                 return {'sku':sku,'offer_id':offer,'phase':'manual_review','verified':False,'retryable_readback':True,'reason':'awaiting_exact_remote_outcome'}
             before=journal.read(offer)['phase']
         if (not favorite_handled and before not in ('stock_verified','failed','manual_review')) or (favorite_handled and journal.read(offer)['phase']=='ready'):
             try:
-                await service.advance(offer)
+                from .follow_execution import submit_prepared
+                await submit_prepared(service,journal,offer,native_follow=native_follow,before=before)
                 if before=='prepared' and journal.read(offer)['phase']=='favorite_pending':
                     # Verify a successful favorite creation in this same operation.
                     # Some favorites disappear before a later queue turn can see them.
@@ -316,16 +352,16 @@ async def _advance(db, owner, sku, seller):
                 cause=error.__cause__ or error
                 record['phase']=journal.read(offer)['phase']
                 record.setdefault('api_timings',[]).append({'at':time.time(),'calls':transport.timings[:]})
-                record['events'].append({'at':time.time(),'from':before,'error':type(error).__name__,'reason':str(cause)[:250]});save()
+                record['events'].append({'at':time.time(),'from':before,'error':type(error).__name__,'reason':str(cause)[:250]});await database_work(save)
                 if isinstance(cause,ValueError) and str(cause) in ('target_quota_unavailable','hour_window_closed'):raise cause
                 raise
         final=journal.read(offer)
         record.setdefault('api_timings',[]).append({'at':time.time(),'calls':transport.timings[:]})
-        record['events'].append({'at':time.time(),'from':before,'to':final['phase']});record['phase']=final['phase'];save()
+        record['events'].append({'at':time.time(),'from':before,'to':final['phase']});record['phase']=final['phase'];await database_work(save)
         if final['phase']=='stock_verified':
             product=await port.find_product(plan.shop_id,offer);stocks=await port.read_stocks(product) if product else []
             record['product']=asdict(product) if product else None;record['stocks']=[asdict(s) for s in stocks]
-            record['verified']=bool(product and product.status=='selling' and any(s.warehouse_id==warehouse and s.present==99 for s in stocks));save()
+            record['verified']=bool(product and product.status=='selling' and any(s.warehouse_id==warehouse and s.present==99 for s in stocks));await database_work(save)
         library=SourceLibrary(db)
         with db.connect() as c:
             row=c.execute('SELECT body FROM sourcing_products WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller)).fetchone()

@@ -6,7 +6,7 @@ from pathlib import Path
 root=Path(__file__).resolve().parents[1]
 source=root/'packaging/windows-agent'
 out=root/'output/FlowHub-Windows-Full-Agent-v3.zip'
-files=['agent.py','production_agent.py','full_agent.py','compute_worker.py',
+files=['agent.py','production_agent.py','full_agent.py','compute_worker.py','runtime_identity.py',
        'Upgrade-Full.ps1','Upgrade-Full.cmd','Start-Full.cmd','requirements-tested.txt','FULL-README.md']
 revision='ed25f3a31f01632728cabb09d1542f84ab7b0056'
 model=Path.home()/'.cache/huggingface/hub/models--facebook--dinov2-small/snapshots'/revision

@@ -15,7 +15,7 @@ $python = Join-Path $venv 'Scripts\python.exe'
 $vendor = Join-Path $PSScriptRoot 'compareBot'
 & $python -m pip install -c (Join-Path $PSScriptRoot 'requirements-tested.txt') "${vendor}[search1688,dinov2]"
 if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed. Existing device credentials remain available.' }
-foreach ($name in @('agent.py','production_agent.py','full_agent.py','compute_worker.py','dossier_packet.py')) {
+foreach ($name in @('agent.py','production_agent.py','full_agent.py','compute_worker.py','dossier_packet.py','runtime_identity.py','requirements-tested.txt')) {
     Copy-Item (Join-Path $PSScriptRoot $name) (Join-Path $root $name) -Force
 }
 if (Test-Path (Join-Path $PSScriptRoot 'model-cache')) {

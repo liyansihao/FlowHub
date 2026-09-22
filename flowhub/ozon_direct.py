@@ -283,14 +283,21 @@ class OzonDirectPublisher(MaoziPublisher):
                     errors.append(f"{aid}：属性值无效")
                     continue
                 if spec.get("dictionary_id"):
+                    # Search rejects single-character values (e.g. "2"). The
+                    # source already supplies an ID; verify that exact ID/text.
+                    identifier = v.get('dictionary_value_id')
+                    if type(identifier) is not int or identifier <= 0:
+                        errors.append(f"{aid}：缺少有效字典 ID")
+                        continue
                     result = await self.seller(
-                        "/v1/description-category/attribute/values/search",
+                        "/v1/description-category/attribute/values",
                         {
                             "description_category_id": item["description_category_id"],
                             "type_id": item["type_id"],
                             "attribute_id": aid,
-                            "value": v["value"],
+                            "last_value_id": identifier - 1,
                             "limit": 100,
+                            "language": "DEFAULT",
                         },
                     )
                     if not any(

@@ -145,9 +145,13 @@ class SourceLibrary:
               id INTEGER PRIMARY KEY,owner TEXT NOT NULL,sku TEXT NOT NULL,seller TEXT NOT NULL,
               body TEXT NOT NULL,first_seen REAL NOT NULL,updated REAL NOT NULL,UNIQUE(owner,sku,seller));
             CREATE INDEX IF NOT EXISTS sourcing_product_lookup ON sourcing_products(owner,updated,id);
+            CREATE INDEX IF NOT EXISTS sourcing_product_seller ON sourcing_products(owner,seller);
             CREATE INDEX IF NOT EXISTS sourcing_filter_price ON sourcing_products(owner,json_extract(body,'$.average_price_rub'),id);
             CREATE INDEX IF NOT EXISTS sourcing_filter_category ON sourcing_products(owner,json_extract(body,'$.category_id'),id);
-            CREATE INDEX IF NOT EXISTS sourcing_product_seller ON sourcing_products(owner,seller);
+            CREATE INDEX IF NOT EXISTS sourcing_admission_candidates ON sourcing_products(owner,id)
+              WHERE json_extract(body,'$.coverage') IN ('storefront-page','maozi-exact-seller-page')
+              AND json_extract(body,'$.source_relation.seller_id')=json_extract(body,'$.seller_id')
+              AND json_array_length(json_extract(body,'$.source_relation.root_seeds'))>0;
             CREATE INDEX IF NOT EXISTS sourcing_admission_candidate_keys ON sourcing_products(owner,id,sku)
               WHERE json_extract(body,'$.coverage') IN ('storefront-page','maozi-exact-seller-page')
               AND json_extract(body,'$.source_relation.seller_id')=json_extract(body,'$.seller_id')
@@ -155,6 +159,7 @@ class SourceLibrary:
             CREATE TABLE IF NOT EXISTS sourcing_evidence(
               owner TEXT NOT NULL,hash TEXT NOT NULL,sku TEXT NOT NULL,body TEXT NOT NULL,at REAL NOT NULL,
               PRIMARY KEY(owner,hash));
+            CREATE INDEX IF NOT EXISTS sourcing_evidence_product ON sourcing_evidence(owner,sku,hash);
             CREATE TABLE IF NOT EXISTS sourcing_seeds(
               owner TEXT NOT NULL,shop TEXT NOT NULL,offer TEXT NOT NULL,sku TEXT NOT NULL,
               body TEXT NOT NULL,archived INTEGER,sales REAL,checked REAL,

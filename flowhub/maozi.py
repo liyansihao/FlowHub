@@ -15,6 +15,10 @@ class MaoziPublisher:
         self.keys = self.store["credentials"]
 
     async def erp(self, method, path, body=None, params=None):
+        if self.c.get('acquisition_gateway'):
+            from .source_gateway import request
+            result,_=await request(self.keys,path,method,params,body,proxy=self.config.get("erp_proxy"))
+            return result
         async with httpx.AsyncClient(
             base_url="https://api.maozierp.com",
             headers={
@@ -25,6 +29,7 @@ class MaoziPublisher:
             },
             timeout=25,
             trust_env=False,
+            proxy=self.config.get('erp_proxy'),
         ) as client:
             r = await client.request(method, path, json=body, params=params)
             r.raise_for_status()

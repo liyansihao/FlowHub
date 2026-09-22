@@ -94,3 +94,33 @@ def test_dossier_extraction_cannot_switch_source_or_variant():
     assert result['fields']['dimensions_mm']==[None,None,None]
     with pytest.raises(ValueError):extract({**payload,'sku':'other'})
     with pytest.raises(ValueError):extract({'sku':'123','snapshot':{'source_key':'123','detail':{'skus':[{},{}]}}})
+
+
+def test_status_reader_does_not_block_compute_result(tmp_path):
+    import sqlite3
+    clock,hub,service,d=setup(tmp_path)
+    identity=service.submit('rank',{'manifest':{'product_id':'123'}})
+    task=service.claim(d['token'])
+    reader=sqlite3.connect(hub.path)
+    try:
+        assert reader.execute('PRAGMA journal_mode').fetchone()[0]=='wal'
+        reader.execute('BEGIN')
+        assert reader.execute('SELECT state FROM compute_jobs WHERE id=?',(identity,)).fetchone()[0]=='running'
+        # A status page can hold its snapshot while a device returns a result.
+        # Bound the writer timeout so the old rollback journal fails promptly.
+        original_connect=hub.connect
+        from contextlib import contextmanager
+        @contextmanager
+        def short_connection():
+            with original_connect() as c:
+                c.execute('PRAGMA busy_timeout=100')
+                yield c
+        hub.connect=short_connection
+        result={'output':{'query':{'product_id':'123'}}}
+        assert service.complete(d['token'],identity,task['lease'],task['digest'],result)['ok']
+        assert reader.execute('SELECT state FROM compute_jobs WHERE id=?',(identity,)).fetchone()[0]=='running'
+        reader.rollback()
+        assert reader.execute('SELECT state FROM compute_jobs WHERE id=?',(identity,)).fetchone()[0]=='done'
+        assert service.result(identity)==result
+    finally:
+        reader.close()

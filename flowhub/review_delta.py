@@ -44,6 +44,35 @@ async def upload(db,config,client,snapshot,remote_cursor,request):
     path=db.directory/'review-delta-checkpoint.json'
     mode,body,checkpoint=prepare(snapshot,config,read(path),remote_cursor)
     metrics_path=db.directory/'review-delta-metrics.json';metrics=read(metrics_path)
+    if mode and remote_cursor and (mode=='refresh' or len(json.dumps(body).encode())>1_000_000):
+        # Cursor recovery uploads bounded idempotent deltas. Preserve remote rows
+        # unknown to the prior local checkpoint; never infer their deletion.
+        old=read(path)
+        removals=body.get('removed',[]) if mode=='delta' else [dict(zip(('sku','seller'),json.loads(k))) for k in old.get('items',{}) if k not in checkpoint['items']]
+        items=body.get('upserts',body.get('items',[]));history=body.get('history',body.get('local_history',[]))
+        batches=[]
+        for field,values in [('upserts',items),('removed',removals),('history',history)]:
+            batch=[];size=0
+            for value in values:
+                n=len(json.dumps(value,ensure_ascii=False).encode())
+                if batch and (size+n>500_000 or len(batch)>=100):batches.append((field,batch));batch=[];size=0
+                batch.append(value);size+=n
+            if batch:batches.append((field,batch))
+        if not batches:batches=[('upserts',[])]
+        cursor=remote_cursor;total_bytes=0
+        for index,(field,values) in enumerate(batches):
+            next_cursor=checkpoint['cursor'] if index==len(batches)-1 else digest([checkpoint['cursor'],cursor,index,values])
+            chunk={'owner':snapshot['owner'],'base_cursor':cursor,'cursor':next_cursor,'generated_at':snapshot['generated_at'],'upserts':[],'removed':[],'history':[],field:values}
+            response=await request(client,config,'POST',params={'mode':'delta'},body=chunk)
+            response.raise_for_status()
+            if response.json().get('cursor')!=next_cursor:raise ValueError('chunk cursor not acknowledged')
+            cursor=next_cursor;total_bytes+=len(json.dumps(chunk).encode())
+        save(path,checkpoint)
+        metrics.update(at=time.time(),last_mode='chunked_delta',last_products=len(snapshot['items']),last_changed=len(items),last_upload_json_bytes=total_bytes)
+        metrics['delta_uploads']=metrics.get('delta_uploads',0)+len(batches)
+        metrics['uploaded_json_bytes']=metrics.get('uploaded_json_bytes',0)+total_bytes
+        save(metrics_path,metrics)
+        return
     if mode:
         response=await request(client,config,'POST',params={'mode':mode},body=body)
         response.raise_for_status()

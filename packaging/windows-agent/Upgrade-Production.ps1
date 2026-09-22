@@ -14,5 +14,6 @@ $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 if ($LASTEXITCODE -ne 0) { throw 'Cannot protect agent directory' }
 Copy-Item (Join-Path $PSScriptRoot 'agent.py') (Join-Path $root 'agent.py') -Force
 Copy-Item (Join-Path $PSScriptRoot 'production_agent.py') (Join-Path $root 'production_agent.py') -Force
+Copy-Item (Join-Path $PSScriptRoot 'runtime_identity.py') (Join-Path $root 'runtime_identity.py') -Force
 & py.exe -3 (Join-Path $root 'production_agent.py') --config (Join-Path $root 'device.json')
 if ($LASTEXITCODE -ne 0) { throw 'Agent stopped. Close phase-1 Start.cmd or scheduled agent before retrying.' }

@@ -36,16 +36,43 @@ def policy(verdict,sales,complete,explicit=False):
  return 'queued'
 
 class NativeAPI:
- def __init__(self,token):self.token=token
+ def __init__(self,token,db=None,owner=None):self.token=token;self.db=db;self.owner=owner
  async def erp(self,method,path,body=None,params=None):
-  p=await asyncio.create_subprocess_exec('node',str(Path(__file__).resolve().parents[1]/'bridges/sellable-audit.mjs'),stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL,env=os.environ|{'MAOZI_ACCESS_TOKEN':self.token})
-  try:
-   out,_=await asyncio.wait_for(p.communicate(json.dumps({'method':method,'path':path,'query':params,'body':body,'execute':method=='POST'}).encode()),100)
-   result=json.loads(out)
-   if not result.get('ok'):raise RuntimeError(json.dumps(result.get('error')))
-   return result['data']
-  finally:
-   if p.returncode is None:p.kill();await p.wait()
+  payload=json.dumps({'method':method,'path':path,'query':params,'body':body,'execute':method=='POST'}).encode()
+  attempts=3 if method=='GET' else 1
+  last=None
+  for attempt in range(attempts):
+   p=await asyncio.create_subprocess_exec('node',str(Path(__file__).resolve().parents[1]/'bridges/sellable-audit.mjs'),stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL,env=os.environ|{'MAOZI_ACCESS_TOKEN':self.token})
+   try:
+    out,_=await asyncio.wait_for(p.communicate(payload),100)
+    result=json.loads(out)
+    if result.get('ok'):return result['data']
+    error=result.get('error') or {}
+    last=RuntimeError(json.dumps(error,ensure_ascii=False))
+    retryable=str(error.get('code') or '').upper() in {'UND_ERR_CONNECT_TIMEOUT','UND_ERR_HEADERS_TIMEOUT','ETIMEDOUT','ECONNRESET','ECONNREFUSED'} or 'timeout' in str(error).lower()
+    if not retryable or attempt+1>=attempts:raise last
+   except (asyncio.TimeoutError, json.JSONDecodeError) as e:
+    last=e
+    if attempt+1>=attempts:raise
+   finally:
+    if p.returncode is None:p.kill();await p.wait()
+   await asyncio.sleep(2**attempt)
+  raise last or RuntimeError('erp_request_failed')
+ async def archived_readback(self,row):
+  if self.db is None or not self.owner:return False
+  from . import official_api
+  with self.db.connect() as c:
+   stores=[dict(r) for r in c.execute('SELECT config,secret FROM stores WHERE owner=?',(self.owner,))]
+  stores=[s for s in stores if str(json.loads(s['config']).get('shop_id'))==str(row['shop_id'])]
+  if len(stores)!=1:raise ValueError('official_shop_not_unique')
+  keys=self.db.open(stores[0]['secret'])
+  async with official_api.client(self.db,keys) as api:
+   response=await api.post('/v3/product/info/list',json={'product_id':[int(row['product_id'])]})
+   response.raise_for_status();items=response.json().get('items',[])
+  matches=[p for p in items if str(p.get('id'))==str(row['product_id']) and str(p.get('offer_id'))==str(row['offer_id']) and str(p.get('sku'))==str(row['sku'])]
+  if len(matches)!=1:raise ValueError('official_product_identity_mismatch')
+  p=matches[0];stocks=p.get('stocks') or {};entries=stocks.get('stocks') or []
+  return p.get('is_archived') is True and stocks.get('has_stock') is False and bool(entries) and all(x.get('present')==0 and x.get('reserved')==0 for x in entries)
  async def rows(self,path,params):
   result=[];seen=set()
   for page in range(1,2001):
@@ -121,11 +148,18 @@ async def delist_step(api,row,receipt,persist):
  target={'shop_id':str(row['shop_id']),'offer_id':str(row['offer_id'])}
  rows=await api.rows('/api.product.online/lists',target|{'archived_type':'all'})
  matches=[r for r in rows if str(r.get('shop_id'))==target['shop_id'] and str(r.get('offer_id'))==target['offer_id']]
+ if not matches and receipt.get('archive_dispatched_at') and hasattr(api,'archived_readback'):
+  if await api.archived_readback(row):
+   receipt.update(archived_verified_at=time.time(),zero_stock_verified_at=time.time(),phase='verified',verification_source='ozon_official');return 'delisted'
+  return 'waiting'
  if len(matches)!=1:raise ValueError('exact_own_product_not_unique')
  current=matches[0]
- if any(str(current.get(k))!=str(row.get(k)) for k in ('id','sku','product_id')):raise ValueError('own_product_identity_changed')
+ if any(str(current.get(k))!=str(row.get(k)) for k in ('sku','product_id')):raise ValueError('own_product_identity_changed')
  if current.get('name')!=row.get('name') or current.get('primary_image')!=row.get('primary_image'):raise ValueError('comparison_input_changed')
- data=await api.erp('GET','/api.product.online/get_stock',params={'id':int(row['id'])})
+ # ERP row IDs are replaced on sync; platform identity above remains authoritative.
+ current_id=int(current['id'])
+ receipt['current_erp_id']=current_id
+ data=await api.erp('GET','/api.product.online/get_stock',params={'id':current_id})
  stocks=data if isinstance(data,list) else data.get('data',[])
  if not isinstance(stocks,list):raise ValueError('stock_schema')
  for s in stocks:
@@ -138,14 +172,14 @@ async def delist_step(api,row,receipt,persist):
   if not ids:raise ValueError('all_warehouses_unknown')
   receipt.setdefault('original_stocks',stocks);receipt.setdefault('original_online',current)
   receipt.update(phase='zero_stock_dispatched',warehouses=sorted(ids));persist()
-  await api.erp('POST','/api.product.online/batch_update_stock',body={'shop_id':int(row['shop_id']),'products':[{'id':int(row['id']),'offer_id':row['offer_id'],'warehouses':[{'warehouse_id':int(w),'stock':0} for w in sorted(ids)]}]})
+  await api.erp('POST','/api.product.online/batch_update_stock',body={'shop_id':int(row['shop_id']),'products':[{'id':current_id,'offer_id':row['offer_id'],'warehouses':[{'warehouse_id':int(w),'stock':0} for w in sorted(ids)]}]})
   return 'waiting'
  receipt['zero_stock_verified_at']=time.time()
  archived=current.get('archived_type') in ('manual','archived','archive','deleted') or current.get('online_status') in ('archived','deleted','disabled')
  if archived:receipt.update(archived_verified_at=time.time(),phase='verified');return 'delisted'
  if not receipt.get('archive_dispatched_at'):
   receipt.update(phase='archive_dispatched',archive_dispatched_at=time.time());persist()
-  await api.erp('POST','/api.product.online/archive',body={'ids':[int(row['id'])]})
+  await api.erp('POST','/api.product.online/archive',body={'ids':[current_id]})
   await api.erp('POST','/api.product.online/sync_shop',body={'ids':[int(row['shop_id'])],'type':'all'})
  return 'waiting'
 

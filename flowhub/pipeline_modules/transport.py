@@ -19,11 +19,14 @@ class StepTransport(httpx.AsyncBaseTransport):
         if len(rows)<10 or any(r.get("error_type") for r in rows[-10:]):return False
         return all(r.get("network_ms",float("inf"))<5000 and r.get("pacing_wait_ms",float("inf"))<15000 for r in rows[-10:])
 
-    def __init__(self, transport, ttl=30, namespace=None):
+    def __init__(self, transport, ttl=30, namespace=None, circuit_namespace="local"):
         self.transport=transport;self.ttl=ttl;self.cache={};self.timings=[]
         self.namespace=namespace if namespace is not None else object()
+        self.circuit_namespace=circuit_namespace
 
     def scope(self,path):return (asyncio.get_running_loop(),self.namespace,path)
+
+    def generation_scope(self,path):return self.scope(path)
 
     def invalidate(self,path):
         # Stock/import writes cannot change shop identity. Unknown endpoints may.
@@ -37,7 +40,7 @@ class StepTransport(httpx.AsyncBaseTransport):
                         '/api.product.online/batch_update_stock','/api.product.online/sync_shop'):
             affected.add('/api.shop/lists')
         for read in affected:
-            scope=self.scope(read);self.generations[scope]=self.generations.get(scope,0)+1
+            scope=self.generation_scope(read);self.generations[scope]=self.generations.get(scope,0)+1
         for key in list(self.cache):
             if httpx.URL(key[1]).path in affected:self.cache.pop(key,None)
         if '/api.shop/lists' in affected:
@@ -52,7 +55,8 @@ class StepTransport(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request):
         path=request.url.path;start=time.monotonic();scope=self.scope(path)
-        key=(request.method,str(request.url));generation=self.generations.get(scope,0)
+        generation_scope=self.generation_scope(path)
+        key=(request.method,str(request.url));generation=self.generations.get(generation_scope,0)
         shared_key=(*scope[:2],*key,generation)
         read=request.method=='GET';cacheable=read and path in self.CACHEABLE
         shop=read and path=='/api.shop/lists'
@@ -66,10 +70,12 @@ class StepTransport(httpx.AsyncBaseTransport):
         coalesce=read and path!='/api.product.online/get_stock'
         if coalesce and shared_key in self.inflight:
             result=await asyncio.shield(self.inflight[shared_key])
-            if generation!=self.generations.get(scope,0):return await self.handle_async_request(request)
+            if generation!=self.generations.get(generation_scope,0):return await self.handle_async_request(request)
             self.timings.append({'path':path,'seconds':round(time.monotonic()-start,3),'cache_hit':False,'coalesced':True})
             return httpx.Response(result[0],content=result[1],headers=result[2],request=request)
-        circuit=self.circuits.get(scope,{})
+        # Connection failures belong to an execution host, not the shared account.
+        circuit_scope=(*scope,self.circuit_namespace)
+        circuit=self.circuits.get(circuit_scope,{})
         if read and circuit.get('until',0)>start:
             self.timings.append({'path':path,'seconds':0,'cache_hit':False,'circuit_wait':True})
             raise httpx.ConnectError('ERP endpoint cooling down after connection failures',request=request)
@@ -83,11 +89,11 @@ class StepTransport(httpx.AsyncBaseTransport):
             content=await response.aread()
             metric.update(response.extensions.get('erp_timing',{}))
             if response.status_code in (401,403):self.invalidate('/authentication-failure')
-            self.circuits.pop(scope,None)
+            self.circuits.pop(circuit_scope,None)
             if cacheable and response.status_code==200:
                 try:ok=response.json().get('code') in (1,'1')
                 except (ValueError,AttributeError):ok=False
-                if ok and generation==self.generations.get(scope,0):
+                if ok and generation==self.generations.get(generation_scope,0):
                     saved=(time.monotonic(),response.status_code,content,dict(response.headers),generation)
                     self.cache[key]=saved
                     if shop:
@@ -100,7 +106,7 @@ class StepTransport(httpx.AsyncBaseTransport):
             metric.update(getattr(getattr(self.transport,'bridge',None),'last_timing',{}))
             if read and self.network_failure(error):
                 failures=circuit.get('failures',0)+1
-                self.circuits[scope]={'failures':failures,'until':time.monotonic()+min(120,30*2**min(failures-3,2)) if failures>=3 else 0}
+                self.circuits[circuit_scope]={'failures':failures,'until':time.monotonic()+min(120,30*2**min(failures-3,2)) if failures>=3 else 0}
             if future:future.set_exception(error)
             raise
         finally:

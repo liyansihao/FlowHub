@@ -17,7 +17,7 @@ async def main():
  load_runtime_env();db=Database();schema(db);owner=os.environ['FLOWHUB_REVIEW_OWNER']
  with db.connect() as c:stores=[dict(r) for r in c.execute('SELECT * FROM stores WHERE owner=?',(owner,))]
  allowed={str(json.loads(r['config'])['shop_id']):r for r in stores}
- api=NativeAPI(db.open(stores[0]['secret'])['erp_token']);index=None;index_at=0;blocks=None;block_at=0;last_sync=0
+ api=NativeAPI(db.open(stores[0]['secret'])['erp_token'],db=db,owner=owner);index=None;index_at=0;blocks=None;block_at=0;last_sync=0
  handled=set();inventory={};loaded=set();state={'started_at':time.time(),'phase':'running','rule':'不同款且历史未取消订单为零直接下架；有销量或无法核实保留待审核'}
  while True:
   try:

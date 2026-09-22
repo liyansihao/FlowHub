@@ -1,5 +1,7 @@
 """Durable queue isolation. Remote inspection is strictly read-only and request-budgeted."""
 import json
+import asyncio
+from .database_work import run as database_work
 import secrets
 import time
 from dataclasses import asdict
@@ -39,6 +41,10 @@ def classify(state, body, now):
     if body.get('isolation_recovery_until', 0) > now:
         return None
     if state == 'needs_fields':
+        if body.get('repair_workflow'):
+            # Stage failures and dependency waits have distinct durable counters.
+            # Do not quarantine a restarted staged task using legacy attempt totals.
+            return None
         retry = body.get('repair_retry') or {}
         count = max(retry.get('total_attempts', 0), retry.get('attempts', 0))
         since = body.get('repair_wait_started_at', body.get('updated_at', body.get('requested_at', now)))
@@ -76,6 +82,9 @@ def cleanup(db, *, now=None):
                 continue
             body = json.loads(row['body'])
             reason = classify(row['state'], body, now)
+            if not reason and row['state']=='needs_fields' and not body.get('repair_workflow'):
+                from .lifecycle import config as lifecycle_config, reason as lifecycle_reason
+                reason=lifecycle_reason(body,now,lifecycle_config(db))
             if not reason:
                 continue
             c.execute('INSERT INTO queue_isolation_receipts VALUES(NULL,?,?,?,?,?,?,?,?,?)',
@@ -104,6 +113,10 @@ class ReadBudgetTransport(httpx.AsyncBaseTransport):
         if (request.method != 'POST' or request.url.host != 'api-seller.ozon.ru'
                 or request.url.scheme != 'https' or request.url.path not in READ_PATHS):
             raise ValueError('quarantine_remote_write_forbidden')
+        await database_work(self.reserve)
+        return await self.inner.handle_async_request(request)
+
+    def reserve(self):
         with self.db.connect() as c:
             c.execute('BEGIN IMMEDIATE')
             row = c.execute('SELECT * FROM queue_isolation_budget WHERE id=1').fetchone()
@@ -124,7 +137,6 @@ class ReadBudgetTransport(httpx.AsyncBaseTransport):
                 if row['used'] + 1 > normal // divisor:
                     raise BudgetDeferred('foreground_request_budget_required')
                 c.execute('UPDATE queue_isolation_budget SET used=used+1 WHERE id=1')
-        return await self.inner.handle_async_request(request)
 
     async def aclose(self):
         await self.inner.aclose()
@@ -178,7 +190,7 @@ async def inspect(db, row):
                 'issues': list(product.issue_codes)}
 
 
-async def tick(db):
+def claim_inspection(db):
     if not enabled(db):
         return False
     now = time.time(); token = secrets.token_hex(16)
@@ -201,7 +213,19 @@ async def tick(db):
         c.execute('UPDATE queue_isolation_budget SET last_scan=? WHERE id=1', (now,))
         c.execute('INSERT OR REPLACE INTO plugin_pipeline_leases VALUES(?,?,?,?,?)', (*key, token, now+120))
         row = dict(row)
-    import asyncio
+    return row,key,token
+
+
+async def tick(db):
+    from ..plugin_pipeline import release_lease
+    task=asyncio.create_task(asyncio.to_thread(claim_inspection,db))
+    try:claimed=await asyncio.shield(task)
+    except asyncio.CancelledError:
+        claimed=await task
+        if claimed:await database_work(release_lease,db,claimed[1],claimed[2])
+        raise
+    if not claimed:return False
+    row,key,token=claimed
 
     from ..source_library import SourceLibrary
     try:
@@ -210,32 +234,35 @@ async def tick(db):
             result = await asyncio.wait_for(inspect(db, row), timeout=45)
         except Exception as error:
             result = {'result': 'read_deferred', 'error_type': type(error).__name__}
-        with db.connect() as c:
-            c.execute('BEGIN IMMEDIATE')
-            current = c.execute('SELECT * FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?', key).fetchone()
-            lease = c.execute('SELECT token FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=?', key).fetchone()
-            if not current or current['state'] != 'quarantined' or not lease or lease[0] != token:
-                return False
-            body = json.loads(current['body']); isolation = body['isolation']
-            isolation.update(last_checked_at=time.time(), last_result={k:v for k,v in result.items() if k != 'publication_body'},
-                             checks=isolation.get('checks', 0)+1)
-            state = 'quarantined'; due = time.time()+21600
-            if result.get('error_type') in ('BudgetDeferred', 'OfficialDeferred'):
-                due = time.time()+900
-            if result.get('verified') and close_verified(c, db, key, result, body, library):
-                state = 'selling'; due = time.time()
-            elif result.get('resume') and not body.get('isolation_recovery_attempted'):
-                body['isolation_recovery_attempted'] = True
-                body['isolation_recovery_until'] = time.time()+1800
-                body.setdefault('isolation_history', []).append(body.pop('isolation'))
-                state = 'awaiting_remote'; due = time.time()
-            body['updated_at'] = time.time()
-            c.execute('UPDATE plugin_pipeline SET state=?,body=?,due=? WHERE owner=? AND sku=? AND seller=?',
-                      (state, json.dumps(body), due, *key))
-        return True
+        return await database_work(finish_inspection,db,key,token,result,library)
     finally:
-        with db.connect() as c:
-            c.execute('DELETE FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=? AND token=?', (*key, token))
+        await database_work(release_lease,db,key,token)
+
+def finish_inspection(db,key,token,result,library):
+    with db.connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        current = c.execute('SELECT * FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?', key).fetchone()
+        lease = c.execute('SELECT token FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=?', key).fetchone()
+        if not current or current['state'] != 'quarantined' or not lease or lease[0] != token:
+            return False
+        body = json.loads(current['body']); isolation = body['isolation']
+        isolation.update(last_checked_at=time.time(), last_result={k:v for k,v in result.items() if k != 'publication_body'},
+                         checks=isolation.get('checks', 0)+1)
+        state = 'quarantined'; due = time.time()+21600
+        if result.get('error_type') in ('BudgetDeferred', 'OfficialDeferred'):
+            due = time.time()+900
+        if result.get('verified') and close_verified(c, db, key, result, body, library):
+            state = 'selling'; due = time.time()
+        elif result.get('resume') and not body.get('isolation_recovery_attempted'):
+            body['isolation_recovery_attempted'] = True
+            body['isolation_recovery_until'] = time.time()+1800
+            body.setdefault('isolation_history', []).append(body.pop('isolation'))
+            state = 'awaiting_remote'; due = time.time()
+        body['updated_at'] = time.time()
+        c.execute('UPDATE plugin_pipeline SET state=?,body=?,due=? WHERE owner=? AND sku=? AND seller=?',
+                  (state, json.dumps(body), due, *key))
+    return True
+
 
 
 def close_verified(c, db, key, result, body, library):

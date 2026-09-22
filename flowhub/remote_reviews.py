@@ -7,6 +7,7 @@ import time
 
 import httpx
 from .review_transport import request as review_request
+from .pipeline_modules.database_work import run as database_work
 
 
 def current_snapshot(db, owner):
@@ -73,7 +74,7 @@ async def sync_once(db, config, *, refresh=True):
                 if item.get('owner') != owner:
                     raise ValueError('审核租户不匹配，请刷新当前租户快照')
                 from .manual_reviews import decide
-                result = decide(db, owner, item["reviewer"], item["sku"], item["seller"], item["action"], item["note"], item["revision"], replay=True, review_scope="same_product_only" if item["action"] in ("approve","reject") else None)
+                result = await database_work(decide, db, owner, item["reviewer"], item["sku"], item["seller"], item["action"], item["note"], item["revision"], replay=True, review_scope="same_product_only" if item["action"] in ("approve","reject") else None)
                 status, error = ("applied", "") if result else ("error", "本地审核未返回结果")
                 applied += status == "applied"
             except ValueError as exc:
@@ -84,9 +85,9 @@ async def sync_once(db, config, *, refresh=True):
                 ack = await review_request(client, config, 'POST', params={'mode':'ack'}, body={'id':item['id'],'status':status,'error':error})
                 ack.raise_for_status()
             except Exception:
-                db.health("remote-review-ack-error")
+                await database_work(db.health,"remote-review-ack-error")
         if decisions or refresh:
-            snapshot=current_snapshot(db, owner)
+            snapshot=await database_work(current_snapshot,db,owner)
             if config.get('FLOWHUB_REVIEW_PROTOCOL')=='delta-v1' and remote.get('protocol')=='delta-v1':
                 from .review_delta import upload
                 await upload(db,config,client,snapshot,remote.get('cursor',''),review_request)
@@ -108,6 +109,6 @@ async def run(db):
             state=read(db.directory/'review-poll-state.json')
             delay=next_delay(delay,base,maximum,state.get('viewer_active',False),state.get('pending',0)>0)
         except Exception:
-            db.health("remote-review-sync-error")
+            await database_work(db.health,"remote-review-sync-error")
             delay=min(maximum,max(base,delay*2))
         await asyncio.sleep(delay)

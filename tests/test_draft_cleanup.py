@@ -106,3 +106,39 @@ async def test_clear_completed_does_not_stop_at_capacity_target(tmp_path):
  api=Low()
  result=await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db)|{'clear_completed':True,'batch_size':1000},api)
  assert result['deleted']==1 and api.writes==1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('guard',[None,'binding','wrong_offer','zero_stock','wrong_warehouse','other_inflight','missing_record'])
+async def test_official_sold_draft_cleanup_uses_fresh_official_stock_without_erp_online(tmp_path,monkeypatch,guard):
+ import httpx
+ from flowhub import official_api
+ db,owner,item=setup(tmp_path)
+ item['queue']['backend']='official'
+ item['context']['store'].update(config={'shop_id':'4','warehouse_id':'5'},credentials={'client_id':'6','api_key':'test'})
+ with db.connect() as c:
+  c.execute('CREATE TABLE plugin_publications(owner TEXT,sku TEXT,seller TEXT,body TEXT)')
+  record={'backend':'official','offer_id':'offer','account_binding':['wrong' if guard=='binding' else '6','5','4']}
+  if guard!='missing_record':c.execute('INSERT INTO plugin_publications VALUES(?,?,?,?)',(owner,'123','2',json.dumps(record)))
+  if guard=='other_inflight':c.execute('INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)',(owner,'123','3','needs_fields','{}',0,0))
+ calls=[]
+ def reply(request):
+  calls.append(request.url.path)
+  if request.url.path=='/v2/warehouse/list':return httpx.Response(200,json={'warehouses':[{'warehouse_id':5,'status':'active'}]})
+  if request.url.path=='/v3/product/info/list':return httpx.Response(200,json={'items':[{'id':10,'offer_id':'other' if guard=='wrong_offer' else 'offer','sku':20,'statuses':{'status_name':'selling'}}]})
+  assert request.url.path=='/v2/product/info/stocks-by-warehouse/fbs'
+  return httpx.Response(200,json={'products':[{'sku':20,'product_id':10,'offer_id':'offer','warehouse_id':9 if guard=='wrong_warehouse' else 5,'present':0 if guard=='zero_stock' else 99,'reserved':0}]})
+ monkeypatch.setattr(official_api,'client',lambda db,keys:httpx.AsyncClient(base_url='https://api-seller.ozon.ru',transport=httpx.MockTransport(reply)))
+ class OfficialOnly(Fake):
+  async def call(self,path,method='GET',params=None):
+   assert not path.endswith('online/lists')
+   return await super().call(path,method,params)
+ api=OfficialOnly()
+ result=await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
+ assert api.writes==(0 if guard else 1)
+ if not guard:
+  assert result['deleted']==1
+  with db.connect() as c:r=c.execute('SELECT body FROM draft_cleanup_receipts').fetchone()
+  assert db.open(r[0])['online']['backend']=='official'
+  await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
+  assert api.writes==1

@@ -3,19 +3,24 @@ import {chromium} from 'playwright';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {sourceNetworkArgs} from './source-network.mjs';
+import {sourceBrowserOptions} from './source-browser.mjs';
+import {settleSourcePage} from './source-page.mjs';
 const [sku,outDir,maxRoundsArg='8']=process.argv.slice(2);
 if(!/^\d+$/.test(sku||''))throw Error('numeric SKU required');
 const maxRounds=Math.min(40,Math.max(1,Number(maxRoundsArg)||8));
 const profile=process.env.FLOWHUB_SOURCE_PROFILE;
 if(!profile)throw Error('dedicated profile required');
 await fs.mkdir(outDir,{recursive:true});
-const c=await chromium.launchPersistentContext(profile,{channel:'chrome',headless:false,viewport:null,args:sourceNetworkArgs(),ignoreDefaultArgs:['--disable-extensions']});
+const browserOptions=sourceBrowserOptions(process.env);
+browserOptions.args.push(...sourceNetworkArgs());
+const c=await chromium.launchPersistentContext(browserOptions.profile,browserOptions);
 process.once('SIGTERM',()=>{void c.close().catch(()=>{});});
 process.once('SIGINT',()=>{void c.close().catch(()=>{});});
 let step='navigation',p;
 try{
  p=await c.newPage();
- const response=await p.goto(`https://www.ozon.ru/product/${sku}/`,{waitUntil:'domcontentloaded',timeout:45000});
+ let response=await p.goto(`https://www.ozon.ru/product/${sku}/`,{waitUntil:'domcontentloaded',timeout:45000});
+ step='access_challenge';response=await settleSourcePage(p,response);
  if(response?.status()===403||/captcha|antibot|access denied/i.test(await p.title())){step='access_challenge';throw Error('browser_access_challenge');}
  step='product_main';
  await p.locator('[data-widget="webProductMainWidget"]').waitFor({state:'attached',timeout:20000});

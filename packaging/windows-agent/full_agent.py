@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from urllib.error import HTTPError,URLError
 from agent import Client,save
+from runtime_identity import capture
 
 
 def terminate(child):
@@ -46,6 +47,7 @@ def compute_loop(root,path,config,stop,children,capability):
             client=Client(config['url'],config['token'])
             client.call('/v3/compute/register',cap)
             capability['value']=cap
+            capability['runtime']=ready.get('runtime')
             print('FlowHub v3 ready: supplier search + image ranking + AI review. Device: '+ready['accelerator'],flush=True)
             while not stop.is_set():
                 try:
@@ -71,6 +73,7 @@ def compute_loop(root,path,config,stop,children,capability):
             if isinstance(exc,HTTPError) and exc.code in (401,403):stop.set()
             print('Compute unavailable ('+type(exc).__name__+'); restarting compute only.',flush=True)
         finally:
+            capability['runtime']=None
             capability['value']={'version':3,'slots':1,'kinds':[],
                                  'cpu_count':os.cpu_count() or 1,'accelerator':'unavailable'}
             terminate(worker)
@@ -89,6 +92,16 @@ def main():
         import fcntl
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     root=Path(__file__).resolve().parent;stop=threading.Event();children={};capability={}
+    runtime=capture('full-agent',root,{'erp':2,'compute':3})
+    def report_versions():
+        client=Client(config['url'],config['token'])
+        while not stop.is_set():
+            for identity in (runtime,capability.get('runtime')):
+                if identity:
+                    try:client.call('/v1/runtime',identity)
+                    except Exception:pass
+            stop.wait(30)
+    threading.Thread(target=report_versions,daemon=True).start()
     def heartbeat():
         client=Client(config['url'],config['token'])
         while not stop.wait(5):

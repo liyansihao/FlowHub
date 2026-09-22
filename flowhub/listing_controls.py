@@ -111,7 +111,7 @@ def save(db,key,state,body):
 
 
 async def prepare_listing(db,key,body):
- from .identity_review import confirm,comparison,bound,envelope
+ from .identity_review import comparison,bound,envelope
  from .evaluation_requirements import review_sale_price
  from .plugin_comparebot import candidate
  from .plugin_publication import require_quota
@@ -122,14 +122,27 @@ async def prepare_listing(db,key,body):
   return await official_restore(db,key,body,record,cfg,api.keys)
  blocks=await read_delists()
  if key[1] in blocks['skus']:raise ValueError('商品在飞书明确下架清单中')
- targets=await owned_targets(api,cfg,record,key[1])
+ from .official_publication import backend
+ new_official=not record and backend(cfg)!='maozi'
+ # A new official intent uses the local/official preflight in the publication
+ # lane. Do not reintroduce the old import-log dependency while resuming review.
+ targets=[] if new_official else await owned_targets(api,cfg,record,key[1])
  if targets:
   if not record or record.get('phase') not in (None,'prepared','ready','favorite_pending'):return await restore(db,key,body,api,cfg,targets,blocks)
   observed=await online(api,targets[0])
   if observed:return await restore(db,key,body,api,cfg,targets,blocks)
- quota=await api.erp('POST','/api.shop/sync_single_product_limit',body={'id':int(cfg['shop_id'])});body['quota']=quota
+ if new_official:
+  from .official_api import client,capacity
+  if not api.keys.get('client_id') or not api.keys.get('api_key'):raise ValueError('official_credentials_required')
+  async with client(db,api.keys) as official:quota=await capacity(official)
+ else:quota=await api.erp('POST','/api.shop/sync_single_product_limit',body={'id':int(cfg['shop_id'])})
+ body['quota']=quota
  try:require_quota(quota)
  except ValueError:
+  if new_official:
+   from .pipeline_modules.store_capacity import observe
+   observe(db,key[0],store['id'],quota)
+   return 'waiting',body|{'next_attempt_at':time.time()+900,'error':'target_quota_unavailable'}
   from .listing_fallback import choose
   if record:raise ValueError('已有发布记录，需回查原店结果，不能自动换店重复发布')
   chosen=await choose(db,key,body,api,store,quota)
@@ -174,16 +187,19 @@ async def prepare_listing(db,key,body):
  if result.get('rejected') or result.get('manual_review'):raise ValueError('上架数据检查未通过：'+str(result.get('reason') or '物流或类目不可用'))
  new={'sku':key[1],'seller':key[2],'state':'matched','candidate':env,'result':result,'started_at':time.time(),'finished_at':time.time(),'identity_review':r['identity_review'],'publication_blockers':env['origin']['publication_blockers'],'price_basis':env['origin']['price_evidence'],'website_listing_authorization':{'id':body['id'],'actor':body['actor'],'at':body['requested_at'],'price_policy':'available_asking_price','same_product_only':True}}
  expiry=time.time()+86400
- with db.connect() as c:
-  c.execute('UPDATE plugin_reviews SET state=?,body=?,updated=? WHERE owner=? AND sku=? AND seller=?',('matched',json.dumps(new),time.time(),*key))
-  c.execute('UPDATE plugin_routes SET expires=?,run_id=? WHERE owner=? AND sku=? AND seller=?',(expiry,body['id'],*key))
-  c.execute('INSERT OR REPLACE INTO plugin_publication_permissions VALUES(?,?,?,?,?)',(*key,expiry,'用户要求网站同款上架'))
-  q=json.loads(c.execute('SELECT body FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?',key).fetchone()[0]);q.update(listing_control_id=body['id'],same_product_only=True);q.pop('repair_retry',None);q.pop('error',None);q.pop('reason',None)
-  c.execute("UPDATE plugin_pipeline SET state='publishing',body=?,due=0,attempts=0 WHERE owner=? AND sku=? AND seller=?",(json.dumps(q),*key))
+ def persist_ready():
+  with db.connect() as c:
+   c.execute('UPDATE plugin_reviews SET state=?,body=?,updated=? WHERE owner=? AND sku=? AND seller=?',('matched',json.dumps(new),time.time(),*key))
+   c.execute('UPDATE plugin_routes SET expires=?,run_id=? WHERE owner=? AND sku=? AND seller=?',(expiry,body['id'],*key))
+   c.execute('INSERT OR REPLACE INTO plugin_publication_permissions VALUES(?,?,?,?,?)',(*key,expiry,'用户要求网站同款上架'))
+   q=json.loads(c.execute('SELECT body FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?',key).fetchone()[0]);q.update(listing_control_id=body['id'],same_product_only=True);q.pop('repair_retry',None);q.pop('error',None);q.pop('reason',None)
+   c.execute("UPDATE plugin_pipeline SET state='publishing',body=?,due=0,attempts=0 WHERE owner=? AND sku=? AND seller=?",(json.dumps(q),*key))
+ from .pipeline_modules.database_work import run as database_work
+ await database_work(persist_ready)
  return 'waiting',body|{'phase':'publication_pipeline'}
 
 
-async def tick(db, *, target=None):
+def claim_listing(db, *, target=None):
  if target is not None and (len(target)!=3 or not all(isinstance(x,str) and x for x in target)):
   raise ValueError("exact_listing_identity_required")
  scope=" AND owner=? AND sku=? AND seller=?" if target else ""
@@ -198,6 +214,19 @@ async def tick(db, *, target=None):
   token='listing-control-'+body['id']
   c.execute('INSERT OR REPLACE INTO plugin_pipeline_leases VALUES(?,?,?,?,?)',(*key,token,time.time()+360))
   c.execute("UPDATE product_listing_controls SET state='running',updated=? WHERE owner=? AND sku=? AND seller=?",(time.time(),*key))
+ return dict(row),key,body,token
+
+
+async def tick(db, *, target=None):
+ from .pipeline_modules.database_work import run as database_work
+ task=asyncio.create_task(asyncio.to_thread(claim_listing,db,target=target))
+ try:claimed=await asyncio.shield(task)
+ except asyncio.CancelledError:
+  claimed=await task
+  if claimed:await database_work(finish_listing,db,claimed[1],'waiting',claimed[2],claimed[3])
+  raise
+ if not claimed:return False
+ row,key,body,token=claimed
  try:
   if row['action']=='unlist':state,body=await remove(db,key,body)
   elif body.get('phase')=='publication_pipeline':
@@ -209,13 +238,11 @@ async def tick(db, *, target=None):
  except OfficialDeferred as e:
   state='waiting';body['next_attempt_at']=e.until;body['dependency_wait']=e.reason
  except asyncio.CancelledError:
-  save(db,key,'waiting',body)
-  with db.connect() as c:c.execute('DELETE FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=? AND token=?',(*key,token))
+  await database_work(finish_listing,db,key,'waiting',body,token)
   raise
  except Exception as e:state='blocked';body['error']=(str(e) or type(e).__name__)[:220]
  if state=='waiting' and body.get('phase') not in ('publication_pipeline','capacity_wait') and time.time()-max(body['requested_at'],body.get('workflow_repaired_at',0))>1800:state='blocked';body['error']='上下架回查尚未完成，请查看原记录后重试'
- save(db,key,state,body)
- with db.connect() as c:c.execute('DELETE FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=? AND token=?',(*key,token))
+ await database_work(finish_listing,db,key,state,body,token)
  return True
 
 
@@ -286,3 +313,8 @@ def management_card(c,owner,row,sku,seller):
  labels={'quarantined':'已隔离 · 不占正常上架队列','selling':'已上架','same_product_confirmed':'同款已确认','rejected':'已拒绝','delisting':'下架处理中','delisted':'已下架','not_listed':'未查到本店上架记录','publishing':'上架处理中'}
  item['category_label']=labels.get(row['state'],item['category_label'])
  return item
+
+
+def finish_listing(db,key,state,body,token):
+ save(db,key,state,body)
+ with db.connect() as c:c.execute('DELETE FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=? AND token=?',(*key,token))

@@ -19,6 +19,8 @@ def schema(db):
         control.schema(db)
         with db.connect() as c:
             c.execute('CREATE TABLE IF NOT EXISTS plugin_pipeline(owner TEXT,sku TEXT,seller TEXT,state TEXT,body TEXT,due REAL,attempts INTEGER DEFAULT 0,PRIMARY KEY(owner,sku,seller))')
+            c.execute('CREATE INDEX IF NOT EXISTS plugin_pipeline_state_due ON plugin_pipeline(state,due)')
+            c.execute('CREATE INDEX IF NOT EXISTS plugin_pipeline_owner_state_due ON plugin_pipeline(owner,state,due)')
             c.execute('CREATE INDEX IF NOT EXISTS plugin_pipeline_owner_state_keys ON plugin_pipeline(owner,state,sku,seller)')
             c.execute('CREATE TABLE IF NOT EXISTS plugin_pipeline_leases(owner TEXT,sku TEXT,seller TEXT,token TEXT,expires REAL,PRIMARY KEY(owner,sku,seller))')
     db.schema_once('plugin_pipeline', initialize)
@@ -38,7 +40,7 @@ def enqueue(db, owner, sku, seller):
 RECONCILE = ('submitting','reconciling','sync_pending','stock_ready','stock_pending','stock_verified','favorite_pending','manual_review')
 
 
-def readback_delay(body, phase, verified=False, submission_priority=False):
+def readback_delay(body, phase, verified=False, submission_priority=False, *, native_follow=False):
     """Persisted phase-based polling: useful writes stay immediate, remote waits back off."""
     if verified:
         body.pop('readback_schedule',None)
@@ -49,13 +51,22 @@ def readback_delay(body, phase, verified=False, submission_priority=False):
     previous=body.get('readback_schedule') or {}
     repeat=previous.get('repeat',0)+1 if previous.get('phase')==phase else 0
     base,cap=(60,600) if phase=='favorite_pending' else (20,120) if phase=='stock_pending' else ((180,900) if submission_priority else (60,240))
+    if native_follow:base,cap=15,60
     delay=min(cap,base*2**min(repeat,4))
     body['readback_schedule']={'phase':phase,'repeat':repeat,'delay_seconds':delay,
                                'first_wait_at':previous.get('first_wait_at',time.time())}
     return delay
 
 
-async def tick(db, lane=None, *, target=None, run_paused=False):
+def claim(db, lane=None, *, target=None, run_paused=False, repair_kind=None, repair_stage=None, acquisition_route=None):
+    from .pipeline_modules import repair_workflow
+    staged_repairs=repair_workflow.enabled(db)
+    if acquisition_route is not None and (not isinstance(acquisition_route,bool) or repair_stage!='acquire'):
+        raise ValueError('invalid_acquisition_route')
+    if repair_stage not in (None,'validate','acquire') or (repair_stage and repair_kind!='publication'):
+        raise ValueError('invalid_repair_stage')
+    if repair_kind not in (None,'publication','valuation') or (repair_kind and lane!='seed_repair'):
+        raise ValueError('invalid_repair_kind')
     if target is not None and (len(target)!=3 or not all(isinstance(v,str) and v for v in target)):
         raise ValueError('exact_pipeline_identity_required')
     if run_paused and (target is None or lane not in ('seed_repair','review')):
@@ -76,6 +87,16 @@ async def tick(db, lane=None, *, target=None, run_paused=False):
             'reconcile_history': " AND q.state IN ('publishing','awaiting_remote') AND json_extract(q.body,'$.phase')='manual_review'",
             'reconcile': " AND COALESCE(json_extract(q.body,'$.phase'),'')!='manual_review' AND q.state IN ('publishing','awaiting_remote') AND json_extract(q.body,'$.phase') IN (" + ','.join('?' for _ in RECONCILE) + ')',
         }[lane]
+        if repair_kind:
+            if staged_repairs:lane_sql+=' AND '+('' if repair_kind=='publication' else 'NOT ')+repair_workflow.PUBLICATION_SQL
+            else:lane_sql += " AND COALESCE(json_extract(q.body,'$.official_dossier_pending'),0)" + ('=1' if repair_kind=='publication' else '!=1')
+        if repair_stage:
+            lane_sql += " AND COALESCE(json_extract(q.body,'$.repair_workflow.stage'),'facts')"+ ('=' if repair_stage=='validate' else '!=')+"'validate'"
+        route_args = []
+        if acquisition_route is not None:
+            from .acquisition import routing
+            route_sql, route_args = routing(db,c)
+            lane_sql += " AND " + ("" if acquisition_route else "NOT ") + route_sql
         now = time.time()
         r=c.execute("""SELECT q.* FROM plugin_pipeline q JOIN users u ON u.id=q.owner
             LEFT JOIN plugin_pipeline_leases l ON l.owner=q.owner AND l.sku=q.sku AND l.seller=q.seller
@@ -87,32 +108,60 @@ async def tick(db, lane=None, *, target=None, run_paused=False):
               WHEN json_extract(q.body,'$.phase')='ready' THEN 2
               WHEN q.state='publishing' THEN 3
               ELSE 4 END,
-              CASE WHEN q.state='needs_fields' AND json_extract(q.body,'$.pending_publication_fields') IS NOT NULL THEN 0 WHEN q.state='needs_fields' AND json_extract(q.body,'$.evaluation_state') IS NULL AND json_extract(q.body,'$.repair_retry') IS NULL THEN 1 ELSE 2 END,q.due LIMIT 1""", (now, now, *(RECONCILE if lane in ('submit','reconcile') else ()),*(target or ()))).fetchone()
+              CASE WHEN q.state='needs_fields' AND json_extract(q.body,'$.repair_workflow.stage')='validate' THEN 0 ELSE 1 END,
+              CASE WHEN q.state='needs_fields' AND json_extract(q.body,'$.pending_publication_fields') IS NOT NULL THEN 0 WHEN q.state='needs_fields' AND json_extract(q.body,'$.evaluation_state') IS NULL AND json_extract(q.body,'$.repair_retry') IS NULL THEN 1 ELSE 2 END,q.due LIMIT 1""", (now, now, *(RECONCILE if lane in ('submit','reconcile') else ()),*route_args,*(target or ()))).fetchone()
         if not r:return False
-        if r['state']=='needs_fields':
+        if r['state']=='needs_fields' and not (staged_repairs and repair_kind=='publication'):
             campaign=c.execute('SELECT body FROM pipeline_campaigns WHERE owner=? AND enabled=1',(r['owner'],)).fetchone() if c.execute("SELECT 1 FROM sqlite_master WHERE name='pipeline_campaigns'").fetchone() else None
             limit=json.loads(campaign[0]).get('max_inflight',12) if campaign else 12
             active=c.execute("SELECT count(*) FROM plugin_pipeline WHERE owner=? AND state IN ('queued','evaluating','publishing') AND COALESCE(json_extract(body,'$.phase'),'') NOT IN ('submitting','reconciling','sync_pending','stock_ready','stock_pending','manual_review')",(r['owner'],)).fetchone()[0]
-            active+=c.execute("SELECT count(*) FROM plugin_pipeline q JOIN plugin_pipeline_leases l USING(owner,sku,seller) WHERE q.owner=? AND q.state='needs_fields' AND l.expires>?",(r['owner'],now)).fetchone()[0]
+            active+=c.execute("SELECT count(*) FROM plugin_pipeline q JOIN plugin_pipeline_leases l USING(owner,sku,seller) WHERE q.owner=? AND q.state='needs_fields' AND l.expires>?"+(' AND NOT '+repair_workflow.PUBLICATION_SQL if staged_repairs else ''),(r['owner'],now)).fetchone()[0]
             if active>=limit:return False
         row=dict(r);key=(row['owner'],row['sku'],row['seller']);token=secrets.token_hex(16)
         c.execute('INSERT OR REPLACE INTO plugin_pipeline_leases VALUES(?,?,?,?,?)',(*key,token,now+120))
+    return row,key,token
+
+
+async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None, repair_stage=None, acquisition_route=None):
+    from .pipeline_modules.database_work import run as database_work
+    claim_task=asyncio.create_task(asyncio.to_thread(claim,db,lane,target=target,run_paused=run_paused,
+        repair_kind=repair_kind,repair_stage=repair_stage,acquisition_route=acquisition_route))
+    try:
+        claimed=await asyncio.shield(claim_task)
+    except asyncio.CancelledError:
+        claimed=await claim_task
+        if claimed:await database_work(release_lease,db,claimed[1],claimed[2])
+        raise
+    if not claimed:return False
+    row,key,token=claimed
     async def renew():
         while True:
             await asyncio.sleep(30)
-            with db.connect() as c:
-                c.execute('UPDATE plugin_pipeline_leases SET expires=? WHERE owner=? AND sku=? AND seller=? AND token=?',
-                          (time.time()+120,*key,token))
+            await database_work(renew_lease,db,key,token)
     heartbeat=asyncio.create_task(renew())
     started=time.time()
-    state=row['state'];body=json.loads(row['body']);attempts=row['attempts'];delay=0;lock_wait=False;dependency_wait=False
+    state=row['state'];body=json.loads(row['body']);attempts=row['attempts'];delay=0;lock_wait=False;dependency_wait=False;repair_progress=False
     try:
-        if state=='needs_fields':
+        from .follow_publication import (
+            release_repair,
+            selected as follow_selected,
+            clear_dossier,
+            full_dossier_required as follow_full_dossier_required,
+        )
+        if state=='needs_fields' and release_repair(db,key,body):
+            state='queued'
+        elif state=='needs_fields':
             from .pipeline_modules.repair import PriceRepairModule
             result=await PriceRepairModule().run(db,*key)
             body['repair_reason']=result['reason']
+            if result.get('workflow'):body['repair_workflow']=result['workflow']
             if result['state']=='ready':
                 state='queued';body.pop('error',None);body.pop('reason',None)
+                body.pop('repair_manual',None);body.pop('repair_dependency',None)
+                if body.pop('official_dossier_pending',False):
+                    for field in ('needs_dossier','missing_fields','pending_publication_fields','repair_full_dossier'):
+                        body.pop(field,None)
+                    body.pop('phase',None)
                 if body.get('repair_retry'):
                     body.setdefault('repair_history',[]).append(body.pop('repair_retry'))
                 with db.connect() as c:
@@ -126,7 +175,19 @@ async def tick(db, lane=None, *, target=None, run_paused=False):
                             if state=='needs_review':body['reason']=synced.get('result',{}).get('reason','manual_same_product_review')
                             body.pop('pending_publication_fields',None)
                         else:
-                            c.execute('DELETE FROM plugin_reviews WHERE owner=? AND sku=? AND seller=?',key)
+                            from .pipeline_modules.repair_queue import preserve_review
+                            preserve_review(c,db,key,body)
+                    if state=='publishing' and (result.get('workflow') or {}).get('kind')=='publication':
+                        from .dossier_gate import record as record_gate
+                        body['dossier_gate_hash']=record_gate(c,key)
+            elif result.get('workflow'):
+                if result['state']=='progress':
+                    repair_progress=True;delay=result.get('retry_after',0)
+                elif result['state']=='manual':
+                    state='needs_review';body.update(reason='repair_input_required: '+result['reason'],repair_manual=True)
+                else:
+                    delay=result.get('retry_after',60)
+                    body['repair_dependency']=result.get('failure_class') or result['workflow'].get('failure_class')
             else:
                 repair=body.setdefault('repair_retry',{})
                 from .pipeline_modules.repair_retry import schedule
@@ -139,6 +200,9 @@ async def tick(db, lane=None, *, target=None, run_paused=False):
                 from .identity_review import evaluate as evaluate_identity
                 report=await evaluate_identity(db,*key)
                 body.pop('force_identity_review',None)
+            elif body.get('force_full_evaluation'):
+                report=await evaluate(db,*key,force=True)
+                body.pop('force_full_evaluation',None)
             else:report=await evaluate(db,*key)
             reason=report.get('reason') or report.get('result',{}).get('reason')
             decision=report.get('result',{}).get('evidence',{}).get('source',{}).get('comparebot',{}).get('decision',{})
@@ -149,8 +213,19 @@ async def tick(db, lane=None, *, target=None, run_paused=False):
             body['evaluation_state']=report['state']
             if report['state']=='matched':
                 state='publishing'
+                from .acquisition import enabled as acquisition_enabled
+                native_follow=follow_selected(db,key)
+                full_dossier = native_follow and follow_full_dossier_required(db,key)
+                if native_follow and not full_dossier:clear_dossier(body)
+                if (not native_follow or full_dossier) and acquisition_enabled(db,key[1]):
+                    with db.connect() as c:
+                        exists=c.execute("SELECT 1 FROM sqlite_master WHERE name='plugin_publications'").fetchone()
+                        existing=exists and c.execute('SELECT 1 FROM plugin_publications WHERE owner=? AND sku=? AND seller=?',key).fetchone()
+                    if not existing:
+                        state='needs_fields'
+                        body.update(repair_full_dossier=True,official_dossier_pending=True,reason='publication_dossier_gate')
                 origin=(report.get('candidate') or {}).get('origin') or {}
-                if origin.get('weight_first_valuation'):
+                if (not native_follow or full_dossier) and origin.get('weight_first_valuation'):
                     from .pipeline_modules.repair import missing_fields
                     pending=missing_fields(origin)
                     if pending:
@@ -174,21 +249,21 @@ async def tick(db, lane=None, *, target=None, run_paused=False):
                 state='publishing'
             body['submitted']=bool(body.get('submitted')) or result['phase'] in ('reconciling','sync_pending','stock_ready','stock_pending','stock_verified')
             if result.get('verified'):state='selling'
+            elif result.get('needs_dossier'):
+                state='needs_fields';delay=300
+                body.pop('error',None)
+                body.update(repair_full_dossier=True,official_dossier_pending=True,
+                            pending_publication_fields=result.get('missing_fields',[]))
             elif result.get('retryable_readback'):
                 state='awaiting_remote';delay=3600 if result.get('reason')=='favorite_visibility_exhausted' else 900 if result.get('phase')=='manual_review' else 300
                 if result.get('reason')=='favorite_visibility_exhausted':
                     unchanged=(result.get('favorite_recovery') or {}).get('unchanged_checks',0)
                     delay=min(21600,3600*2**min(max(0,unchanged-1),3))
             elif result['phase'] in ('failed','manual_review'):state='needs_review'
-            if state!='awaiting_remote':
-                with db.connect() as c:
-                    campaign=c.execute('SELECT body FROM pipeline_campaigns WHERE owner=? AND enabled=1',(key[0],)).fetchone() if c.execute("SELECT 1 FROM sqlite_master WHERE name='pipeline_campaigns'").fetchone() else None
-                policy=json.loads(campaign[0]) if campaign else {}
-                priority=policy.get('submission_priority',False) and body.get('campaign_run_id')==policy.get('run_id')
-                from .pipeline_modules.throughput_policy import readback_policy
-                with db.connect() as c:
-                    body['readback_policy']=readback_policy(c,key[0],priority,time.time())
-                delay=readback_delay(body,result['phase'],bool(result.get('verified')),body['readback_policy']['submission_priority'])
+            if state not in ('awaiting_remote','needs_fields'):
+                policy,native_follow=await database_work(publication_readback_policy,db,key,body.get('campaign_run_id'))
+                body['readback_policy']=policy
+                delay=readback_delay(body,result['phase'],bool(result.get('verified')),policy['submission_priority'],native_follow=native_follow)
         body.pop('dependency_wait',None)
         if state!='needs_fields':body.pop('error',None)
     except OfficialDeferred as error:
@@ -204,12 +279,27 @@ async def tick(db, lane=None, *, target=None, run_paused=False):
         # An uncertain publication remains resumable in its immutable ERP journal.
         if state not in ('publishing','awaiting_remote') and attempts>=8:state='needs_review'
     except asyncio.CancelledError:
-        with db.connect() as c:
-            c.execute('DELETE FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=? AND token=?',(*key,token))
+        await database_work(release_lease,db,key,token)
         raise
     finally:
         heartbeat.cancel()
         await asyncio.gather(heartbeat,return_exceptions=True)
+    return await database_work(finish,db,row,key,token,state,body,attempts,delay,lane,started,
+                               lock_wait,dependency_wait,repair_progress)
+
+
+def publication_readback_policy(db,key,campaign_run_id):
+    from .pipeline_modules.throughput_policy import readback_policy
+    from .follow_publication import selected
+    with db.connect() as c:
+        campaign=c.execute('SELECT body FROM pipeline_campaigns WHERE owner=? AND enabled=1',(key[0],)).fetchone() if c.execute("SELECT 1 FROM sqlite_master WHERE name='pipeline_campaigns'").fetchone() else None
+        policy=json.loads(campaign[0]) if campaign else {}
+        priority=policy.get('submission_priority',False) and campaign_run_id==policy.get('run_id')
+        result=readback_policy(c,key[0],priority,time.time())
+    return result,selected(db,key)
+
+
+def finish(db,row,key,token,state,body,attempts,delay,lane,started,lock_wait,dependency_wait,repair_progress):
     if state=='publishing':
         with db.connect() as c:
             if c.execute("SELECT 1 FROM sqlite_master WHERE name='plugin_publications'").fetchone():
@@ -219,7 +309,7 @@ async def tick(db, lane=None, *, target=None, run_paused=False):
                     if publication.get('phase'):
                         body['phase']=publication['phase']
                         body['submitted']=bool(body.get('submitted')) or publication['phase'] in ('submitting','reconciling','sync_pending','stock_ready','stock_pending','stock_verified')
-    if state=='needs_review':
+    if state=='needs_review' and not body.get('repair_manual'):
         from .manual_reviews import publication_started
         with db.connect() as c:
             if not publication_started(c,*key,body):body['same_product_only']=True
@@ -228,12 +318,15 @@ async def tick(db, lane=None, *, target=None, run_paused=False):
         else:body.setdefault('repair_wait_started_at',body.get('updated_at',started))
     else:body.pop('repair_wait_started_at',None)
     if lane=='reconcile_history' and state=='awaiting_remote' and body.get('phase')=='manual_review':delay=max(delay,900)
+    from .pipeline_modules.lifecycle import track
+    track(body,row['state'],state,time.time(),attempted=not (lock_wait or dependency_wait))
+    if repair_progress:body['lifecycle']['last_progress_at']=time.time()
     body['updated_at']=time.time()
     with db.connect() as c:
         c.execute('BEGIN IMMEDIATE')
         if not c.execute('SELECT 1 FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=? AND token=?',(*key,token)).fetchone():
             return False
-        if state=='needs_review' and body.get('same_product_only'):
+        if state=='needs_review' and body.get('same_product_only') and not body.get('repair_manual'):
             from .identity_review import reconcile_pending
             state=reconcile_pending(c,key,body) or state
         c.execute('DELETE FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=? AND token=?',(*key,token))
@@ -249,3 +342,14 @@ async def tick(db, lane=None, *, target=None, run_paused=False):
             SourceLibrary(db).put(key[0],p,{'channel':'plugin-pipeline','state':state},connection=c)
     control.record(db,'seed' if row['state']=='needs_fields' else 'review' if row['state'] in ('queued','evaluating') else 'publication',key[0],key[1],started,'waiting_lock' if lock_wait else 'waiting_dependency' if dependency_wait else state,{'lane':lane,'phase':body.get('phase'),'reason':body.get('dependency_wait') if dependency_wait else None if lock_wait else body.get('error')})
     return not lock_wait
+
+
+def release_lease(db,key,token):
+    with db.connect() as c:
+        c.execute('DELETE FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=? AND token=?',(*key,token))
+
+
+def renew_lease(db,key,token):
+    with db.connect() as c:
+        c.execute('UPDATE plugin_pipeline_leases SET expires=? WHERE owner=? AND sku=? AND seller=? AND token=?',
+                  (time.time()+120,*key,token))

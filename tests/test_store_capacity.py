@@ -19,6 +19,8 @@ async def test_failed_quota_refresh_keeps_store_blocked(tmp_path,monkeypatch):
     db,owner=setup(tmp_path);observe(db,owner,'test',{'total':'0/100'},now=1)
     from flowhub.maozi import MaoziPublisher
     monkeypatch.setattr(MaoziPublisher,'erp',AsyncMock(side_effect=TimeoutError()))
+    from flowhub import official_api
+    monkeypatch.setattr(official_api,'capacity',AsyncMock(side_effect=TimeoutError()))
     with pytest.raises(TimeoutError):await check_one(db)
     with db.connect() as c:assert c.execute('select state from store_publication_capacity').fetchone()[0]=='blocked'
 

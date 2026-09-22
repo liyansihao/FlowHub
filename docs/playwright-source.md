@@ -10,10 +10,14 @@
 运行前用 CLI `python -m flowhub.browser_source next --owner OWNER --run-id RUN --seller SELLER` 检查状态。pause/resume/retry 使用相同参数。运行传输：
 
 ```sh
-FLOWHUB_SOURCE_PROFILE=/path/to/dedicated/profile node bridges/playwright-source.mjs OWNER RUN SELLER 3
+FLOWHUB_SOURCE_PROFILE=/path/to/dedicated/profile \
+FLOWHUB_SOURCE_EXTENSION_DIR=/path/to/unpacked/extension \
+node bridges/playwright-source.mjs OWNER RUN SELLER 3
 ```
 
 profile不能同时由CLI浏览器和采集器占用。不要使用个人默认Chrome配置目录。
+设置 `FLOWHUB_SOURCE_EXTENSION_DIR` 后会按 ozon-playwright 的方式加载明确指定的解压扩展，并启用
+`--disable-blink-features=AutomationControlled`。不设置扩展目录时保留原有 profile 中已安装的扩展；程序不会猜测、下载或复制扩展。
 
 2026-09-13首次尝试：新建profile与原项目 专用持久化 profile 均触发403。用户随后在原项目持久化浏览器中恢复正常访问并安装插件。
 

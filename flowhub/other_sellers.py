@@ -6,6 +6,7 @@ import time
 from html.parser import HTMLParser
 from urllib.parse import urljoin,urlsplit,parse_qs
 from .source_library import SourceLibrary,SourceFilters,assess,identity
+from .pipeline_modules.database_work import run as database_work
 
 class OffersHTML(HTMLParser):
     def __init__(self):
@@ -124,17 +125,23 @@ async def discover_one(db,owner,config,now=None):
     import asyncio,os
     from pathlib import Path
     now=time.time() if now is None else now
-    with db.connect() as c:
-        seed=c.execute("""SELECT * FROM source_discovery_seeds s WHERE owner=? AND due<=?
-          AND state IN ('queued','partial','retry_wait','complete')
-          AND NOT EXISTS(SELECT 1 FROM blocks b WHERE b.owner=s.owner AND b.source_key=s.sku)
-          ORDER BY updated,sku LIMIT 1""",(owner,now)).fetchone()
+    def select_seed():
+        with db.connect() as c:
+            return c.execute("""SELECT * FROM source_discovery_seeds s WHERE owner=? AND due<=?
+              AND state IN ('queued','partial','retry_wait','complete')
+              AND NOT EXISTS(SELECT 1 FROM blocks b WHERE b.owner=s.owner AND b.source_key=s.sku)
+              ORDER BY updated,sku LIMIT 1""",(owner,now)).fetchone()
+    seed=await database_work(select_seed)
     if not seed:return {'state':'no_due_discovery'}
     root=Path(__file__).resolve().parents[1];process=None
     try:
         process=await asyncio.create_subprocess_exec('node',str(root/'bridges/other-sellers.mjs'),seed['sku'],
             str(root/'output/playwright/other-seller-expansion'),str(min(40,8*(seed['attempts']+1))),
-            cwd=root,env=os.environ|{'FLOWHUB_SOURCE_PROFILE':config['profile']},
+            cwd=root,env=os.environ|{
+                'FLOWHUB_SOURCE_PROFILE':config['profile'],
+                **({'FLOWHUB_SOURCE_EXTENSION_DIR':str(config['extension_dir'])} if config.get('extension_dir') else {}),
+                **({'FLOWHUB_SOURCE_CHROMIUM_EXECUTABLE':str(config['chromium_executable'])} if config.get('chromium_executable') else {}),
+            },
             stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
         output,error=await asyncio.wait_for(process.communicate(),120)
         if process.returncode:
@@ -143,17 +150,20 @@ async def discover_one(db,owner,config,now=None):
             reason='browser_navigation_failed' if failure.get('network') or b'net::ERR_' in error else 'other_offers_unavailable_'+str(failure.get('error','unknown'))
             raise ValueError(reason)
         result=json.loads(output);artifact=Path(result['artifact'])
-        return ingest(db,owner,seed['sku'],artifact.read_text(),str(artifact))|{'sku':seed['sku']}
+        def save_artifact():return ingest(db,owner,seed['sku'],artifact.read_text(),str(artifact))
+        return (await database_work(save_artifact))|{'sku':seed['sku']}
     except Exception as error:
         reason=str(error) if isinstance(error,ValueError) else type(error).__name__
         attempts=seed['attempts']+1
         body=json.loads(seed['body']);failures=body.get('consecutive_failures',0)+1
         state='retry_wait' if failures<=3 and 'access_challenge' not in reason else 'blocked'
-        with db.connect() as c:
-            c.execute('INSERT INTO source_discovery_failures VALUES(?,?,?,?)',(owner,seed['sku'],reason,now))
-            body.update(last_failure={'reason':reason,'at':now},consecutive_failures=failures)
-            c.execute('UPDATE source_discovery_seeds SET state=?,due=?,attempts=?,body=?,updated=? WHERE owner=? AND sku=?',
-                (state,now+min(21600,120*2**failures),attempts,json.dumps(body),now,owner,seed['sku']))
+        def save_failure():
+            with db.connect() as c:
+                c.execute('INSERT INTO source_discovery_failures VALUES(?,?,?,?)',(owner,seed['sku'],reason,now))
+                body.update(last_failure={'reason':reason,'at':now},consecutive_failures=failures)
+                c.execute('UPDATE source_discovery_seeds SET state=?,due=?,attempts=?,body=?,updated=? WHERE owner=? AND sku=?',
+                    (state,now+min(21600,120*2**failures),attempts,json.dumps(body),now,owner,seed['sku']))
+        await database_work(save_failure)
         return {'state':state,'sku':seed['sku'],'reason':reason}
     finally:
         if process and process.returncode is None:

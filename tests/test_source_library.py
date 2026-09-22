@@ -581,3 +581,23 @@ def test_market_refresh_preserves_newer_listing_review_without_refreshing_review
     assert library.query("a")["items"][0]["listing_review"] == review
     library.put("b", refreshed, {})
     assert "listing_review" not in library.query("b")["items"][0]
+
+
+def test_admission_index_keeps_exact_source_binding_rules(tmp_path):
+    from flowhub.db import Database
+    from flowhub.source_library import SourceLibrary
+    db=Database(tmp_path);SourceLibrary(db)
+    condition="""owner=? AND json_extract(body,'$.coverage') IN ('storefront-page','maozi-exact-seller-page')
+        AND json_extract(body,'$.source_relation.seller_id')=json_extract(body,'$.seller_id')
+        AND json_array_length(json_extract(body,'$.source_relation.root_seeds'))>0"""
+    import json
+    good={'coverage':'storefront-page','seller_id':'2','source_relation':{'seller_id':'2','root_seeds':[{'sku':'9'}]}}
+    variants=[good,good|{'coverage':'unknown'},good|{'source_relation':{'seller_id':'3','root_seeds':[{'sku':'9'}]}},good|{'source_relation':{'seller_id':'2','root_seeds':[]}},good|{'source_relation':{}},good|{'coverage':'maozi-exact-seller-page'}]
+    with db.connect() as c:
+        for i,body in enumerate(variants):
+            c.execute('INSERT INTO sourcing_products(owner,sku,seller,body,first_seen,updated) VALUES(?,?,?,?,0,0)',('o',str(i),'2',json.dumps(body)))
+        expected=[tuple(r) for r in c.execute('SELECT sku FROM sourcing_products NOT INDEXED WHERE '+condition+' ORDER BY id',('o',))]
+        actual=[tuple(r) for r in c.execute('SELECT sku FROM sourcing_products WHERE '+condition+' ORDER BY id',('o',))]
+        assert actual==expected==[('0',),('5',)]
+        plan=' '.join(str(tuple(r)) for r in c.execute('EXPLAIN QUERY PLAN SELECT * FROM sourcing_products WHERE '+condition,('o',)))
+        assert any(name in plan for name in ('sourcing_admission_candidates','sourcing_admission_candidate_keys'))

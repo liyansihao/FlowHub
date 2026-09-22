@@ -200,7 +200,7 @@ def flow(tmp_path, monkeypatch):
     monkeypatch.setattr(
         SourceCollector, "collect", AsyncMock(side_effect=AssertionError("No lazy collection"))
     )
-    monkeypatch.setattr("flowhub.official_source_guard.verify_unimported", AsyncMock())
+    monkeypatch.setattr("flowhub.official_source_guard.verify_unimported", AsyncMock(side_effect=AssertionError('New official intents must not query ERP')))
     platform = Platform()
     original_client = official_api.client
 
@@ -461,15 +461,100 @@ async def test_batch_rejects_foreign_product(tmp_path):
             await api.post("/v3/product/info/list", json={"offer_id": ["own"]})
 
 
-async def test_remote_duplicate_blocks_official_import(flow, monkeypatch):
+async def test_known_historical_import_blocks_new_official_import(flow):
     await step(flow)
-    monkeypatch.setattr(
-        "flowhub.official_source_guard.verify_unimported",
-        AsyncMock(side_effect=ValueError("source_already_imported")),
-    )
+    with flow[0].connect() as c:
+        c.execute('CREATE TABLE official_source_checks(account TEXT,sku TEXT,checked REAL,imported INTEGER,PRIMARY KEY(account,sku))')
+        c.execute('INSERT INTO official_source_checks VALUES(?,?,?,1)',('old-account','123',0))
     with pytest.raises(ValueError, match="source_already_imported"):
         await step(flow)
     assert not any(path == "/v3/product/import" for path, _ in flow[2].calls)
+
+
+async def test_pinned_old_official_intent_keeps_original_dedupe(flow, monkeypatch):
+    await step(flow)
+    with flow[0].connect() as c:
+        record=json.loads(c.execute('SELECT body FROM plugin_publications').fetchone()[0])
+        record.pop('source_dedupe')
+        c.execute('UPDATE plugin_publications SET body=?',(json.dumps(record),))
+    check=AsyncMock(side_effect=ValueError('source_already_imported'))
+    monkeypatch.setattr('flowhub.official_source_guard.verify_unimported',check)
+    with pytest.raises(ValueError,match='source_already_imported'):
+        await step(flow)
+    check.assert_awaited_once()
+    assert not any(path == '/v3/product/import' for path,_ in flow[2].calls)
+
+
+@pytest.mark.parametrize('mode', ['official_only','official_preferred'])
+async def test_missing_dossier_leaves_submit_lane_and_never_falls_back(flow,monkeypatch,mode):
+    from flowhub import plugin_pipeline,plugin_publication
+    db,owner,p,review=flow
+    review['candidate']['origin']['ozon_dossier'].pop('attributes')
+    with db.connect() as c:
+        c.execute('UPDATE plugin_reviews SET body=?',(json.dumps(review),))
+        c.execute('UPDATE plugin_pipeline SET body=?',(json.dumps({'error':'old ERP timeout'}),))
+        cfg=json.loads(c.execute('SELECT config FROM stores').fetchone()[0])
+        cfg['publication_backend']=mode
+        c.execute('UPDATE stores SET config=?',(json.dumps(cfg),))
+    old=AsyncMock(side_effect=AssertionError('No ERP fallback'))
+    monkeypatch.setattr(plugin_publication,'_advance',old)
+    assert await plugin_pipeline.tick(db,lane='submit')
+    with db.connect() as c:
+        row=c.execute('SELECT * FROM plugin_pipeline').fetchone()
+        assert row['state']=='needs_fields' and row['due']>time.time()+290
+        body=json.loads(row['body'])
+        assert body['official_dossier_pending'] and 'error' not in body
+        assert not c.execute('SELECT 1 FROM plugin_publications').fetchone()
+    assert not await plugin_pipeline.tick(db,lane='submit')
+    old.assert_not_awaited()
+    assert not p.calls
+
+
+async def test_missing_official_credentials_never_falls_back(flow,monkeypatch):
+    from flowhub import plugin_publication
+    db=flow[0]
+    with db.connect() as c:
+        c.execute('UPDATE stores SET secret=?',(db.seal({'erp_token':'synthetic'}),))
+    old=AsyncMock(side_effect=AssertionError('No ERP fallback'))
+    monkeypatch.setattr(plugin_publication,'_advance',old)
+    with pytest.raises(ValueError,match='official_credentials_required'):
+        await step(flow)
+    old.assert_not_awaited()
+
+
+@pytest.mark.parametrize('response', [{'items':[{'offer_id':'offer','id':12}]},{'result':{}}, {'items':None}])
+async def test_official_dedupe_rejects_existing_or_malformed_result(tmp_path,response):
+    from flowhub.official_source_guard import verify_local_official
+    db=Database(tmp_path)
+    with db.connect() as c:
+        c.execute('CREATE TABLE plugin_publications(owner TEXT,sku TEXT,seller TEXT,body TEXT)')
+    async with httpx.AsyncClient(base_url='https://api-seller.ozon.ru',transport=httpx.MockTransport(lambda r:httpx.Response(200,json=response))) as api:
+        with pytest.raises(ValueError,match='official_'):
+            await verify_local_official(db,'owner','123','seller','offer',api)
+
+
+async def test_local_other_seller_claim_blocks_without_remote_read(flow):
+    from flowhub.official_source_guard import verify_local_official
+    db,owner,p,_=flow
+    await step(flow)
+    calls=len(p.calls)
+    async with official_api.client(db,{'client_id':'12','api_key':'synthetic'}) as api:
+        with pytest.raises(ValueError,match='source_already_claimed'):
+            await verify_local_official(db,owner,'123','another','new-offer',api)
+    assert len(p.calls)==calls
+
+
+async def test_supplement_validation_reads_official_only_and_persists_traceable_dossier(flow):
+    from flowhub.pipeline_modules.repair import official_dossier_fields
+    db,owner,p,review=flow
+    origin=review['candidate']['origin']
+    product=origin|{'sku':'123','title':review['candidate']['title'],'image':review['candidate']['image']}
+    with db.connect() as c:
+        store=c.execute('SELECT * FROM stores').fetchone()
+    context={'store':{'id':store['id'],'config':json.loads(store['config']),'credentials':db.open(store['secret'])}}
+    result,missing=await official_dossier_fields(db,owner,product,review,context)
+    assert missing==[] and result['ozon_dossier']['attributes']
+    assert not any(path in ('/v3/product/import','/v2/products/stocks') for path,_ in p.calls)
 
 
 async def test_submitted_official_intent_no_longer_needs_erp_dedupe(flow, monkeypatch):
@@ -595,3 +680,30 @@ async def test_pipeline_cooldown_keeps_attempts_and_does_not_report_old_errors(t
         ).fetchone()
         assert event["outcome"] == "waiting_dependency"
         assert json.loads(event["details"])["reason"] == "official_authentication"
+
+
+async def test_new_website_listing_preparation_uses_official_quota_without_erp_lookup(flow,monkeypatch):
+    from flowhub import listing_controls,compat
+    from flowhub.identity_review import envelope
+    db,owner,platform,review=flow;now=time.time()
+    with db.connect() as c:
+        product=json.loads(c.execute('SELECT body FROM sourcing_products').fetchone()[0])
+        product.update(url='https://www.ozon.ru/product/123/',
+            proposed_sale_price={'value':100,'currency':'CNY','observed_at':now},
+            source_relation={'seller_id':'456','root_seeds':[{'sku':'99','shop':'11','offer':'root'}]})
+        product['plugin_detail'].update(sku='123',weight_g=400,dimensions_mm=[100,100,100],attributes=[],observed_at=now)
+        cb={'search_and_rank':{'query':{'product_id':'123','title':product['title'],'image_url':product['image'],
+            'specifications':envelope(product)['origin']['specifications']},'candidates':[{'candidate':{'offer_id':'1','offer_url':'https://example.com/1',
+            'title':'same product','price_cny':4.1,'image_url':'https://example.com/supplier.jpg'},'dinov2_similarity':.9}]},
+            'decision':{'selected_offer_id':'1','outcome':'approved'}}
+        review['identity_review']={'verdict':'match','human_review':{'actor':'user','at':now},'comparison':cb}
+        c.execute('UPDATE sourcing_products SET body=?',(json.dumps(product),))
+        c.execute('UPDATE plugin_reviews SET body=?',(json.dumps(review),))
+        c.execute('INSERT INTO plugin_routes VALUES(?,?,?,?,?,?)',(owner,'123','456','one',now+3600,'test'))
+    monkeypatch.setattr(listing_controls,'read_delists',AsyncMock(return_value={'skus':[],'offers':[]}))
+    monkeypatch.setattr(listing_controls,'owned_targets',AsyncMock(side_effect=AssertionError('No ERP import-log lookup')))
+    monkeypatch.setattr(compat,'invoke',AsyncMock(return_value=review['result']))
+    state,body=await listing_controls.prepare_listing(db,(owner,'123','456'),{'id':'existing-intent','actor':'user','requested_at':now})
+    assert state=='waiting' and body['phase']=='publication_pipeline'
+    assert any(path=='/v4/product/info/limit' for path,_ in platform.calls)
+    assert not any(path in ('/v3/product/import','/v2/products/stocks') for path,_ in platform.calls)

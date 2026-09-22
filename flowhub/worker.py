@@ -4,10 +4,15 @@ import asyncio
 import fcntl
 import json
 import secrets
+import sqlite3
 import time
 
 from .db import Database
 from .modules import ModuleError, ModuleHost, candidate, image_url, number
+from .runtime_identity import capture as capture_runtime, save as save_runtime
+from pathlib import Path
+
+RUNTIME_IDENTITY = capture_runtime('worker', Path(__file__).resolve().parents[1])
 
 TERMINAL = ("selling", "rejected", "attention")
 
@@ -325,7 +330,21 @@ class Worker:
             return dict(r) | {"lease": lease}
 
     async def step(self):
-        job = self.claim()
+        from .pipeline_modules.database_work import run as database_work
+        claim_task=asyncio.create_task(asyncio.to_thread(self.claim))
+        try:
+            job=await asyncio.shield(claim_task)
+        except asyncio.CancelledError:
+            job=await claim_task
+            if job:
+                def release():
+                    with self.db.connect() as c:
+                        c.execute("UPDATE jobs SET lease=NULL,lease_until=0 WHERE id=? AND lease=?",(job['id'],job['lease']))
+                await database_work(release)
+            raise
+        except sqlite3.OperationalError as error:
+            if 'locked' not in str(error).lower() and 'busy' not in str(error).lower():raise
+            return False
         if not job:
             return False
         try:
@@ -453,10 +472,19 @@ class Worker:
     async def run(self):
         lock = (self.db.directory / "worker.lock").open("w")
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        save_runtime(self.db.directory, RUNTIME_IDENTITY)
 
         async def heartbeat():
+            from .pipeline_modules.database_work import run as database_work
             while True:
-                self.db.health("worker")
+                try:
+                    await database_work(self.db.health,"worker")
+                except sqlite3.OperationalError as error:
+                    if 'locked' not in str(error).lower() and 'busy' not in str(error).lower():raise
+                    # A busy writer is retried; do not restart in-flight operations.
+                    await asyncio.sleep(1)
+                    continue
+                save_runtime(self.db.directory, RUNTIME_IDENTITY)
                 await asyncio.sleep(5)
 
         async def refill():
@@ -518,6 +546,9 @@ class Worker:
         tasks = [asyncio.create_task(heartbeat()), asyncio.create_task(refill()),
                  asyncio.create_task(collect_sources()), asyncio.create_task(plugin_publications()),
                  asyncio.create_task(remote_review_sync())]
+        if (self.db.directory/'observe-loop-stalls').exists():
+            from .loop_health import monitor
+            tasks.append(asyncio.create_task(monitor(self.db.directory)))
         try:
             while True:
                 for task in tasks:
