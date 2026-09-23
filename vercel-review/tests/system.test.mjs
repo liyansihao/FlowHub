@@ -1,0 +1,15 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {authorize,validToken,validateCommand,dayRange} from '../lib/system.mjs';
+const env={SYSTEM_AGENT_TOKEN:'secret',SYSTEM_PUBLIC_ORIGIN:'https://flowhub-review.vercel.app'};
+const now=10000,snap={status:{observed_at:now,controls_enabled:true,state_version:'v',source_revision:'r'}};
+const command={action:'pause',idempotency_key:'k',expected_state_version:'v',target_revision:'r',expires_at:now+60};
+test('reads require no operator login',()=>assert.doesNotThrow(()=>authorize(new Request(env.SYSTEM_PUBLIC_ORIGIN+'/api/system/v1/status'),env)));
+test('same origin commands require no operator identity',()=>assert.doesNotThrow(()=>authorize(new Request(env.SYSTEM_PUBLIC_ORIGIN+'/api/system/v1/commands',{method:'POST',headers:{origin:env.SYSTEM_PUBLIC_ORIGIN,'x-system-request':'1'}}),env)));
+test('foreign origin rejected',()=>assert.throws(()=>authorize(new Request(env.SYSTEM_PUBLIC_ORIGIN+'/api/system/v1/commands',{method:'POST',headers:{origin:'https://evil.example','x-system-request':'1'}}),env)));
+test('device token cannot be replaced with public request header',()=>assert.throws(()=>authorize(new Request(env.SYSTEM_PUBLIC_ORIGIN+'/api/system/v1/agent/exchange',{method:'POST',headers:{origin:env.SYSTEM_PUBLIC_ORIGIN,'x-system-request':'1'}}),env)));
+test('token exact constant-time comparison',()=>{assert.ok(validToken('Bearer secret','secret'));assert.ok(!validToken('Bearer secre','secret'));assert.ok(!validToken('Bearer secrex','secret'));assert.ok(!validToken('Bearer ',''));});
+test('bounded valid existing-state command',()=>assert.equal(validateCommand(command,snap,now),command));
+for(const [name,patch] of Object.entries({expired:{expires_at:now-1},far_future:{expires_at:now+1801},wrong_version:{target_revision:'old'},wrong_state:{expected_state_version:'old'},shell:{action:'exec'},business_rule:{seller_id:'new_shop'}}))test('reject '+name,()=>assert.throws(()=>validateCommand({...command,...patch},snap,now)));
+test('stale/offline snapshots cannot launch',()=>assert.throws(()=>validateCommand(command,{status:{...snap.status,observed_at:now-91}},now)));
+test('Shanghai day boundary and invalid calendar date',()=>{assert.equal(dayRange('2026-09-23').start,Date.parse('2026-09-22T16:00:00Z')/1000);assert.throws(()=>dayRange('2026-02-31'));});
