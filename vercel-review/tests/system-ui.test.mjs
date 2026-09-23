@@ -50,3 +50,5 @@ test('task filter race cannot overwrite newer result; closed product cannot rece
  pending[2].resolve({ok:true,json:async()=>({...f.payload,items:[{kind:'product',body:{sku:'123',state:'selling',seller:'s'}}]})});await lookup;
  assert.doesNotMatch(f.element('sys-product-body').innerHTML,/在售/);assert.equal(f.element('sys-product-dialog').open,false);
 });
+
+test('SQLite verification flags accept boolean and integer, without treating unknown as success',()=>{assert.equal(model.verifiedFlag(1),true);assert.equal(model.verifiedFlag(true),true);for(const value of [null,0,false,'1'])assert.equal(model.verifiedFlag(value),false);});

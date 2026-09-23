@@ -1,4 +1,4 @@
-import {stateLabel,escapeHTML as esc,number as num,time,hour,isStale,runningState,identities,errorLabel} from './system-model.mjs';
+import {stateLabel,escapeHTML as esc,number as num,time,hour,isStale,runningState,identities,errorLabel,verifiedFlag} from './system-model.mjs';
 const $=id=>document.getElementById(id);
 const cache={},failures=new Set();let refreshing=false,taskGeneration=0,taskController,taskLoading=false,cursors=[''],nextCursor=null,productGeneration=0,productController;
 const empty=text=>`<div class="sys-empty">${esc(text)}</div>`;
@@ -81,7 +81,7 @@ function productHTML(d){
  const notice=isStale(d)?'<p class="sys-alert">本机数据已过期，以下为最后一次同步记录。</p>':'';
  return notice+(groups.map(g=>{
   const product=g.product??{},pub=g.publication??{},success=g.success??{};
-  const verified=pub.verified===true||success.verified===true;
+  const verified=verifiedFlag(pub.verified)||verifiedFlag(success.verified);
   return `<section class="sys-identity"><h3>店铺 ${esc(g.seller||'未分配')}</h3><dl><dt>来源</dt><dd>${esc(g.owner||'未记录')}</dd><dt>当前记录状态</dt><dd>${esc(stateLabel(product.state))}</dd><dt>发布核验</dt><dd>${verified?'已核验成功':'尚未核验成功'}</dd><dt>尝试次数</dt><dd>${num(product.attempts)}</dd><dt>下一次计划</dt><dd>${product.due?esc(time(product.due)):'未记录'}</dd><dt>发布开始</dt><dd>${esc(time(pub.started_at))}</dd><dt>首次核验</dt><dd>${esc(time(success.first_verified_at??pub.first_verified_at))}</dd><dt>发布方式</dt><dd>${esc(pub.backend??success.backend??'未记录')}</dd><dt>商品货号</dt><dd>${esc(pub.offer_id??success.offer_id??'未记录')}</dd><dt>状态同步时间</dt><dd>${esc(time(product.observed_at??pub.observed_at??success.observed_at))}</dd></dl></section>`;
  }).join('')||empty('尚未同步到该商品记录，请检查来源 SKU 和店铺 ID。'))+`<h3>最近处理步骤</h3><p>同一 SKU 的步骤可能来自不同店铺；尚未提供逐店铺归属。历史成功核验不代表当前仍在售。</p><div class="sys-list">${eventRows(d.events??[])||empty('暂无已同步步骤记录。')}</div>`;
 }

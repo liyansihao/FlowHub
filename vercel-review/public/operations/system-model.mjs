@@ -12,3 +12,5 @@ export function identities(items){
  return [...groups.values()];
 }
 export const errorLabel=value=>({sqlite_lock:'SQLite 锁竞争',storage:'存储异常',external_or_transport:'外部接口 / 网络异常',application:'程序异常'}[value]??value??'未分类异常');
+
+export const verifiedFlag=value=>value===true||value===1;
