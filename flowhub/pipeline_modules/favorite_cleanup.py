@@ -12,7 +12,7 @@ from ..modules import ModuleError
 from . import control
 from .database_work import run as database_work
 
-DEFAULTS={'enabled':False,'threshold_ratio':0.95,'target_ratio':2/3,'batch_size':1000,'interval_seconds':60,'minimum_age_seconds':3600,'max_checks_per_cycle':32,'cycle_seconds':120}
+DEFAULTS={'enabled':False,'threshold_ratio':0.95,'target_ratio':2/3,'batch_size':1000,'interval_seconds':60,'minimum_age_seconds':3600,'max_checks_per_cycle':32,'cycle_seconds':120,'batch_seconds':1800}
 
 
 def config(db):
@@ -22,6 +22,7 @@ def config(db):
     if not 1<=value['batch_size']<=1000 or value['interval_seconds']<60 or value['minimum_age_seconds']<0:
         raise ValueError('invalid cleanup bounds')
     if not 1<=value['max_checks_per_cycle']<=100 or not 1<=value['cycle_seconds']<=300:raise ValueError('invalid cleanup work bounds')
+    if not 1<=value['batch_seconds']<=3600:raise ValueError('invalid batch deadline')
     return value
 
 
@@ -78,6 +79,24 @@ async def listing(client,should_stop=lambda:False):
             if len(found)!=total or len({str(r['id']) for r in found})!=total:raise ValueError('incomplete favorite list')
             return header,found
     raise ValueError('favorite pagination exceeded')
+
+
+async def discover_present(client,should_stop,seconds):
+    """Positive discovery only: moving pages can omit rows, never prove absence."""
+    found=set();pages=0;error=None
+    try:
+        async with asyncio.timeout(seconds):
+            for page in range(1,101):
+                if await database_work(should_stop):raise CleanupPaused()
+                response=await client.call('/api.product.favorite/lists',params={'page':page,'page_size':100})
+                batch=rows(response) if isinstance(response,dict) else None
+                if not isinstance(batch,list) or any(not isinstance(r,dict) or not str(r.get('id','')).isdigit() or not r.get('sku') for r in batch):
+                    raise FavoriteLookupError('invalid discovery page')
+                found.update(str(r['sku']) for r in batch);pages+=1
+                if len(batch)<100:break
+    except (httpx.HTTPError,TimeoutError,ModuleError,FavoriteLookupError) as exc:
+        error=type(exc).__name__
+    return found,{'pages':pages,'observed_skus':len(found),'error_type':error}
 
 
 async def exact_favorites(client,sku,should_stop=lambda:False):
@@ -291,24 +310,34 @@ async def clean_item(db,owner,account,item,settings,client,stopped,budget):
     return await reconcile_one(db,account,r,client,stopped)
 
 
-async def clean_account(db,owner,account,items,settings,client=None):
+async def clean_account(db,owner,account,items,settings,client=None,*,bulk=False):
     client=client or Client(items[0]['context'])
     def stopped():return control.paused(db,'seed') or not config(db)['enabled']
     await database_work(schema,db)
     def previous_receipts():
         with db.connect() as c:return c.execute("SELECT * FROM favorite_cleanup_receipts WHERE account=? AND state!='deleted'",(account,)).fetchall()
     prior=await database_work(previous_receipts)
-    work,due_count=await database_work(scheduled_work,db,account,items,prior,settings)
+    discovery=None
+    if bulk:
+        present,discovery=await discover_present(client,stopped,settings['cycle_seconds'])
+        items=[item for item in items if item['sku'] in present]
+    # The finite observed queue is the batch; the deletion budget remains a
+    # separate cap. Receipt reconciliation does not consume that budget.
+    scheduling=settings|{'max_checks_per_cycle':max(1,len(items)+len(prior))} if bulk else settings
+    work,due_count=await database_work(scheduled_work,db,account,items,prior,scheduling)
     result={'deleted':0,'skipped':0,'checked':0,'due_candidates':due_count,'reasons':{},'max_item_seconds':0}
+    if bulk:result['discovery']=discovery
     started=time.monotonic();budget={'remaining':None}
+    seconds=settings['batch_seconds'] if bulk else settings['cycle_seconds']
+    new_deletions=0
     for w in work:
         if await database_work(stopped):return result|{'state':'paused'}
-        if result['deleted']>=settings['batch_size'] or time.monotonic()-started>=settings['cycle_seconds']:break
+        if new_deletions>=settings['batch_size'] or time.monotonic()-started>=seconds:break
         # Reserve rotation before I/O. A crash delays this item, it cannot erase it.
         await database_work(checked,db,account,w['key'],'checking',60)
         item_started=time.monotonic()
         try:
-            async with asyncio.timeout(min(40,max(.001,settings['cycle_seconds']-(item_started-started)))):
+            async with asyncio.timeout(min(40,max(.001,seconds-(item_started-started)))):
                 if w['kind']=='receipt':reason=await reconcile_one(db,account,w['row'],client,stopped)
                 else:reason=await clean_item(db,owner,account,w['item'],settings,client,stopped,budget)
         except CleanupPaused:return result|{'state':'paused'}
@@ -318,8 +347,13 @@ async def clean_account(db,owner,account,items,settings,client=None):
         result['checked']+=1;result['reasons'][reason]=result['reasons'].get(reason,0)+1
         if reason=='deleted':
             result['deleted']+=1
+            if w['kind']=='candidate':new_deletions+=1
         else:result['skipped']+=1
         await database_work(checked,db,account,w['key'],reason,300 if reason!='deleted' else 3600)
+        if bulk and result['checked']%32==0:
+            await database_work(control.record,db,'seed',owner,'',time.time(),'favorite_cleanup_progress',
+                                result|{'new_deletions':new_deletions,'duration_seconds':round(time.monotonic()-started,3)})
+    result['new_deletions']=new_deletions
     if await database_work(stopped):return result|{'state':'paused'}
     return result|{'state':'cleaned' if result['deleted'] else ('below_threshold' if result['reasons'] and set(result['reasons'])=={'below_threshold'} else 'no_safe_candidates'),
                    'duration_seconds':round(time.monotonic()-started,3),'requests':getattr(client,'requests',None),'read_retries':getattr(client,'retries',None)}
@@ -343,7 +377,7 @@ async def tick(db):
                 items=groups.get(account,[])
                 if await database_work(control.paused,db,'seed') or not config(db)['enabled']:return results
                 started=time.time()
-                try:result=await clean_account(db,owner,account,items,settings,Client(items[0]['context'] if items else contexts[account]))
+                try:result=await clean_account(db,owner,account,items,settings,Client(items[0]['context'] if items else contexts[account]),bulk=True)
                 except Exception as e:result={'state':'error','error_type':type(e).__name__,'reason':str(e)[:160] if isinstance(e,ValueError) else type(e).__name__}
                 await database_work(control.record,db,'seed',owner,'',started,'favorite_cleanup',result);results.append(result)
         return results

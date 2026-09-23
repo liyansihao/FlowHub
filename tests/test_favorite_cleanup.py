@@ -435,3 +435,125 @@ def test_presence_lane_borrows_empty_discovery_and_respects_due(tmp_path):
     work,count=cleanup.scheduled_work(db,'account',items,[],cleanup.config(db)|{'max_checks_per_cycle':4})
     assert count==4
     assert [w['item']['sku'] for w in work]==['1','2','3','4']
+
+
+def bulk_fixture(tmp_path,count):
+    db,owner,item=setup(tmp_path);items=[]
+    with db.connect() as c:
+        template=json.loads(c.execute('SELECT body FROM sourcing_products').fetchone()[0])
+        for i in range(count):
+            sku=str(100000+i);offer='offer-'+sku
+            c.execute('INSERT INTO sourcing_products(owner,sku,seller,body,first_seen,updated) VALUES(?,?,?,?,?,?)',(owner,sku,'2',json.dumps(template|{'sku':sku}),1,1))
+            c.execute('INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)',(owner,sku,'2','selling',json.dumps({'offer_id':offer}),1,0))
+            c.execute('INSERT INTO plugin_publications VALUES(?,?,?,?)',(owner,sku,'2',json.dumps({'offer_id':offer,'phase':'stock_verified'})))
+            items.append(item|{'sku':sku,'offer_id':offer})
+    return db,owner,items
+
+
+class BulkFake:
+    def __init__(self,items,db,faults=False):
+        self.present={i['sku']:{'id':int(i['sku']),'sku':i['sku'],'is_imported':1} for i in items}
+        self.db=db;self.writes=[];self.lookups=[];self.faults=faults
+    async def call(self,path,method='GET',params=None,body=None):
+        if path.endswith('favorite/lists'):
+            if params.get('sku'):
+                sku=params['sku'];self.lookups.append(sku)
+                if self.faults and sku=='100000':raise TimeoutError()
+                batch=[self.present[sku]] if sku in self.present else []
+                total=len(batch)
+            else:
+                offset=(params['page']-1)*100
+                batch=list(self.present.values())[offset:offset+100];total=len(self.present)
+            return {'data':batch,'total':total,'used':len(self.present),'limit':3000}
+        if path.endswith('online/lists'):
+            return {'data':[{'shop_id':'4','offer_id':params['offer_id'],'online_status':'selling','stock':0 if self.faults and params['offer_id']=='offer-100001' else 99}]}
+        assert path.endswith('favorite/toggle') and body['status'] is False
+        sku=body['productInfo']['sku']
+        with self.db.connect() as c:r=c.execute('SELECT * FROM favorite_cleanup_receipts WHERE sku=?',(sku,)).fetchone()
+        assert r['state']=='intent' and Path(self.db.open(r['body'])['archive_path']).is_file()
+        self.writes.append(sku)
+        if self.faults and sku=='100002':raise TimeoutError()  # Unknown outcome: must not replay.
+        del self.present[sku]
+        if self.faults and sku=='100003':raise TimeoutError()  # Lost ack, exact lookup proves success.
+        return {}
+
+
+@pytest.mark.asyncio
+async def test_bulk_deletes_thousand_archived_favorites_and_resumes_remainder(tmp_path):
+    db,owner,items=bulk_fixture(tmp_path,1005);api=BulkFake(items,db)
+    history=[items[0]|{'sku':f'absent-{i}'} for i in range(4000)]
+    settings=cleanup.config(db)|{'clear_completed':True}
+    result=await cleanup.clean_account(db,owner,'account',history+items,settings,api,bulk=True)
+    assert result['new_deletions']==1000 and len(api.writes)==1000
+    assert not any(s.startswith('absent-') for s in api.lookups)
+    resumed=Database(tmp_path)
+    await cleanup.clean_account(resumed,owner,'account',history+items,settings,api,bulk=True)
+    assert len(api.writes)==len(set(api.writes))==1005 and not api.present
+    with db.connect() as c:
+        receipts=c.execute('SELECT * FROM favorite_cleanup_receipts').fetchall()
+        assert len(receipts)==1005 and all(r['state']=='deleted' for r in receipts)
+        assert c.execute('SELECT count(*) FROM sourcing_products').fetchone()[0]==1006
+        assert c.execute("SELECT count(*) FROM plugin_pipeline WHERE state='selling'").fetchone()[0]==1006
+    for r in receipts:
+        b=db.open(r['body'])
+        assert hashlib.sha256(Path(b['archive_path']).read_bytes()).hexdigest()==b['archive_sha256']
+
+
+@pytest.mark.asyncio
+async def test_bulk_faults_do_not_block_following_items_or_replay_unknown_writes(tmp_path):
+    db,owner,items=bulk_fixture(tmp_path,20);api=BulkFake(items,db,True)
+    settings=cleanup.config(db)|{'clear_completed':True}
+    result=await cleanup.clean_account(db,owner,'account',items,settings,api,bulk=True)
+    assert result['new_deletions']==17
+    assert set(api.present)=={'100000','100001','100002'}
+    await cleanup.clean_account(Database(tmp_path),owner,'account',items,settings,api,bulk=True)
+    assert len(api.writes)==len(set(api.writes))==18
+
+
+@pytest.mark.asyncio
+async def test_partial_discovery_is_positive_hint_not_absence_evidence(tmp_path):
+    db,owner,item=setup(tmp_path)
+    with db.connect() as c:
+        c.execute('INSERT INTO favorite_cleanup_receipts VALUES(?,?,?,?,?,?,?)',('account','999',owner,'unknown','unconfirmed',db.seal({}),0))
+    class Partial(BulkFake):
+        async def call(self,path,method='GET',params=None,body=None):
+            if path.endswith('favorite/lists'):
+                if params.get('sku')=='unknown':return {'total':1,'data':[{'id':999,'sku':'unknown'}]}
+                if not params.get('sku'):
+                    if params['page']==2:raise TimeoutError()
+                    return {'total':500,'data':[{'id':10000+i,'sku':'other'} for i in range(100)]}
+            return await super().call(path,method,params,body)
+    api=Partial([],db)
+    result=await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api,bulk=True)
+    assert result['discovery']['error_type']=='TimeoutError' and not api.writes
+    with db.connect() as c:assert c.execute('SELECT state FROM favorite_cleanup_receipts').fetchone()[0]=='unconfirmed'
+
+
+@pytest.mark.asyncio
+async def test_bulk_pause_preserves_progress_and_resumes_without_duplicate(tmp_path):
+    db,owner,items=bulk_fixture(tmp_path,40)
+    class Pausing(BulkFake):
+        async def call(self,*args,**kwargs):
+            answer=await super().call(*args,**kwargs)
+            if len(self.writes)==3:cleanup.control.set_paused(db,'seed',True)
+            return answer
+    api=Pausing(items,db);settings=cleanup.config(db)|{'clear_completed':True}
+    result=await cleanup.clean_account(db,owner,'account',items,settings,api,bulk=True)
+    assert result['state']=='paused' and len(api.writes)==3
+    cleanup.control.set_paused(db,'seed',False)
+    resumed=BulkFake(items,db);resumed.present=api.present
+    await cleanup.clean_account(Database(tmp_path),owner,'account',items,settings,resumed,bulk=True)
+    assert len(api.writes+resumed.writes)==len(set(api.writes+resumed.writes))==40
+    assert not resumed.present
+
+
+@pytest.mark.asyncio
+async def test_bulk_discovery_has_total_timeout(tmp_path):
+    import asyncio
+    db,owner,item=setup(tmp_path)
+    class Hanging:
+        async def call(self,*args,**kwargs):await asyncio.Event().wait()
+    started=time.monotonic()
+    result=await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db)|{'cycle_seconds':.01},Hanging(),bulk=True)
+    assert time.monotonic()-started<1 and result['discovery']['error_type']=='TimeoutError'
+    assert result['checked']==0
