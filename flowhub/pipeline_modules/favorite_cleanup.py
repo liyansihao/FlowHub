@@ -8,11 +8,10 @@ import time
 import httpx
 from pathlib import Path
 from ..maozi import MaoziPublisher
-from ..modules import ModuleError
 from . import control
 from .database_work import run as database_work
 
-DEFAULTS={'enabled':False,'threshold_ratio':0.95,'target_ratio':2/3,'batch_size':1000,'interval_seconds':60,'minimum_age_seconds':3600,'max_checks_per_cycle':32,'cycle_seconds':120}
+DEFAULTS={'enabled':False,'threshold_ratio':0.95,'target_ratio':2/3,'batch_size':1000,'interval_seconds':60,'minimum_age_seconds':3600}
 
 
 def config(db):
@@ -21,7 +20,6 @@ def config(db):
     if not 0<value['target_ratio']<value['threshold_ratio']<=1:raise ValueError('invalid cleanup thresholds')
     if not 1<=value['batch_size']<=1000 or value['interval_seconds']<60 or value['minimum_age_seconds']<0:
         raise ValueError('invalid cleanup bounds')
-    if not 1<=value['max_checks_per_cycle']<=100 or not 1<=value['cycle_seconds']<=300:raise ValueError('invalid cleanup work bounds')
     return value
 
 
@@ -30,30 +28,18 @@ def schema(db):
         c.execute('''CREATE TABLE IF NOT EXISTS favorite_cleanup_receipts(
             account TEXT,favorite_id TEXT,owner TEXT,sku TEXT,state TEXT,body TEXT,updated REAL,
             PRIMARY KEY(account,favorite_id))''')
-        c.execute('''CREATE TABLE IF NOT EXISTS favorite_cleanup_checks(
-            account TEXT,work_key TEXT,last_checked REAL,next_check REAL,reason TEXT,
-            PRIMARY KEY(account,work_key))''')
 
 
 class Client:
-    request_seconds=25
-    def __init__(self,context):
-        self.api=MaoziPublisher(context);self.requests=0;self.retries=0
+    def __init__(self,context):self.api=MaoziPublisher(context)
     async def call(self,path,method='GET',params=None,body=None):
-        # httpx's per-read timeout alone cannot bound a slowly streaming response.
-        async with asyncio.timeout(self.request_seconds):
+        try:
             for attempt in range(2 if method=='GET' else 1):
-                self.requests+=1
                 try:return await self.api.erp(method,path,params=params,body=body)
-                except ValueError as e:raise FavoriteLookupError('invalid ERP response') from e
                 except (httpx.TransportError,TimeoutError):
                     if method!='GET' or attempt:raise
-                    self.retries+=1
                     await asyncio.sleep(1)
-
-
-class FavoriteLookupError(ValueError):
-    pass
+        finally:await asyncio.sleep(.2)
 
 
 def rows(response):return response if isinstance(response,list) else response.get('data',[])
@@ -80,22 +66,6 @@ async def listing(client,should_stop=lambda:False):
     raise ValueError('favorite pagination exceeded')
 
 
-async def exact_favorites(client,sku,should_stop=lambda:False):
-    """The ERP SKU filter includes imported and unimported rows; never infer
-    absence from a global, moving page. Reject ignored filters/truncation."""
-    if await database_work(should_stop):raise CleanupPaused()
-    response=await client.call('/api.product.favorite/lists',params={'sku':sku,'page':1,'page_size':100})
-    if await database_work(should_stop):raise CleanupPaused()
-    batch=rows(response) if isinstance(response,dict) else None
-    total=response.get('total') if isinstance(response,dict) else None
-    if not isinstance(batch,list) or not str(total).isdigit() or int(total)!=len(batch):
-        raise FavoriteLookupError('incomplete exact favorite list')
-    if any(not isinstance(r,dict) or str(r.get('sku'))!=str(sku) or not str(r.get('id','')).isdigit() for r in batch):
-        raise FavoriteLookupError('exact favorite filter/identity mismatch')
-    if len({str(r['id']) for r in batch})!=len(batch):raise FavoriteLookupError('duplicate favorite identity')
-    return response,batch
-
-
 def lineage(product,sku,seller):
     relation=product.get('source_relation') or {}
     return (str(product.get('sku'))==sku and str(product.get('seller_id'))==seller
@@ -108,7 +78,7 @@ def candidates(db,owner,settings):
             JOIN sourcing_products p USING(owner,sku,seller)
             JOIN plugin_routes r USING(owner,sku,seller)
             JOIN stores s ON s.id=r.store_id AND s.owner=q.owner
-            WHERE q.owner=? AND q.state='selling' AND q.due<=? ORDER BY q.due DESC''',
+            WHERE q.owner=? AND q.state='selling' AND q.due<=? ORDER BY q.due''',
             (owner,time.time()-settings['minimum_age_seconds'])).fetchall()
     groups={}
     for r in found:
@@ -118,20 +88,6 @@ def candidates(db,owner,settings):
         groups.setdefault(account,[]).append({'owner':owner,'sku':r['sku'],'seller':r['seller'],
             'offer_id':queue['offer_id'],'context':{'store':{'config':json.loads(r['config']),'credentials':keys}}})
     return groups
-
-
-def pending_contexts(db,owner):
-    # Receipts remain reconcilable even after their product leaves selling.
-    with db.connect() as c:
-        pending={r[0] for r in c.execute("SELECT DISTINCT account FROM favorite_cleanup_receipts WHERE owner=? AND state!='deleted'",(owner,))}
-        stores=c.execute('SELECT config,secret FROM stores WHERE owner=?',(owner,)).fetchall()
-    contexts={}
-    for r in stores:
-        keys=db.open(r['secret'])
-        if not keys.get('erp_token'):continue
-        account=hashlib.sha256((owner+':'+keys['erp_token']).encode()).hexdigest()
-        if account in pending:contexts[account]={'store':{'config':json.loads(r['config']),'credentials':keys}}
-    return contexts
 
 
 def update_receipt(db,account,favorite,state,body):
@@ -193,108 +149,62 @@ def prepare_archive(db,owner,account,item,favorite,online):
         return ('intent',backup) if inserted else ('exists',None)
 
 
-def scheduled_work(db,account,items,prior,settings):
-    """Persist fair rotation; failed/unchanged old products cannot monopolize a cycle."""
-    work={}
-    for r in prior:work['receipt:'+r['favorite_id']]={'kind':'receipt','key':'receipt:'+r['favorite_id'],'row':r}
-    for item in items:work.setdefault('sku:'+item['sku'],{'kind':'candidate','key':'sku:'+item['sku'],'item':item})
-    with db.connect() as c:
-        checks={r['work_key']:r for r in c.execute('SELECT * FROM favorite_cleanup_checks WHERE account=?',(account,))}
-        completed={r['sku']:r['last_at'] for r in c.execute("SELECT sku,max(updated) last_at FROM favorite_cleanup_receipts WHERE account=? AND state='deleted' GROUP BY sku",(account,))}
-    now=time.time()
-    due=[w for k,w in work.items() if k not in checks or checks[k]['next_check']<=now]
-    # Completed receipts are prior observations, not proof of current absence.
-    # New completed publications get service before thousands of archived SKUs.
-    rank={k:i for i,k in enumerate(work)}
-    due.sort(key=lambda w:(checks[w['key']]['last_checked'] if w['key'] in checks else completed.get(w.get('item',{}).get('sku'),0),rank[w['key']]))
-    return due[:settings['max_checks_per_cycle']],len(due)
-
-
-def checked(db,account,key,reason,delay):
-    now=time.time()
-    with db.connect() as c:
-        c.execute('INSERT OR REPLACE INTO favorite_cleanup_checks VALUES(?,?,?,?,?)',
-                  (account,key,now,now+delay,reason))
-
-
-async def reconcile_one(db,account,r,client,stopped):
-    _,remote=await exact_favorites(client,r['sku'],stopped)
-    if r['favorite_id'] in {str(x['id']) for x in remote}:return 'unconfirmed_present'
-    body=db.open(r['body']);body['absence_verified_at']=time.time()
-    await database_work(update_receipt,db,account,r['favorite_id'],'deleted',body)
-    return 'deleted'
-
-
-async def clean_item(db,owner,account,item,settings,client,stopped,budget):
-    sku=item['sku'];header,matches=await exact_favorites(client,sku,stopped)
-    if not settings.get('clear_completed') and not str(header.get('used')).isdigit():raise FavoriteLookupError('account usage required')
-    used=int(header.get('used') or 0);limit=int(header.get('limit') or 0)
-    if budget['remaining'] is None:
-        budget['remaining']=settings['batch_size'] if settings.get('clear_completed') else (min(settings['batch_size'],max(0,used-int(limit*settings['target_ratio']))) if limit>0 and used>=limit*settings['threshold_ratio'] else 0)
-    if budget['remaining']<=0:return 'below_threshold'
-    if len(matches)!=1:return 'favorite_absent' if not matches else 'favorite_ambiguous'
-    favorite=matches[0];fid=str(favorite['id'])
-    if str(favorite.get('is_imported'))!='1':return 'not_imported'
-    old=await database_work(receipt,db,account,fid)
-    if old:return 'receipt_retained'  # Never replay an acknowledged/unknown mutation.
-    shop=item['context']['store']['config']['shop_id'];offer=item['offer_id']
-    data=await client.call('/api.product.online/lists',params={'page':1,'page_size':100,'shop_id':shop,'offer_id':offer})
-    online_rows=rows(data) if isinstance(data,(dict,list)) else None
-    if not isinstance(online_rows,list) or any(not isinstance(r,dict) for r in online_rows):raise FavoriteLookupError('invalid online rows')
-    exact=[r for r in online_rows if str(r.get('shop_id'))==str(shop) and str(r.get('offer_id'))==str(offer)]
-    if len(exact)!=1:return 'online_identity_not_unique'
-    if exact[0].get('online_status')!='selling':return 'not_selling'
-    try:stock=float(exact[0].get('stock') or 0)
-    except (TypeError,ValueError):raise FavoriteLookupError('invalid online stock')
-    if not 0<stock<float('inf'):return 'no_stock'
-    state,backup=await database_work(prepare_archive,db,owner,account,item,favorite,exact[0])
-    if state in ('paused','disabled'):raise CleanupPaused()
-    if state!='intent':return 'archive_'+state
-    budget['remaining']-=1
-    try:
-        backup['response']=await client.call('/api.product.favorite/toggle',method='POST',body={'status':False,'productInfo':favorite|{
-            'sku':sku,'coverImage':favorite.get('cover_image',''),'price_info':{'sell_price':favorite.get('sell_price'),'currency':'CNY'}}})
-    except (httpx.HTTPError,TimeoutError,ModuleError,FavoriteLookupError) as e:
-        backup['error_type']=type(e).__name__
-        await database_work(update_receipt,db,account,fid,'unconfirmed',backup)
-        # A lost acknowledgement permits a read, never a second mutation.
-    else:await database_work(update_receipt,db,account,fid,'acknowledged',backup)
-    r=await database_work(receipt,db,account,fid)
-    return await reconcile_one(db,account,r,client,stopped)
-
-
 async def clean_account(db,owner,account,items,settings,client=None):
     client=client or Client(items[0]['context'])
     def stopped():return control.paused(db,'seed') or not config(db)['enabled']
-    await database_work(schema,db)
+    try:header,remote=await listing(client,stopped)
+    except CleanupPaused:return {'state':'paused','deleted':0,'skipped':0}
+    present={str(r['id']):r for r in remote}
     def previous_receipts():
-        with db.connect() as c:return c.execute("SELECT * FROM favorite_cleanup_receipts WHERE account=? AND state!='deleted'",(account,)).fetchall()
+        with db.connect() as c:return c.execute('SELECT * FROM favorite_cleanup_receipts WHERE account=?',(account,)).fetchall()
     prior=await database_work(previous_receipts)
-    work,due_count=await database_work(scheduled_work,db,account,items,prior,settings)
-    result={'deleted':0,'skipped':0,'checked':0,'due_candidates':due_count,'reasons':{},'max_item_seconds':0}
-    started=time.monotonic();budget={'remaining':None}
-    for w in work:
+    # A timeout is reconciled by absence; a still-present favorite is never blindly deleted again.
+    for r in prior:
+        if r['state']!='deleted' and r['favorite_id'] not in present:
+            body=db.open(r['body']);body['absence_verified_at']=time.time()
+            await database_work(update_receipt,db,account,r['favorite_id'],'deleted',body)
+    used=int(header.get('used',header['total']));limit=int(header.get('limit') or 0)
+    result={'used_before':used,'limit':limit,'deleted':0,'skipped':0}
+    if not settings.get('clear_completed') and (limit<=0 or used<limit*settings['threshold_ratio']):return result|{'state':'below_threshold'}
+    count=min(settings['batch_size'],len(items) if settings.get('clear_completed') else max(0,used-int(limit*settings['target_ratio'])))
+    touched=[]
+    for item in items:
         if await database_work(stopped):return result|{'state':'paused'}
-        if result['deleted']>=settings['batch_size'] or time.monotonic()-started>=settings['cycle_seconds']:break
-        # Reserve rotation before I/O. A crash delays this item, it cannot erase it.
-        await database_work(checked,db,account,w['key'],'checking',60)
-        item_started=time.monotonic()
+        if len(touched)>=count:break
+        sku=item['sku'];matches=[r for r in remote if str(r.get('sku'))==sku]
+        if len(matches)!=1 or str(matches[0].get('is_imported'))!='1':continue
+        favorite=matches[0];fid=str(favorite['id'])
+        if await database_work(receipt,db,account,fid):continue
+        shop=item['context']['store']['config']['shop_id'];offer=item['offer_id']
         try:
-            async with asyncio.timeout(min(40,max(.001,settings['cycle_seconds']-(item_started-started)))):
-                if w['kind']=='receipt':reason=await reconcile_one(db,account,w['row'],client,stopped)
-                else:reason=await clean_item(db,owner,account,w['item'],settings,client,stopped,budget)
+            data=await client.call('/api.product.online/lists',params={'page':1,'page_size':100,'shop_id':shop,'offer_id':offer})
+        except Exception:
+            result['skipped']+=1;continue
+        exact=[r for r in rows(data) if str(r.get('shop_id'))==str(shop) and str(r.get('offer_id'))==str(offer)]
+        if len(exact)!=1 or exact[0].get('online_status')!='selling' or float(exact[0].get('stock') or 0)<=0:
+            result['skipped']+=1;continue
+        state,backup=await database_work(prepare_archive,db,owner,account,item,favorite,exact[0])
+        if state in ('paused','disabled'):return result|{'state':state}
+        if state=='skipped':result['skipped']+=1
+        if state!='intent':continue
+        touched.append(fid)
+        try:
+            backup['response']=await client.call('/api.product.favorite/toggle',method='POST',body={'status':False,'productInfo':favorite|{
+                'sku':sku,'coverImage':favorite.get('cover_image',''),'price_info':{'sell_price':favorite.get('sell_price'),'currency':'CNY'}}})
+            await database_work(update_receipt,db,account,fid,'acknowledged',backup)
+        except Exception as e:
+            backup['error_type']=type(e).__name__;await database_work(update_receipt,db,account,fid,'unconfirmed',backup);break
+    if touched:
+        try:after,remote=await listing(client,stopped)
         except CleanupPaused:return result|{'state':'paused'}
-        except (httpx.HTTPError,TimeoutError,ModuleError,FavoriteLookupError) as e:
-            reason='remote_'+type(e).__name__
-        result['max_item_seconds']=round(max(result['max_item_seconds'],time.monotonic()-item_started),3)
-        result['checked']+=1;result['reasons'][reason]=result['reasons'].get(reason,0)+1
-        if reason=='deleted':
-            result['deleted']+=1
-        else:result['skipped']+=1
-        await database_work(checked,db,account,w['key'],reason,300 if reason!='deleted' else 3600)
-    if await database_work(stopped):return result|{'state':'paused'}
-    return result|{'state':'cleaned' if result['deleted'] else ('below_threshold' if result['reasons'] and set(result['reasons'])=={'below_threshold'} else 'no_safe_candidates'),
-                   'duration_seconds':round(time.monotonic()-started,3),'requests':getattr(client,'requests',None),'read_retries':getattr(client,'retries',None)}
+        remaining={str(r['id']) for r in remote}
+        for fid in touched:
+            if fid in remaining:continue
+            r=await database_work(receipt,db,account,fid)
+            backup=db.open(r['body']);backup['absence_verified_at']=time.time()
+            await database_work(update_receipt,db,account,fid,'deleted',backup);result['deleted']+=1
+        result['used_after']=after.get('used',after['total'])
+    return result|{'state':'cleaned' if result['deleted'] else 'no_safe_candidates'}
 
 
 async def tick(db):
@@ -309,13 +219,10 @@ async def tick(db):
         owners=await database_work(active_owners)
         results=[]
         for owner in owners:
-            groups=await database_work(candidates,db,owner,settings)
-            contexts=await database_work(pending_contexts,db,owner)
-            for account in sorted(set(groups)|set(contexts)):
-                items=groups.get(account,[])
+            for account,items in (await database_work(candidates,db,owner,settings)).items():
                 if await database_work(control.paused,db,'seed') or not config(db)['enabled']:return results
                 started=time.time()
-                try:result=await clean_account(db,owner,account,items,settings,Client(items[0]['context'] if items else contexts[account]))
+                try:result=await clean_account(db,owner,account,items,settings)
                 except Exception as e:result={'state':'error','error_type':type(e).__name__,'reason':str(e)[:160] if isinstance(e,ValueError) else type(e).__name__}
                 await database_work(control.record,db,'seed',owner,'',started,'favorite_cleanup',result);results.append(result)
         return results
