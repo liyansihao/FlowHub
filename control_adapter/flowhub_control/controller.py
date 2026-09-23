@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import subprocess
 import time
+from contextlib import closing
 from pathlib import Path
 
 PRODUCTION = Path('/Users/mac/Desktop/ozon/FlowHub')
@@ -65,6 +66,8 @@ class Controller:
         health['state_version'] = state_version(health)
         health['controls_enabled'] = self.enabled
         health['queue_counts'] = {r['state']:r['n'] for r in self.reader.query('SELECT state,count(*) n FROM plugin_pipeline GROUP BY state')}
+        health['pending_task_count'] = sum(n for state,n in health['queue_counts'].items() if state in ('needs_fields','needs_review','publishing','awaiting_remote','delisting'))
+        health['pending_definition'] = 'needs_fields,needs_review,publishing,awaiting_remote,delisting; quarantined reported separately'
         health['stop_capability'] = 'drain_then_require_attention_without_core_quiescence_barrier'
         return health
 
@@ -75,7 +78,7 @@ class Controller:
         if intent is None:
             intent = {'before': original, 'updated': self.clock(), 'command_id': command_id}
             self.store.put('owned_pause', intent)  # durable before production side effect
-        with sqlite3.connect(self.reader.data/'flowhub.sqlite3', timeout=.25) as c:
+        with closing(sqlite3.connect((self.reader.data/'flowhub.sqlite3').resolve().as_uri()+'?mode=rw', uri=True, timeout=.25)) as c, c:
             c.execute('BEGIN IMMEDIATE')
             row = c.execute("SELECT paused,updated FROM pipeline_module_control WHERE module='seed'").fetchone()
             current = {'paused': bool(row[0]), 'updated': row[1]} if row else {'paused': False, 'updated': None}
@@ -94,7 +97,7 @@ class Controller:
         resume_stamp = intent.get('resume_updated') or self.clock()
         intent['resume_updated'] = resume_stamp
         self.store.put('owned_pause', intent)
-        with sqlite3.connect(self.reader.data/'flowhub.sqlite3', timeout=.25) as c:
+        with closing(sqlite3.connect((self.reader.data/'flowhub.sqlite3').resolve().as_uri()+'?mode=rw', uri=True, timeout=.25)) as c, c:
             c.execute('BEGIN IMMEDIATE')
             changed=c.execute("UPDATE pipeline_module_control SET paused=0,updated=? WHERE module='seed' AND paused=1 AND updated=?",(resume_stamp,intent['updated'])).rowcount
             if changed != 1: raise ValueError('resume_conflict')
