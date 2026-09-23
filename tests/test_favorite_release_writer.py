@@ -84,7 +84,7 @@ async def test_batch_records_sqlite_location_and_stops_instead_of_expanding(tmp_
     (db.directory/'runtime-worker.json').write_text(json.dumps({'identity':{'pid':os.getpid(),'source_revision':'v'}}))
     request={'enabled':True,'batch_id':'b','revision':'v','max_deletes':20,'seconds':30,'items':[{'sku':'1','favorite_id':'7','source_key':'source'},{'sku':'2','favorite_id':'8','source_key':'other'}]}
     (db.directory/'favorite-release-request.json').write_text(json.dumps(request));api=Fake();calls=[]
-    monkeypatch.setattr(batch,'context',lambda db,item:(item,api,{}))
+    monkeypatch.setattr(batch,'context',lambda db,item,proxy=None:(item,api,{}))
     async def fail(*args):calls.append(1);raise sqlite3.OperationalError('test busy')
     monkeypatch.setattr(batch,'execute_one',fail)
     await batch.tick(db);await batch.tick(db)
@@ -99,7 +99,7 @@ async def test_batch_bound_and_completed_request_never_repeat(tmp_path,monkeypat
     (db.directory/'runtime-worker.json').write_text(json.dumps({'identity':{'pid':os.getpid(),'source_revision':'v'}}))
     request={'enabled':True,'batch_id':'bounded','revision':'v','max_deletes':2,'seconds':30,'items':[{'sku':str(i),'favorite_id':str(i),'source_key':str(i)} for i in range(4)]}
     (db.directory/'favorite-release-request.json').write_text(json.dumps(request));api=Fake();calls=[]
-    monkeypatch.setattr(batch,'context',lambda db,item:(item,api,{}))
+    monkeypatch.setattr(batch,'context',lambda db,item,proxy=None:(item,api,{}))
     async def deleted(db,item,*args):calls.append(item['sku']);return {'state':'deleted'}
     monkeypatch.setattr(batch,'execute_one',deleted)
     assert await batch.tick(db)
@@ -107,3 +107,11 @@ async def test_batch_bound_and_completed_request_never_repeat(tmp_path,monkeypat
     assert calls==['0','1']
     state=json.loads((db.directory/'favorite-release-batch-bounded.json').read_text())
     assert state['state']=='finished' and len(state['records'])==2
+
+
+def test_batch_proxy_is_explicit_loopback_only():
+    from flowhub.pipeline_modules.favorite_release_batch import validate_proxy
+    assert validate_proxy(None) is None
+    assert validate_proxy('http://127.0.0.1:7897')=='http://127.0.0.1:7897'
+    for value in ('http://external.example:7897','http://user:secret@127.0.0.1:7897','http://127.0.0.1:7897/x','http://localhost:7897'):
+        with pytest.raises(ValueError):validate_proxy(value)

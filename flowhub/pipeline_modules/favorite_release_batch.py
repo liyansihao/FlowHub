@@ -10,6 +10,7 @@ import os
 import sqlite3
 import time
 import traceback
+from urllib.parse import urlsplit
 from pathlib import Path
 from .database_work import read
 from .favorite_cleanup import Client
@@ -24,7 +25,16 @@ def persist(path, value):
     os.replace(temporary,path)
 
 
-def context(db,item):
+def validate_proxy(value):
+    if value is None:return None
+    parsed=urlsplit(value)
+    if (parsed.scheme!='http' or parsed.hostname not in ('127.0.0.1','::1') or not parsed.port
+        or parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment):
+        raise ValueError('only an explicit local proxy may be selected for this batch')
+    return value
+
+
+def context(db,item,loopback_proxy=None):
     with db.connect() as c:
         pubs=[json.loads(r[0]) for r in c.execute('SELECT body FROM plugin_publications WHERE sku=?',(item['sku'],))]
         stores={r['id']:dict(r) for r in c.execute('SELECT * FROM stores')}
@@ -42,6 +52,7 @@ def context(db,item):
         keys=db.open(st['secret'])
         if p['owner']!=owner or keys.get('erp_token')!=token:return None
         cfg=json.loads(st['config'])
+        if loopback_proxy is not None:cfg['erp_proxy']=validate_proxy(loopback_proxy)
         contexts[p['store_id']]={'client':Client({'store':{'config':cfg,'credentials':keys}}),'shop_id':cfg['shop_id']}
     return item|{'account':hashlib.sha256((owner+':'+token).encode()).hexdigest()},contexts[pubs[0]['store_id']]['client'],contexts
 
@@ -57,6 +68,7 @@ async def tick(db):
     if not request_path.exists():return False
     request=json.loads(request_path.read_text())
     if not request.get('enabled'):return False
+    proxy=validate_proxy(request.get('loopback_proxy'))
     batch=request['batch_id']
     if not batch or any(ch not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for ch in batch):raise ValueError('invalid batch id')
     if not 1<=request['max_deletes']<=1000 or not 1<=len(request['items'])<=1000 or not 1<=request['seconds']<=1800:raise ValueError('invalid batch bounds')
@@ -72,7 +84,7 @@ async def tick(db):
         if not fresh.get('enabled') or fresh['batch_id']!=batch:return False
         started=time.time();client=None
         try:
-            prepared=await read(context,db,item)
+            prepared=await read(context,db,item,proxy)
             if prepared is None:result={'state':'protected','reason':'account_identity'}
             else:
                 item,client,contexts=prepared
