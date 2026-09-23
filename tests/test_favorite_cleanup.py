@@ -262,3 +262,31 @@ def test_evidence_product_index_preserves_all_archive_evidence(tmp_path):
         assert 'sourcing_evidence_product' in plan and 'sku=?' in plan
         backup=cleanup.archive(db,c,item,{'id':7},{})
     assert backup['evidence']==expected
+
+@pytest.mark.asyncio
+async def test_unrelated_favorite_churn_does_not_abort_exact_cleanup(tmp_path):
+    db,owner,item=setup(tmp_path)
+    class Churn(Fake):
+        calls=0
+        async def call(self,path,**kwargs):
+            r=await super().call(path,**kwargs)
+            if path.endswith('favorite/lists'):
+                assert kwargs['params']['sku']=='123'
+                self.calls+=1;r['used']=3000-self.calls
+            return r
+    api=Churn(db=db)
+    result=await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db)|{'clear_completed':True},api)
+    assert result['deleted']==1 and api.writes==1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('bad',['ignored_filter','truncated','duplicate_identity'])
+async def test_exact_query_never_proves_absence_from_invalid_results(bad):
+    class Bad:
+        async def call(self,*args,**kwargs):
+            data=[{'id':7,'sku':'123'}];total=1
+            if bad=='ignored_filter':data[0]['sku']='456'
+            if bad=='truncated':total=2
+            if bad=='duplicate_identity':data=data*2;total=2
+            return {'total':total,'data':data}
+    with pytest.raises(ValueError):await cleanup.exact_favorites(Bad(),'123')

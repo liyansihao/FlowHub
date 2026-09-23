@@ -66,6 +66,22 @@ async def listing(client,should_stop=lambda:False):
     raise ValueError('favorite pagination exceeded')
 
 
+async def exact_favorites(client,sku,should_stop=lambda:False):
+    """The ERP SKU filter includes imported and unimported rows; never infer
+    absence from a global, moving page. Reject ignored filters/truncation."""
+    if await database_work(should_stop):raise CleanupPaused()
+    response=await client.call('/api.product.favorite/lists',params={'sku':sku,'page':1,'page_size':100})
+    if await database_work(should_stop):raise CleanupPaused()
+    batch=rows(response) if isinstance(response,dict) else None
+    total=response.get('total') if isinstance(response,dict) else None
+    if not isinstance(batch,list) or not str(total).isdigit() or int(total)!=len(batch):
+        raise ValueError('incomplete exact favorite list')
+    if any(str(r.get('sku'))!=str(sku) or not str(r.get('id','')).isdigit() for r in batch):
+        raise ValueError('exact favorite filter/identity mismatch')
+    if len({str(r['id']) for r in batch})!=len(batch):raise ValueError('duplicate favorite identity')
+    return response,batch
+
+
 def lineage(product,sku,seller):
     relation=product.get('source_relation') or {}
     return (str(product.get('sku'))==sku and str(product.get('seller_id'))==seller
@@ -152,17 +168,18 @@ def prepare_archive(db,owner,account,item,favorite,online):
 async def clean_account(db,owner,account,items,settings,client=None):
     client=client or Client(items[0]['context'])
     def stopped():return control.paused(db,'seed') or not config(db)['enabled']
-    try:header,remote=await listing(client,stopped)
-    except CleanupPaused:return {'state':'paused','deleted':0,'skipped':0}
-    present={str(r['id']):r for r in remote}
     def previous_receipts():
-        with db.connect() as c:return c.execute('SELECT * FROM favorite_cleanup_receipts WHERE account=?',(account,)).fetchall()
+        with db.connect() as c:return c.execute("SELECT * FROM favorite_cleanup_receipts WHERE account=? AND state!='deleted'",(account,)).fetchall()
     prior=await database_work(previous_receipts)
-    # A timeout is reconciled by absence; a still-present favorite is never blindly deleted again.
+    # Reconcile each original identity even if its product is no longer selling.
     for r in prior:
-        if r['state']!='deleted' and r['favorite_id'] not in present:
+        try:_,remote=await exact_favorites(client,r['sku'],stopped)
+        except CleanupPaused:return {'state':'paused','deleted':0,'skipped':0}
+        if r['favorite_id'] not in {str(x['id']) for x in remote}:
             body=db.open(r['body']);body['absence_verified_at']=time.time()
             await database_work(update_receipt,db,account,r['favorite_id'],'deleted',body)
+    try:header,_=await exact_favorites(client,items[0]['sku'],stopped)
+    except CleanupPaused:return {'state':'paused','deleted':0,'skipped':0}
     used=int(header.get('used',header['total']));limit=int(header.get('limit') or 0)
     result={'used_before':used,'limit':limit,'deleted':0,'skipped':0}
     if not settings.get('clear_completed') and (limit<=0 or used<limit*settings['threshold_ratio']):return result|{'state':'below_threshold'}
@@ -171,7 +188,9 @@ async def clean_account(db,owner,account,items,settings,client=None):
     for item in items:
         if await database_work(stopped):return result|{'state':'paused'}
         if len(touched)>=count:break
-        sku=item['sku'];matches=[r for r in remote if str(r.get('sku'))==sku]
+        sku=item['sku']
+        try:_,matches=await exact_favorites(client,sku,stopped)
+        except CleanupPaused:return result|{'state':'paused'}
         if len(matches)!=1 or str(matches[0].get('is_imported'))!='1':continue
         favorite=matches[0];fid=str(favorite['id'])
         if await database_work(receipt,db,account,fid):continue
@@ -194,13 +213,11 @@ async def clean_account(db,owner,account,items,settings,client=None):
             await database_work(update_receipt,db,account,fid,'acknowledged',backup)
         except Exception as e:
             backup['error_type']=type(e).__name__;await database_work(update_receipt,db,account,fid,'unconfirmed',backup);break
-    if touched:
-        try:after,remote=await listing(client,stopped)
+    for fid in touched:
+        r=await database_work(receipt,db,account,fid)
+        try:after,remote=await exact_favorites(client,r['sku'],stopped)
         except CleanupPaused:return result|{'state':'paused'}
-        remaining={str(r['id']) for r in remote}
-        for fid in touched:
-            if fid in remaining:continue
-            r=await database_work(receipt,db,account,fid)
+        if fid not in {str(x['id']) for x in remote}:
             backup=db.open(r['body']);backup['absence_verified_at']=time.time()
             await database_work(update_receipt,db,account,fid,'deleted',backup);result['deleted']+=1
         result['used_after']=after.get('used',after['total'])
