@@ -95,13 +95,19 @@ async def execute_one(db,item,client,contexts,archive_directory):
     Caller never retries a deletion on missing acknowledgement.
     """
     import os
+    from .database_work import run as write_unit, read as read_unit
+    runtime=Path(db.directory)/'runtime-worker.json'
+    if runtime.exists() and json.loads(runtime.read_text())['identity']['pid']!=os.getpid():
+        raise RuntimeError('favorite release must use the production worker writer queue')
     from .favorite_cleanup import exact_favorites, rows
     with source_guard(db.directory,item['sku']):
-        with db.connect() as c:
-            schema(c)
-            if c.execute('SELECT 1 FROM favorite_release_certificates WHERE account=? AND favorite_id=?',
-                         (item['account'],item['favorite_id'])).fetchone():return {'state':'prior_intent_protected'}
-        reason,proof=local_proof(db,item)
+        def initialize():
+            with db.connect() as c:
+                schema(c)
+                return bool(c.execute('SELECT 1 FROM favorite_release_certificates WHERE account=? AND favorite_id=?',
+                            (item['account'],item['favorite_id'])).fetchone())
+        if await write_unit(initialize):return {'state':'prior_intent_protected'}
+        reason,proof=await read_unit(local_proof,db,item)
         if reason!='eligible_for_remote_proof':return {'state':'protected','reason':reason}
         _,favorites=await exact_favorites(client,item['sku'])
         if len(favorites)!=1 or str(favorites[0]['id'])!=item['favorite_id']:return {'state':'protected','reason':'remote_identity'}
@@ -117,25 +123,39 @@ async def execute_one(db,item,client,contexts,archive_directory):
             if len(exact)!=1 or exact[0].get('online_status')!='selling' or not math.isfinite(stock) or stock<=0:
                 return {'state':'protected','reason':'online_not_verified'}
             online.append(exact[0])
-        reason,latest=local_proof(db,item)
+        reason,latest=await read_unit(local_proof,db,item)
         if reason!='eligible_for_remote_proof' or latest['source_updated']!=proof['source_updated']:
             return {'state':'protected','reason':'dependency_changed'}
         proof=latest|{'favorite':favorites[0],'fresh_independent_draft':detail,'online':online,
                      'release_basis':'all recorded SKU publications verified; no other consumer; retain independent draft for existing freshness/reprocessing path',
                      'business_revision':item['business_revision']}
-        archive_directory=Path(archive_directory);archive_directory.mkdir(parents=True,exist_ok=True,mode=0o700)
-        encoded=json.dumps(proof,sort_keys=True).encode();digest=hashlib.sha256(encoded).hexdigest();path=archive_directory/(digest+'.json')
-        with path.open('xb') as f:f.write(encoded);f.flush();os.fsync(f.fileno())
-        directory_fd=os.open(archive_directory,os.O_RDONLY)
-        try:os.fsync(directory_fd)
-        finally:os.close(directory_fd)
-        proof['archive_path']=str(path);proof['archive_sha256']=digest
-        with db.connect() as c:
-            c.execute('BEGIN IMMEDIATE')
-            if c.execute('SELECT 1 FROM draft_cleanup_receipts WHERE draft_id=?',(str(proof['source']['draft_id']),)).fetchone():
-                return {'state':'protected','reason':'draft_deletion_race'}
-            c.execute('INSERT INTO favorite_release_certificates VALUES(?,?,?,?,?,?,?,?)',
-                      (item['account'],item['favorite_id'],item['sku'],item['source_key'],str(proof['source']['draft_id']),'intent',db.seal(proof),time.time()))
+        def archive():
+            directory=Path(archive_directory);directory.mkdir(parents=True,exist_ok=True,mode=0o700)
+            encoded=json.dumps(proof,sort_keys=True).encode();digest=hashlib.sha256(encoded).hexdigest();path=directory/(digest+'.json')
+            fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+            with os.fdopen(fd,'wb') as f:f.write(encoded);f.flush();os.fsync(f.fileno())
+            directory_fd=os.open(directory,os.O_RDONLY)
+            try:os.fsync(directory_fd)
+            finally:os.close(directory_fd)
+            return str(path),digest
+        archive_path,digest=await read_unit(archive)
+        proof['archive_path']=archive_path;proof['archive_sha256']=digest
+        sealed=await read_unit(db.seal,proof)
+        def reserve():
+            with db.connect() as c:
+                c.execute('BEGIN IMMEDIATE')
+                if c.execute('SELECT 1 FROM draft_cleanup_receipts WHERE draft_id=?',(str(proof['source']['draft_id']),)).fetchone():return False
+                c.execute('INSERT INTO favorite_release_certificates VALUES(?,?,?,?,?,?,?,?)',
+                          (item['account'],item['favorite_id'],item['sku'],item['source_key'],str(proof['source']['draft_id']),'intent',sealed,time.time()))
+            return True
+        if not await write_unit(reserve):return {'state':'protected','reason':'draft_deletion_race'}
+        async def record(state):
+            sealed=await read_unit(db.seal,proof)
+            def persist():
+                with db.connect() as c:
+                    c.execute('UPDATE favorite_release_certificates SET state=?,proof=?,updated=? WHERE account=? AND favorite_id=?',
+                              (state,sealed,time.time(),item['account'],item['favorite_id']))
+            await write_unit(persist)
         # Pin persists even after timeout/crash. Never drop it or replay this ID.
         favorite=favorites[0]
         state='acknowledged'
@@ -144,9 +164,7 @@ async def execute_one(db,item,client,contexts,archive_directory):
                 'sku':item['sku'],'coverImage':favorite.get('cover_image',''),'price_info':{'sell_price':favorite.get('sell_price'),'currency':'CNY'}}})
         except Exception as error:
             state='uncertain';proof['error_type']=type(error).__name__
-        with db.connect() as c:
-            c.execute('UPDATE favorite_release_certificates SET state=?,proof=?,updated=? WHERE account=? AND favorite_id=?',
-                      (state,db.seal(proof),time.time(),item['account'],item['favorite_id']))
+        await record(state)
         # Lost acknowledgements allow reads only, and do not block the next SKU.
         try:
             _,present=await exact_favorites(client,item['sku'])
@@ -156,7 +174,5 @@ async def execute_one(db,item,client,contexts,archive_directory):
             elif not isinstance(after,dict) or not after.get('skus'):
                 state='dependent_draft_check_failed'
         except Exception as error:proof['readback_error_type']=type(error).__name__
-        with db.connect() as c:
-            c.execute('UPDATE favorite_release_certificates SET state=?,proof=?,updated=? WHERE account=? AND favorite_id=?',
-                      (state,db.seal(proof),time.time(),item['account'],item['favorite_id']))
+        await record(state)
         return {'state':state,'sku':item['sku'],'favorite_id':item['favorite_id'],'draft_id':str(proof['source']['draft_id']),'archive_sha256':digest}
