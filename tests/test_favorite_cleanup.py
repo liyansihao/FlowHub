@@ -290,3 +290,27 @@ async def test_exact_query_never_proves_absence_from_invalid_results(bad):
             if bad=='duplicate_identity':data=data*2;total=2
             return {'total':total,'data':data}
     with pytest.raises(ValueError):await cleanup.exact_favorites(Bad(),'123')
+
+@pytest.mark.asyncio
+async def test_fair_rotation_survives_new_database_handle(tmp_path):
+    db,owner,item=setup(tmp_path)
+    items=[item|{'sku':str(i)} for i in range(100,140)]
+    class Absent:
+        def __init__(self):self.seen=[]
+        async def call(self,path,**kw):
+            self.seen.append(kw['params']['sku'])
+            return {'total':0,'data':[],'used':3000,'limit':3000}
+    api=Absent();settings=cleanup.config(db)|{'max_checks_per_cycle':10}
+    for _ in range(4):
+        await cleanup.clean_account(Database(tmp_path),owner,'account',items,settings,api)
+    assert len(api.seen)==40 and len(set(api.seen))==40
+    assert set(api.seen)=={x['sku'] for x in items}
+
+@pytest.mark.asyncio
+async def test_unconfirmed_receipt_reconciled_without_candidate(tmp_path):
+    db,owner,item=setup(tmp_path);api=Fake('unknown_present',db)
+    await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
+    api.present=False
+    await cleanup.clean_account(db,owner,'account',[],cleanup.config(db),api)
+    assert api.writes==1
+    with db.connect() as c:assert c.execute('SELECT state FROM favorite_cleanup_receipts').fetchone()[0]=='deleted'
