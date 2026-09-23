@@ -31,6 +31,13 @@ class Worker:
         return data
 
     async def call(self, job, kind, operation):
+        if kind == "publisher" and operation in ("prepare", "publish"):
+            from .pipeline_modules.favorite_release import source_guard
+            with source_guard(self.db.directory,job["source_key"]):
+                return await self._guarded_call(job,kind,operation)
+        return await self._guarded_call(job,kind,operation)
+
+    async def _guarded_call(self, job, kind, operation):
         context = self.context(job)
         if kind != "publisher":
             context.pop("store", None)

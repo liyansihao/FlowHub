@@ -89,7 +89,7 @@ async def advance(db, owner, sku, seller):
     # Exclusive maintenance locks can drain all operations. Independent stores
     # proceed concurrently; one SKU or one target store can never overlap.
     import hashlib
-    locks=[]
+    locks=[];guard=None
     try:
         maintenance=(DATA/'plugin-publication.lock').open('a');locks.append(maintenance)
         fcntl.flock(maintenance,fcntl.LOCK_SH|fcntl.LOCK_NB)
@@ -102,6 +102,9 @@ async def advance(db, owner, sku, seller):
         for key in ('sku:'+sku,'store:'+str(target)):
             handle=(directory/(hashlib.sha256(key.encode()).hexdigest()+'.lock')).open('a');locks.append(handle)
             fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        from .pipeline_modules.favorite_release import source_guard
+        guard=source_guard(db.directory,sku)
+        guard.__enter__()
         from .follow_publication import selected
         if selected(db,(owner,sku,seller)):
             return await _advance(db,owner,sku,seller,native_follow=True)
@@ -110,6 +113,7 @@ async def advance(db, owner, sku, seller):
         if official is not None:return official
         return await _advance(db,owner,sku,seller)
     finally:
+        if guard is not None:guard.__exit__(None,None,None)
         for handle in reversed(locks):handle.close()
 
 

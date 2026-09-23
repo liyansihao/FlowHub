@@ -584,6 +584,11 @@ class Acquisition:
             raise ValueError("invalid_acquisition_stage")
 
     async def tick(self):
+        from .pipeline_modules.favorite_release import source_guard
+        with source_guard(self.db.directory,self.s.sku,busy=AcquisitionPending):
+            return await self._guarded_tick()
+
+    async def _guarded_tick(self):
         await asyncio.to_thread(self.claim)
         heartbeat = asyncio.create_task(self.renew())
         try:

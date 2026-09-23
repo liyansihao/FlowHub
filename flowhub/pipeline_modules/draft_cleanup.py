@@ -199,6 +199,8 @@ async def clean_account(db,owner,account,items,settings,client=None):
                 'at':time.time(),'source_record':item['source_record'],'scope':'source draft only'}
         with db.connect() as c:
             c.execute('BEGIN IMMEDIATE')
+            from .favorite_release import draft_retained
+            if draft_retained(c,draft):continue
             q=c.execute('SELECT state,body FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?',(owner,sku,item['seller'])).fetchone()
             if not q or q['state']!='selling' or json.loads(q['body']).get('offer_id')!=offer:continue
             if c.execute('SELECT 1 FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=? AND expires>?',(owner,sku,item['seller'],time.time())).fetchone():continue

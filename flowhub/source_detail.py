@@ -232,7 +232,9 @@ class SourceCollector:
         from .acquisition import enabled, enrolled, dispatch
         if enabled(self.db,self.sku) or enrolled(self.db,self.key):
             return await dispatch(self)
-        return await self.collect_legacy()
+        from .pipeline_modules.favorite_release import source_guard
+        with source_guard(self.db.directory,self.sku):
+            return await self.collect_legacy()
 
     async def collect_legacy(self):
         # Claim once per source/account. A crashed collecting call is not repeated blindly.
