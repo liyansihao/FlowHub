@@ -120,6 +120,9 @@ class SourceCollector:
                 "INSERT OR REPLACE INTO source_details VALUES(?,?,?,?)",
                 (self.key, state, self.db.seal(data), time.time()),
             )
+            from .pipeline_modules.favorite_shadow import record_business_state
+            record_business_state(db, 'source:'+self.key, state, time.time(),
+                                  favorite_id=data.get('favorite_id'))
 
     def renew_claim(self):
         # A paginated lookup can outlive the lease. Only its current owner may continue.

@@ -225,6 +225,10 @@ class Acquisition:
                 "UPDATE acquisition_tasks SET body=?,updated=? WHERE key=? AND token=? AND version=?",
                 (self.db.seal(self.work), now, self.key, self.token, self.version),
             )
+            from .pipeline_modules.favorite_shadow import record_business_state
+            record_business_state(c, 'acquisition:'+self.key, self.work['stage'],
+                                  str(self.version)+':'+str(now),
+                                  favorite_id=self.work.get('data',{}).get('favorite_id'))
             c.execute(
                 "INSERT INTO acquisition_events VALUES(NULL,?,?,?,?,?)",
                 (
