@@ -12,6 +12,7 @@ evaluate = ReviewModule().run
 advance = PublicationModule().run
 from .source_library import SourceLibrary
 from .official_api import OfficialDeferred
+from .pipeline_modules.transport import RemoteReadDeferred
 
 
 def schema(db):
@@ -265,6 +266,11 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
                 delay=readback_delay(body,result['phase'],bool(result.get('verified')),policy['submission_priority'],native_follow=native_follow)
         body.pop('dependency_wait',None)
         if state!='needs_fields':body.pop('error',None)
+    except RemoteReadDeferred as error:
+        # No request was sent: release the SKU lease until its dependency is due.
+        # Preserve the original intent/phase and product failure budget.
+        delay=error.retry_after_seconds;dependency_wait=True
+        body['dependency_wait']=str(error);body.pop('error',None)
     except OfficialDeferred as error:
         delay=max(1,error.until-time.time());body['dependency_wait']=error.reason;dependency_wait=True
     except BlockingIOError:

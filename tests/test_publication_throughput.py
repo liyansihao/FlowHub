@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 from flowhub import plugin_publication  # Load the existing FlowEF adapter path.
-from flowhub.pipeline_modules.transport import StepTransport
+from flowhub.pipeline_modules.transport import StepTransport, RemoteReadDeferred
 from flowhub.pipeline_modules import request_bridge
 from flowef.application.errors import WriteOutcomeUnknown
 
@@ -66,8 +66,9 @@ async def test_network_circuit_does_not_send_extra_reads_or_retry_writes():
     async def handler(r):calls.append(r.method);raise httpx.ConnectTimeout('test')
     t=StepTransport(httpx.MockTransport(handler),namespace='outage')
     async with httpx.AsyncClient(base_url='https://api.maozierp.com',transport=t) as c:
-        for _ in range(4):
+        for _ in range(3):
             with pytest.raises(httpx.TransportError):await c.get('/api.product.online/lists')
+        with pytest.raises(RemoteReadDeferred):await c.get('/api.product.online/lists')
         assert calls==['GET']*3
         with pytest.raises(httpx.TransportError):await c.post('/api.selection.follow/import',json={})
         assert calls==['GET']*3+['POST']
@@ -193,6 +194,6 @@ async def test_local_connection_outage_does_not_disable_healthy_windows_route():
     response=await remote.handle_async_request(httpx.Request('GET',url))
     assert response.status_code==200
     # Remote success must not clear the failing local host's circuit either.
-    with pytest.raises(httpx.ConnectError,match='cooling down'):
+    with pytest.raises(RemoteReadDeferred,match='endpoint recovery'):
         await local.handle_async_request(httpx.Request('GET',url))
     assert calls=={'local':3,'remote':1}

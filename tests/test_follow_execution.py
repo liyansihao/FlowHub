@@ -92,6 +92,7 @@ async def test_connection_backoff_remains_shared_by_account(batch):
     t.transport=httpx.MockTransport(fail)
     for _ in range(3):
         with pytest.raises(httpx.ConnectError):await read(t)
-    with pytest.raises(httpx.ConnectError,match='cooling down'):
+    from flowhub.pipeline_modules.transport import RemoteReadDeferred
+    with pytest.raises(RemoteReadDeferred,match='endpoint recovery'):
         await read(make('2',account='failing-account'),sku='2')
     assert calls==[]

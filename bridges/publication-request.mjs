@@ -3,13 +3,15 @@ import path from 'node:path';
 import readline from 'node:readline';
 import {pathToFileURL} from 'node:url';
 import {channel} from 'node:diagnostics_channel';
+import {connectionErrorDetails} from './connection-error.mjs';
 const root=process.env.FLOWEF_LEGACY_ROOT;
 const {createGloballyPacedMaoziTransport}=await import(pathToFileURL(path.join(root,'ozon-runtime/lib/maozi-transport.mjs')));
 let timing=null;
 const connects=new Map();
 channel('undici:client:beforeConnect').subscribe(({connectParams})=>connects.set(JSON.stringify(connectParams),performance.now()));
-for(const name of ['connected','connectError'])channel('undici:client:'+name).subscribe(({connectParams})=>{
+for(const name of ['connected','connectError'])channel('undici:client:'+name).subscribe(({connectParams,error})=>{
  const start=connects.get(JSON.stringify(connectParams));connects.delete(JSON.stringify(connectParams));
+ if(timing&&error) timing.connection_error=connectionErrorDetails(error);
  if(timing&&start!==undefined){timing.connect_ms+=performance.now()-start;timing.connections++;}
 });
 const api=createGloballyPacedMaoziTransport({token:process.env.MAOZI_ACCESS_TOKEN,

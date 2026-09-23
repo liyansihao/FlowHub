@@ -3,6 +3,14 @@ import asyncio
 from collections import deque
 import time
 import httpx
+from flowef.application.errors import RequestNotSent
+
+
+class RemoteReadDeferred(RequestNotSent):
+    """Endpoint recovery gate declined a read; no network attempt occurred."""
+    def __init__(self, path, retry_after_seconds):
+        self.retry_after_seconds = max(1, retry_after_seconds)
+        super().__init__(f"ERP read deferred during endpoint recovery: {path}")
 
 
 class StepTransport(httpx.AsyncBaseTransport):
@@ -75,10 +83,16 @@ class StepTransport(httpx.AsyncBaseTransport):
             return httpx.Response(result[0],content=result[1],headers=result[2],request=request)
         # Connection failures belong to an execution host, not the shared account.
         circuit_scope=(*scope,self.circuit_namespace)
-        circuit=self.circuits.get(circuit_scope,{})
-        if read and circuit.get('until',0)>start:
-            self.timings.append({'path':path,'seconds':0,'cache_hit':False,'circuit_wait':True})
-            raise httpx.ConnectError('ERP endpoint cooling down after connection failures',request=request)
+        circuit=self.circuits.setdefault(circuit_scope,{'failures':0,'until':0,'probe':False,'epoch':0})
+        probe=False
+        if read and (circuit['until']>start or circuit['probe']):
+            self.timings.append({'path':path,'seconds':0,'cache_hit':False,
+                                 'circuit_wait':True,'request_sent':False})
+            raise RemoteReadDeferred(path, max(1,circuit['until']-start,30 if circuit['probe'] else 0))
+        if read and circuit['failures']>=3:
+            # No await between checking and owning the single recovery probe.
+            circuit['probe']=probe=True
+        epoch=circuit['epoch']
         future=asyncio.get_running_loop().create_future() if coalesce else None
         if future:
             future.add_done_callback(lambda f: None if f.cancelled() else f.exception())
@@ -89,7 +103,8 @@ class StepTransport(httpx.AsyncBaseTransport):
             content=await response.aread()
             metric.update(response.extensions.get('erp_timing',{}))
             if response.status_code in (401,403):self.invalidate('/authentication-failure')
-            self.circuits.pop(circuit_scope,None)
+            if read and epoch==circuit['epoch']:
+                circuit.update(failures=0,until=0)
             if cacheable and response.status_code==200:
                 try:ok=response.json().get('code') in (1,'1')
                 except (ValueError,AttributeError):ok=False
@@ -106,10 +121,14 @@ class StepTransport(httpx.AsyncBaseTransport):
             metric.update(getattr(getattr(self.transport,'bridge',None),'last_timing',{}))
             if read and self.network_failure(error):
                 failures=circuit.get('failures',0)+1
-                self.circuits[circuit_scope]={'failures':failures,'until':time.monotonic()+min(120,30*2**min(failures-3,2)) if failures>=3 else 0}
+                circuit['failures']=failures
+                if failures>=3:
+                    circuit['epoch']+=1
+                    circuit['until']=time.monotonic()+min(120,30*2**min(failures-3,2))
             if future:future.set_exception(error)
             raise
         finally:
+            if probe:circuit['probe']=False
             if future:self.inflight.pop(shared_key,None)
             metric['seconds']=round(time.monotonic()-start,3);self.timings.append(metric)
             self.health_samples.append((time.monotonic(),metric.copy()))
