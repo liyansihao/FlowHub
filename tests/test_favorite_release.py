@@ -101,3 +101,11 @@ async def test_expired_dossier_refresh_after_favorite_release_needs_no_favorite(
     result=await collector.collect()
     assert result['detail']['title']=='fresh from independent draft'
     assert calls==['/api.product.collect/detail']
+
+
+def test_only_exact_completed_publication_mirror_is_non_consuming():
+    p,q,s=sample()
+    job=dict(id='offer',owner='o',source_key='1',store_id='store',phase='selling',lease=None,lease_until=0,external_publication=p[0].copy())
+    assert evaluate(p,q,source=s,favorite_id='7',jobs=[job])=='eligible_for_remote_proof'
+    for change in ({'phase':'reconciling'},{'id':'other'},{'store_id':'other'},{'lease':'active'},{'lease_until':10**12},{'external_publication':{}},{'external_publication':p[0]|{'verified':False}},{'external_publication':p[0]|{'offer_id':'old'}}):
+        assert evaluate(p,q,source=s,favorite_id='7',jobs=[job|change])=='other_consumer'

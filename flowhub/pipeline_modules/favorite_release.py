@@ -38,7 +38,7 @@ def draft_retained(c,draft_id):
 def evaluate(publications, queues, *, source, favorite_id, jobs=(), acquisition=(), leases=(), draft_receipts=(), favorite_receipts=()):
     """Pure fail-closed decision. Caller supplies ALL matching SKU consumers."""
     if not publications or not queues:return 'missing_consumers'
-    if jobs or acquisition:return 'other_consumer'
+    if acquisition:return 'other_consumer'
     if leases:return 'active_lease'
     if draft_receipts:return 'draft_deletion_record'
     if favorite_receipts:return 'prior_favorite_write'
@@ -50,6 +50,16 @@ def evaluate(publications, queues, *, source, favorite_id, jobs=(), acquisition=
     qkeys={(q['owner'],q['sku'],q['seller']):q for q in queues}
     if len(pkeys)!=len(publications) or len(qkeys)!=len(queues) or pkeys.keys()!=qkeys.keys():return 'consumer_identity'
     if any(q['state']!='selling' or q.get('offer_id')!=pkeys[k]['offer_id'] for k,q in qkeys.items()):return 'pipeline_not_complete'
+    # The publisher also writes a terminal jobs projection of the SAME intent.
+    # Only that proven mirror is non-consuming; ordinary legacy jobs stay protected.
+    for job in jobs:
+        if not isinstance(job,dict) or job.get('phase')!='selling' or job.get('lease') or job.get('lease_until',0)>time.time():return 'other_consumer'
+        record=job.get('external_publication',{})
+        key=(record.get('owner'),record.get('sku'),record.get('seller'))
+        publication=pkeys.get(key)
+        if not publication or record.get('phase')!='stock_verified' or record.get('verified') is not True:return 'other_consumer'
+        if any(record.get(k)!=publication.get(k) for k in ('owner','sku','seller','offer_id','store_id')):return 'other_consumer'
+        if (job.get('id'),job.get('owner'),job.get('source_key'),job.get('store_id'))!=(publication['offer_id'],publication['owner'],publication['sku'],publication['store_id']):return 'other_consumer'
     return 'eligible_for_remote_proof'
 
 
@@ -66,13 +76,15 @@ def local_proof(db, item):
         source=db.open(row['body'])|{'state':row['state']}
         if str(source.get('source_key'))!=sku:return 'source_identity',None
         exists=lambda t:bool(c.execute("SELECT 1 FROM sqlite_master WHERE name=?",(t,)).fetchone())
-        jobs=c.execute('SELECT id FROM jobs WHERE source_key=?',(sku,)).fetchall()
+        jobs=[]
+        for r in c.execute('SELECT id,owner,source_key,store_id,phase,lease,lease_until,data FROM jobs WHERE source_key=?',(sku,)):
+            job=dict(r);job['external_publication']=json.loads(job.pop('data')).get('external_publication',{});jobs.append(job)
         acq=c.execute('SELECT task_key FROM acquisition_bindings WHERE sku=?',(sku,)).fetchall() if exists('acquisition_bindings') else []
         leases=c.execute('SELECT token FROM plugin_pipeline_leases WHERE sku=? AND expires>?',(sku,time.time())).fetchall()
         drafts=c.execute('SELECT state FROM draft_cleanup_receipts WHERE draft_id=?',(str(source.get('draft_id')),)).fetchall() if exists('draft_cleanup_receipts') else []
         receipts=c.execute('SELECT state FROM favorite_cleanup_receipts WHERE favorite_id=?',(item['favorite_id'],)).fetchall() if exists('favorite_cleanup_receipts') else []
     reason=evaluate(pubs,qs,source=source,favorite_id=item['favorite_id'],jobs=jobs,acquisition=acq,leases=leases,draft_receipts=drafts,favorite_receipts=receipts)
-    proof={'publications':pubs,'queues':qs,'source':source,'source_updated':row['updated'],'observed':time.time()}
+    proof={'jobs':jobs,'publications':pubs,'queues':qs,'source':source,'source_updated':row['updated'],'observed':time.time()}
     return reason,proof
 
 
