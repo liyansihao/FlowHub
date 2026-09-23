@@ -207,16 +207,27 @@ def scheduled_work(db,account,items,prior,settings):
     # New completed publications get service before thousands of archived SKUs.
     rank={k:i for i,k in enumerate(work)}
     due.sort(key=lambda w:(checks[w['key']]['last_checked'] if w['key'] in checks else completed.get(w.get('item',{}).get('sku'),0),rank[w['key']]))
-    # Reconciliation and new cleanup have independent lanes. An old receipt
-    # backlog cannot consume every slot; neither lane is silently dropped.
-    candidates=[w for w in due if w['kind']=='candidate']
-    receipts=[w for w in due if w['kind']=='receipt']
-    selected=[];ci=ri=0
-    while len(selected)<settings['max_checks_per_cycle'] and (ci<len(candidates) or ri<len(receipts)):
-        for _ in range(3):
-            if ci<len(candidates) and len(selected)<settings['max_checks_per_cycle']:
-                selected.append(candidates[ci]);ci+=1
-        if ri<len(receipts) and len(selected)<settings['max_checks_per_cycle']:
+    # Presence is a scheduling hint, never deletion evidence. Each item still
+    # passes exact remote lookup, publication/stock checks and receipt guards.
+    present_reasons={'not_imported','not_selling','online_identity_not_unique','no_stock','archive_skipped'}
+    present=[];discovery=[];receipts=[]
+    for w in due:
+        if w['kind']=='receipt':receipts.append(w)
+        elif w['key'] in checks and checks[w['key']]['reason'] in present_reasons:present.append(w)
+        else:discovery.append(w)
+    # Two presence checks, one discovery and one reconciliation per round.
+    # Borrow unused candidate slots, retaining the original 3:1 split when
+    # there are no presence observations. All lanes rotate by last_checked.
+    selected=[];pi=di=ri=0
+    limit=settings['max_checks_per_cycle']
+    while len(selected)<limit and (pi<len(present) or di<len(discovery) or ri<len(receipts)):
+        for preferred in ('present','present','discovery'):
+            if len(selected)>=limit:break
+            if pi<len(present) and (preferred=='present' or di>=len(discovery)):
+                selected.append(present[pi]);pi+=1
+            elif di<len(discovery):
+                selected.append(discovery[di]);di+=1
+        if ri<len(receipts) and len(selected)<limit:
             selected.append(receipts[ri]);ri+=1
     return selected,len(due)
 

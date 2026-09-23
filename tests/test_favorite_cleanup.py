@@ -380,3 +380,29 @@ async def test_pending_receipt_backlog_cannot_occupy_all_cleanup_slots(tmp_path)
     more=[item|{'sku':str(200+i)} for i in range(20)]
     work,_=cleanup.scheduled_work(db,'account',more,prior,cleanup.config(db)|{'max_checks_per_cycle':8})
     assert [w['kind'] for w in work]==['candidate','candidate','candidate','receipt']*2
+
+
+def test_present_favorites_are_not_starved_by_unchecked_history(tmp_path):
+    db,owner,item=setup(tmp_path)
+    historical=[item|{'sku':f'old-{i}'} for i in range(4000)]
+    present=[item|{'sku':f'present-{i}'} for i in range(10)]
+    for row in present:cleanup.checked(db,'account','sku:'+row['sku'],'not_imported',-1)
+    prior=[{'favorite_id':str(i),'sku':str(i)} for i in range(85)]
+    settings=cleanup.config(db)|{'max_checks_per_cycle':4}
+    work,count=cleanup.scheduled_work(db,'account',historical+present,prior,settings)
+    assert count==4095
+    assert [w['item']['sku'] for w in work[:3]]==['present-0','present-1','old-0']
+    assert work[3]['kind']=='receipt'
+    for w in work[:2]:cleanup.checked(db,'account',w['key'],'not_selling',300)
+    following,_=cleanup.scheduled_work(db,'account',historical+present,prior,settings)
+    assert [w['item']['sku'] for w in following[:2]]==['present-2','present-3']
+
+
+def test_presence_lane_borrows_empty_discovery_and_respects_due(tmp_path):
+    db,owner,item=setup(tmp_path)
+    items=[item|{'sku':str(i)} for i in range(5)]
+    for row in items:cleanup.checked(db,'account','sku:'+row['sku'],'no_stock',-1)
+    cleanup.checked(db,'account','sku:0','no_stock',300)
+    work,count=cleanup.scheduled_work(db,'account',items,[],cleanup.config(db)|{'max_checks_per_cycle':4})
+    assert count==4
+    assert [w['item']['sku'] for w in work]==['1','2','3','4']
