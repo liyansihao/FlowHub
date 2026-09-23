@@ -62,7 +62,7 @@ POST `commands` requires JSON, exact site Origin, `X-System-Request: 1` and:
 
 Expiry is epoch seconds, future and within 30 minutes. Actions: `start`, `resume`, `pause`, `stop`. `202` means queued only. Commands serialize per deployment. Reuse identical idempotency key/body to recover a lost HTTP response; do not generate a new key as an automatic retry. A stale/disconnected device rejects new commands. An active command remains tracked through agent outages and is reconciled locally.
 
-POST `agent/exchange` is device-only; uses `Authorization: Bearer <SYSTEM_AGENT_TOKEN>`. Never put this token in browser JavaScript. Every observation includes observed/uploaded time, stale and coverage. Startup backfill is bounded and can take several minutes; inspect coverage and upload_pending_after_batch. No data means unknown/partial, not zero failures or confirmed healthy. Product projections include their observation times, and existing archived rows are not silently deleted.
+POST `agent/exchange` is device-only; uses `Authorization: Bearer <SYSTEM_AGENT_TOKEN>`. Never put this token in browser JavaScript. Every observation includes observed/uploaded time, stale and coverage. Startup backfill is bounded and can take several minutes (3-second catch-up interval, 15-second steady interval, capped network backoff); inspect coverage and upload_pending_after_batch. No data means unknown/partial, not zero failures or confirmed healthy. Product projections include their observation times, and existing archived rows are not silently deleted.
 
 ## Exact control limitations
 

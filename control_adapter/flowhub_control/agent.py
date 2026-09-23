@@ -82,7 +82,9 @@ def main():
                 print(json.dumps({'at':time.time(),'error_type':type(e).__name__,'failure_count':failures}),flush=True)
                 if args.once: raise SystemExit(1)
             if args.once: break
-            interval=min(120,15*2**min(failures,3))
+            backfill = not all(store.get(t+':covered_at') for t in ('plugin_pipeline','plugin_publications')) or sum(store.pending_counts().values())>3000
+            # Bounded initial catch-up only; no extra publisher work or API product calls.
+            interval=min(120,(3 if backfill and not failures else 15)*2**min(failures,3))
             time.sleep(max(1,interval-(time.monotonic()-started)))
 
 if __name__=='__main__': main()
