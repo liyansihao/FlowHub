@@ -94,3 +94,14 @@ def test_thousand_candidates_withdraw_without_remote_api(tmp_path):
 async def test_invalid_inventory_fails_closed():
     async def get(page):return {'total':1,'data':[{'id':'bad','sku':'123'}]}
     with pytest.raises(ValueError):await inventory(get)
+
+
+def test_polling_does_not_flood_transition_history(tmp_path):
+    import sqlite3
+    from flowhub.pipeline_modules.favorite_shadow import record_business_state
+    with sqlite3.connect(tmp_path/'business.db') as c:
+        for version in range(100):
+            record_business_state(c,'publication:one','ready',version,favorite_id='7')
+        record_business_state(c,'publication:one','ready',101,favorite_id='8')
+        record_business_state(c,'publication:one','submitting',102,favorite_id='8')
+        assert c.execute('SELECT count(*) FROM favorite_dependency_observations').fetchone()[0]==3

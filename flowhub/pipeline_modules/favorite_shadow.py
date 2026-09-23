@@ -119,5 +119,10 @@ def record_business_state(c, consumer, stage, business_version, *, favorite_id=N
     c.execute('''CREATE TABLE IF NOT EXISTS favorite_dependency_observations(
         id INTEGER PRIMARY KEY,consumer TEXT NOT NULL,stage TEXT NOT NULL,
         business_version TEXT NOT NULL,favorite_id TEXT,observed REAL NOT NULL)''')
+    c.execute('CREATE INDEX IF NOT EXISTS favorite_dependency_consumer ON favorite_dependency_observations(consumer,id)')
+    previous = c.execute('SELECT stage,favorite_id FROM favorite_dependency_observations WHERE consumer=? ORDER BY id DESC LIMIT 1', (consumer,)).fetchone()
+    fid = str(favorite_id) if favorite_id else None
+    if previous and tuple(previous) == (stage, fid):
+        return  # Record transitions, not identical polling observations.
     c.execute('INSERT INTO favorite_dependency_observations(consumer,stage,business_version,favorite_id,observed) VALUES(?,?,?,?,?)',
               (consumer,stage,str(business_version),str(favorite_id) if favorite_id else None,time.time()))
