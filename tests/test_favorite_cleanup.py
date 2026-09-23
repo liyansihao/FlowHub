@@ -129,7 +129,7 @@ async def test_only_reads_retry_transient_connection_failure(monkeypatch):
             self.calls+=1
             if self.calls==1:raise TimeoutError()
             return {}
-    client=cleanup.Client.__new__(cleanup.Client);client.api=API()
+    client=cleanup.Client.__new__(cleanup.Client);client.api=API();client.requests=client.retries=0
     assert await client.call('/read')=={} and client.api.calls==2
     client.api=API()
     with pytest.raises(TimeoutError):await client.call('/write',method='POST')
@@ -314,3 +314,47 @@ async def test_unconfirmed_receipt_reconciled_without_candidate(tmp_path):
     await cleanup.clean_account(db,owner,'account',[],cleanup.config(db),api)
     assert api.writes==1
     with db.connect() as c:assert c.execute('SELECT state FROM favorite_cleanup_receipts').fetchone()[0]=='deleted'
+
+@pytest.mark.asyncio
+async def test_remote_item_failure_does_not_block_next_product(tmp_path):
+    import httpx
+    db,owner,item=setup(tmp_path)
+    class Partial(Fake):
+        async def call(self,path,method='GET',params=None,body=None):
+            if params and params.get('sku')=='100':raise httpx.ConnectTimeout('offline')
+            return await super().call(path,method,params,body)
+    api=Partial(db=db)
+    result=await cleanup.clean_account(db,owner,'account',[item|{'sku':'100'},item],cleanup.config(db),api)
+    assert result['deleted']==1 and result['reasons']['remote_ConnectTimeout']==1
+    assert api.writes==1
+
+@pytest.mark.asyncio
+async def test_hanging_transport_has_total_deadline_and_single_write():
+    import asyncio
+    class Hanging:
+        def __init__(self):self.calls=0
+        async def erp(self,*a,**kw):
+            self.calls+=1
+            await asyncio.Event().wait()
+    client=cleanup.Client.__new__(cleanup.Client)
+    client.api=Hanging();client.requests=client.retries=0;client.request_seconds=.02
+    started=time.monotonic()
+    with pytest.raises(TimeoutError):await client.call('/test',method='POST')
+    assert time.monotonic()-started<.5 and client.api.calls==1
+
+@pytest.mark.asyncio
+async def test_cycle_deadline_retains_unknown_intent_without_replaying(tmp_path):
+    import asyncio
+    db,owner,item=setup(tmp_path)
+    class HangingWrite(Fake):
+        async def call(self,path,method='GET',params=None,body=None):
+            if method=='POST':
+                self.writes+=1
+                await asyncio.Event().wait()
+            return await super().call(path,method,params,body)
+    api=HangingWrite(db=db);settings=cleanup.config(db)|{'cycle_seconds':.05}
+    result=await cleanup.clean_account(db,owner,'account',[item],settings,api)
+    assert result['reasons']['remote_TimeoutError']==1
+    with db.connect() as c:assert c.execute('SELECT state FROM favorite_cleanup_receipts').fetchone()[0]=='intent'
+    await cleanup.clean_account(db,owner,'account',[item],settings,api)
+    assert api.writes==1
