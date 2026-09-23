@@ -85,9 +85,10 @@ async def run(db, *, review_workers=2, submit_workers=2, reconcile_workers=2, se
     from .draft_cleanup import run as draft_cleanup
     from .favorite_cleanup import run as favorite_cleanup
     from .store_capacity import run as capacity_loop
+    from .favorite_release_batch import run as favorite_release
     for name, factory in [('listing_controls',listing_control_loop),('admission',admission_loop),
                           ('source',source_loop),('draft_cleanup',draft_cleanup),
-                          ('favorite_cleanup',favorite_cleanup),('store_capacity',capacity_loop)]:
+                          ('favorite_cleanup',favorite_cleanup),('favorite_release',favorite_release),('store_capacity',capacity_loop)]:
         start(name, lambda factory=factory: factory(db))
     try:
         await asyncio.gather(*tasks)
