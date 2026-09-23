@@ -260,7 +260,7 @@ def test_evidence_product_index_preserves_all_archive_evidence(tmp_path):
         expected=[dict(r) for r in c.execute('SELECT * FROM sourcing_evidence WHERE owner=? AND sku=? ORDER BY hash',(owner,'123'))]
         plan=' '.join(str(tuple(r)) for r in c.execute('EXPLAIN QUERY PLAN SELECT * FROM sourcing_evidence WHERE owner=? AND sku=? ORDER BY hash',(owner,'123')))
         assert 'sourcing_evidence_product' in plan and 'sku=?' in plan
-        backup=cleanup.archive(db,c,item,{'id':7},{})
+        backup=cleanup.archive(db,c,item,{'id':7,'is_imported':1},{})
     assert backup['evidence']==expected
 
 @pytest.mark.asyncio
