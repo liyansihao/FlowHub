@@ -48,6 +48,16 @@ class AdapterTests(unittest.TestCase):
     def pub(self,sku='s',seller='a',verified=True,stamps=(100,200)):
         self.sql('INSERT INTO plugin_publications VALUES(?,?,?,?,?)',('o',sku,seller,json.dumps(dict(backend='maozi_follow',verified=verified,offer_id='offer',started_at=50,events=[{'to':'stock_verified','at':t} for t in stamps])),self.now))
 
+    def test_outbox_fairness_and_uses_available_capacity(self):
+        for i in range(1200):self.store.save('event',str(i),{'id':i})
+        for i in range(800):self.store.save('product',str(i),{'sku':str(i)})
+        self.store.save('success','one',{'verified':True})
+        batch=self.store.batch()
+        self.assertEqual(len(batch),1000)
+        self.assertEqual(len({(r['kind'],r['key']) for r in batch}),1000)
+        self.assertTrue(any(r['kind']=='success' for r in batch))
+        self.assertGreater(sum(r['kind']=='product' for r in batch),150)
+
     def test_reads_cannot_write(self):
         with self.reader.connection() as c:
             with self.assertRaises(sqlite3.OperationalError):c.execute('DELETE FROM health')

@@ -54,6 +54,11 @@ class Store:
             rows=[]
             for kind,limit in [('event',500),('log',50),('product',150),('publication',150),('success',100),('failure',50)]:
                 rows.extend(dict(r) for r in c.execute('SELECT kind,key,body FROM entities WHERE dirty=1 AND kind=? ORDER BY key LIMIT ?', (kind,limit)))
+            for kind in ('product','publication','success','failure','log','event'):
+                remaining = 1000-len(rows)
+                if remaining<=0: break
+                offset = sum(r['kind']==kind for r in rows)
+                rows.extend(dict(r) for r in c.execute('SELECT kind,key,body FROM entities WHERE dirty=1 AND kind=? ORDER BY key LIMIT ? OFFSET ?', (kind,remaining,offset)))
             return rows
 
     def pending_counts(self):

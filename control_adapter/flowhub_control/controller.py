@@ -170,4 +170,4 @@ class Controller:
         except (ValueError, sqlite3.Error, OSError, subprocess.SubprocessError) as e:
             # Whitelist reason, never include paths, raw exception messages or request credentials.
             reason = str(e) if isinstance(e, ValueError) else type(e).__name__
-            return finish('needs_attention', reason)
+            return finish('needs_attention', reason, sqlite_error=getattr(e,'sqlite_errorname',None))
