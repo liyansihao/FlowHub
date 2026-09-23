@@ -358,3 +358,14 @@ async def test_cycle_deadline_retains_unknown_intent_without_replaying(tmp_path)
     with db.connect() as c:assert c.execute('SELECT state FROM favorite_cleanup_receipts').fetchone()[0]=='intent'
     await cleanup.clean_account(db,owner,'account',[item],settings,api)
     assert api.writes==1
+
+@pytest.mark.asyncio
+async def test_historically_cleaned_skus_do_not_delay_new_completed_work(tmp_path):
+    db,owner,item=setup(tmp_path)
+    with db.connect() as c:
+        c.execute('INSERT INTO favorite_cleanup_receipts VALUES(?,?,?,?,?,?,?)',('account','42',owner,'old','deleted',db.seal({}),time.time()-1000))
+    work,count=cleanup.scheduled_work(db,'account',[item|{'sku':'old'},item],[],cleanup.config(db)|{'max_checks_per_cycle':1})
+    assert count==2 and work[0]['item']['sku']=='123'
+    cleanup.checked(db,'account','sku:123','favorite_absent',300)
+    work,count=cleanup.scheduled_work(db,'account',[item|{'sku':'old'},item],[],cleanup.config(db)|{'max_checks_per_cycle':1})
+    assert work[0]['item']['sku']=='old'  # History never permanently removes work.

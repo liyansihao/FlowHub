@@ -45,6 +45,7 @@ class Client:
             for attempt in range(2 if method=='GET' else 1):
                 self.requests+=1
                 try:return await self.api.erp(method,path,params=params,body=body)
+                except ValueError as e:raise FavoriteLookupError('invalid ERP response') from e
                 except (httpx.TransportError,TimeoutError):
                     if method!='GET' or attempt:raise
                     self.retries+=1
@@ -89,7 +90,7 @@ async def exact_favorites(client,sku,should_stop=lambda:False):
     total=response.get('total') if isinstance(response,dict) else None
     if not isinstance(batch,list) or not str(total).isdigit() or int(total)!=len(batch):
         raise FavoriteLookupError('incomplete exact favorite list')
-    if any(str(r.get('sku'))!=str(sku) or not str(r.get('id','')).isdigit() for r in batch):
+    if any(not isinstance(r,dict) or str(r.get('sku'))!=str(sku) or not str(r.get('id','')).isdigit() for r in batch):
         raise FavoriteLookupError('exact favorite filter/identity mismatch')
     if len({str(r['id']) for r in batch})!=len(batch):raise FavoriteLookupError('duplicate favorite identity')
     return response,batch
@@ -107,7 +108,7 @@ def candidates(db,owner,settings):
             JOIN sourcing_products p USING(owner,sku,seller)
             JOIN plugin_routes r USING(owner,sku,seller)
             JOIN stores s ON s.id=r.store_id AND s.owner=q.owner
-            WHERE q.owner=? AND q.state='selling' AND q.due<=? ORDER BY q.due''',
+            WHERE q.owner=? AND q.state='selling' AND q.due<=? ORDER BY q.due DESC''',
             (owner,time.time()-settings['minimum_age_seconds'])).fetchall()
     groups={}
     for r in found:
@@ -199,9 +200,13 @@ def scheduled_work(db,account,items,prior,settings):
     for item in items:work.setdefault('sku:'+item['sku'],{'kind':'candidate','key':'sku:'+item['sku'],'item':item})
     with db.connect() as c:
         checks={r['work_key']:r for r in c.execute('SELECT * FROM favorite_cleanup_checks WHERE account=?',(account,))}
+        completed={r['sku']:r['last_at'] for r in c.execute("SELECT sku,max(updated) last_at FROM favorite_cleanup_receipts WHERE account=? AND state='deleted' GROUP BY sku",(account,))}
     now=time.time()
     due=[w for k,w in work.items() if k not in checks or checks[k]['next_check']<=now]
-    due.sort(key=lambda w:(checks[w['key']]['last_checked'] if w['key'] in checks else 0,w['key']))
+    # Completed receipts are prior observations, not proof of current absence.
+    # New completed publications get service before thousands of archived SKUs.
+    rank={k:i for i,k in enumerate(work)}
+    due.sort(key=lambda w:(checks[w['key']]['last_checked'] if w['key'] in checks else completed.get(w.get('item',{}).get('sku'),0),rank[w['key']]))
     return due[:settings['max_checks_per_cycle']],len(due)
 
 
@@ -234,10 +239,14 @@ async def clean_item(db,owner,account,item,settings,client,stopped,budget):
     if old:return 'receipt_retained'  # Never replay an acknowledged/unknown mutation.
     shop=item['context']['store']['config']['shop_id'];offer=item['offer_id']
     data=await client.call('/api.product.online/lists',params={'page':1,'page_size':100,'shop_id':shop,'offer_id':offer})
-    exact=[r for r in rows(data) if str(r.get('shop_id'))==str(shop) and str(r.get('offer_id'))==str(offer)]
+    online_rows=rows(data) if isinstance(data,(dict,list)) else None
+    if not isinstance(online_rows,list) or any(not isinstance(r,dict) for r in online_rows):raise FavoriteLookupError('invalid online rows')
+    exact=[r for r in online_rows if str(r.get('shop_id'))==str(shop) and str(r.get('offer_id'))==str(offer)]
     if len(exact)!=1:return 'online_identity_not_unique'
     if exact[0].get('online_status')!='selling':return 'not_selling'
-    if float(exact[0].get('stock') or 0)<=0:return 'no_stock'
+    try:stock=float(exact[0].get('stock') or 0)
+    except (TypeError,ValueError):raise FavoriteLookupError('invalid online stock')
+    if not 0<stock<float('inf'):return 'no_stock'
     state,backup=await database_work(prepare_archive,db,owner,account,item,favorite,exact[0])
     if state in ('paused','disabled'):raise CleanupPaused()
     if state!='intent':return 'archive_'+state
@@ -245,7 +254,7 @@ async def clean_item(db,owner,account,item,settings,client,stopped,budget):
     try:
         backup['response']=await client.call('/api.product.favorite/toggle',method='POST',body={'status':False,'productInfo':favorite|{
             'sku':sku,'coverImage':favorite.get('cover_image',''),'price_info':{'sell_price':favorite.get('sell_price'),'currency':'CNY'}}})
-    except (httpx.HTTPError,TimeoutError,ModuleError) as e:
+    except (httpx.HTTPError,TimeoutError,ModuleError,FavoriteLookupError) as e:
         backup['error_type']=type(e).__name__
         await database_work(update_receipt,db,account,fid,'unconfirmed',backup)
         # A lost acknowledgement permits a read, never a second mutation.
