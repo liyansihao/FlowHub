@@ -380,3 +380,33 @@ async def test_pending_receipt_backlog_cannot_occupy_all_cleanup_slots(tmp_path)
     more=[item|{'sku':str(200+i)} for i in range(20)]
     work,_=cleanup.scheduled_work(db,'account',more,prior,cleanup.config(db)|{'max_checks_per_cycle':8})
     assert [w['kind'] for w in work]==['candidate','candidate','candidate','receipt']*2
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('guard',['ok','not_verified','wrong_backend','pending','not_selling','zero_stock','wrong_offer','lost_ack'])
+async def test_official_completed_favorite_does_not_require_erp_import_flag(tmp_path,guard):
+    db,owner,item=setup(tmp_path)
+    with db.connect() as c:
+        publication={'offer_id':'offer','backend':'official','phase':'stock_verified','verified':True}
+        if guard=='not_verified':publication['verified']=False
+        if guard=='wrong_backend':publication['backend']='unknown'
+        if guard=='pending':publication['phase']='submitting'
+        c.execute('UPDATE plugin_publications SET body=?',(json.dumps(publication),))
+    class OfficialFavorite(Fake):
+        async def call(self,path,method='GET',params=None,body=None):
+            response=await super().call(path,method,params,body)
+            if path.endswith('favorite/lists') and response['data']:response['data'][0]['is_imported']=0
+            if path.endswith('online/lists') and guard=='not_selling':response['data'][0]['online_status']='not_selling'
+            return response
+    api=OfficialFavorite({'zero_stock':'no_stock','wrong_offer':'wrong_offer','lost_ack':'lost_ack'}.get(guard,'ok'),db)
+    result=await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
+    assert api.writes==(1 if guard in ('ok','lost_ack') else 0)
+    if api.writes:
+        assert result['deleted']==1
+        with db.connect() as c:r=c.execute('SELECT * FROM favorite_cleanup_receipts').fetchone()
+        archived=db.open(r['body'])
+        assert archived['publication']['backend']=='official'
+        assert archived['favorite']['is_imported']==0
+        assert archived['online']['online_status']=='selling'
+        assert r['state']=='deleted'
+        await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
+        assert api.writes==1

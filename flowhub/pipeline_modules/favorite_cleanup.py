@@ -153,6 +153,13 @@ def archive(db,c,item,favorite,online):
     seeds=[dict(r) for r in c.execute('SELECT * FROM sourcing_seeds WHERE owner=?',(key[0],)) if r['sku'] in root_skus]
     publication=c.execute('SELECT body FROM plugin_publications WHERE owner=? AND sku=? AND seller=?',key).fetchone()
     if not publication or json.loads(publication['body']).get('offer_id')!=item['offer_id']:return None
+    publication_body=json.loads(publication['body'])
+    # Official API publication does not import an ERP favorite. Its immutable
+    # completed intent plus the fresh online identity/stock check is the proof.
+    if str(favorite.get('is_imported'))!='1' and not (
+            publication_body.get('backend')=='official'
+            and publication_body.get('phase')=='stock_verified'
+            and publication_body.get('verified') is True):return None
     backup={'version':1,'at':time.time(),'owner':key[0],'sku':key[1],'seller':key[2],
             'favorite':favorite,'online':online,'product':dict(product),'root_seeds':roots,'seed_records':seeds,
             'publication':json.loads(publication['body']),'pipeline':dict(q),
@@ -245,7 +252,6 @@ async def clean_item(db,owner,account,item,settings,client,stopped,budget):
     if budget['remaining']<=0:return 'below_threshold'
     if len(matches)!=1:return 'favorite_absent' if not matches else 'favorite_ambiguous'
     favorite=matches[0];fid=str(favorite['id'])
-    if str(favorite.get('is_imported'))!='1':return 'not_imported'
     old=await database_work(receipt,db,account,fid)
     if old:return 'receipt_retained'  # Never replay an acknowledged/unknown mutation.
     shop=item['context']['store']['config']['shop_id'];offer=item['offer_id']
