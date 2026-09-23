@@ -81,3 +81,23 @@ async def test_execute_retains_draft_and_never_replays(tmp_path,mode):
     assert r['state']==({'ok':'deleted','lost_ack':'deleted','unknown_present':'uncertain','bad_draft':'protected'}[mode])
     await execute_one(*args)
     assert api.writes==(0 if mode=='bad_draft' else 1)
+
+
+@pytest.mark.asyncio
+async def test_expired_dossier_refresh_after_favorite_release_needs_no_favorite(tmp_path):
+    import time
+    from flowhub.db import Database
+    from flowhub.source_detail import SourceCollector
+    db=Database(tmp_path/'data')
+    context={'owner':'o','candidate':{'source_key':'1'},'store':{'credentials':{'erp_token':'test'}}}
+    collector=SourceCollector(db,context)
+    collector.save('ready',{'source_key':'1','draft_id':8,'favorite_id':7,'detail':{'skus':[{}]},'observed_at':time.time()-30000})
+    calls=[]
+    async def call(path,method='GET',query=None,body=None):
+        calls.append(path)
+        assert path=='/api.product.collect/detail' and query['id']==8
+        return {'skus':[{}],'title':'fresh from independent draft'}
+    collector.call=call
+    result=await collector.collect()
+    assert result['detail']['title']=='fresh from independent draft'
+    assert calls==['/api.product.collect/detail']

@@ -93,3 +93,14 @@ async def test_expired_source_only_recreates_after_confirmed_deletion(tmp_path,d
     else:
         with pytest.raises(Pending):await collector.collect()
         assert not any(m=='POST' for _,m,_ in calls)
+
+
+@pytest.mark.asyncio
+async def test_reset_cannot_delete_retained_favorite_refresh_source(tmp_path):
+    from flowhub.pipeline_modules.favorite_release import schema as release_schema
+    db,ctx=setup(tmp_path);api=API()
+    with db.connect() as c:
+        release_schema(c)
+        c.execute('INSERT INTO favorite_release_certificates VALUES(?,?,?,?,?,?,?,?)',('a','7','123','key','8','deleted','{}',0))
+    result=await clear(db,ctx,api,lambda _:None)
+    assert not result['complete'] and api.writes==0
