@@ -48,9 +48,9 @@ Base `/api/system/v1/`:
 | `status` | worker heartbeat/process, source revision, instance, switches, disk, state version, queue counts |
 | `activity` | live product leases (not a claim of active network work) |
 | `metrics?date=YYYY-MM-DD` | Shanghai daily first verified successes, same-cohort ratio including pending, observed failure transitions, step attempts/durations |
-| `throughput?date=YYYY-MM-DD` | same metrics plus 24 hourly buckets and rolling 60 minutes |
+| `throughput?date=YYYY-MM-DD` or `throughput?from=EPOCH&to=EPOCH` (up to 7 days) | same metrics plus 24 hourly buckets and rolling 60 minutes |
 | `tasks?state=publishing&limit=50&cursor=...` | bounded product-state projection, live aggregate counts |
-| `errors?cursor=0&limit=50` | redacted error events and recent log alerts |
+| `errors?limit=50&cursor=...` (newest first) | redacted error events and recent log alerts |
 | `products/{sku}?seller_id=...` | separate owner/store identities and recent stage events |
 | `commands/{id}` | command and execution receipt |
 

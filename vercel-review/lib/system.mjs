@@ -111,14 +111,20 @@ export async function serveSystem(c,request,env,clock=()=>Date.now()/1000){
    return json({...meta,items,events,event_seller_coverage:'stage_events_do_not_always_include_seller'});
   }
   if(path==='errors'){
-   const cursor=Number(url.searchParams.get('cursor')??0);if(!Number.isFinite(cursor))throw fail('invalid_cursor');
-   const rows=(await q(`SELECT body FROM flowhub_system_entities WHERE deployment=$1 AND kind='event' AND body->>'error_class' IS NOT NULL AND (body->>'id')::bigint>$2 ORDER BY (body->>'id')::bigint LIMIT $3`,[deployment,cursor,limit+1])).rows.map(r=>r.body);
+   const cursor=Number(url.searchParams.get('cursor')??Number.MAX_SAFE_INTEGER);if(!Number.isFinite(cursor))throw fail('invalid_cursor');
+   const rows=(await q(`SELECT body FROM flowhub_system_entities WHERE deployment=$1 AND kind='event' AND body->>'error_class' IS NOT NULL AND (body->>'id')::bigint<$2 ORDER BY (body->>'id')::bigint DESC LIMIT $3`,[deployment,cursor,limit+1])).rows.map(r=>r.body);
    const logs=(await q(`SELECT body FROM flowhub_system_entities WHERE deployment=$1 AND kind='log' ORDER BY received_at DESC LIMIT 20`,[deployment])).rows.map(r=>r.body);
    return json({...meta,items:rows.slice(0,limit),next_cursor:rows.length>limit?String(rows[limit-1].id):null,logs});
   }
   if(path==='metrics'||path==='throughput'){
    if(url.searchParams.get('tz')&&url.searchParams.get('tz')!=='Asia/Shanghai')throw fail('unsupported_timezone');
    const range=dayRange(url.searchParams.get('date')??undefined,now);
+   if(path==='throughput'&&(url.searchParams.has('from')||url.searchParams.has('to'))){
+    const parse=x=>x===null?NaN:/^\d+(\.\d+)?$/.test(x)?Number(x):Date.parse(x)/1000;
+    const start=parse(url.searchParams.get('from')),end=parse(url.searchParams.get('to'));
+    if(!Number.isFinite(start)||!Number.isFinite(end)||end<=start||end-start>7*86400)throw fail('invalid_range_maximum_7_days');
+    range.start=start;range.end=end;range.date=null;
+   }
    const success=(await q(`SELECT body->>'owner' owner,body->>'sku' sku,body->>'seller' seller,
       min((body->>'first_verified_at')::float8) at FROM flowhub_system_entities
       WHERE deployment=$1 AND kind='success' AND body->>'backend'='maozi_follow'
@@ -130,14 +136,14 @@ export async function serveSystem(c,request,env,clock=()=>Date.now()/1000){
    const verified=pubs.filter(r=>success.some(s=>s.owner===r.body.owner&&s.sku===r.body.sku&&s.seller===r.body.seller&&Number(s.at)>=Number(r.body.started_at))).length;
    const coverage=snapshot?.progress?.coverage;
    const uploadPending=snapshot?.progress?.upload_pending_after_batch??{};
-   const complete=Boolean(coverage?.plugin_pipeline&&coverage?.plugin_publications)&&!meta.stale&&['product','publication','success'].every(k=>!uploadPending[k]);
-   const hours=Array.from({length:24},(_,h)=>({start:range.start+h*3600,seconds_observed:Math.max(0,Math.min(3600,now-range.start-h*3600)),successes:today.filter(t=>t>=range.start+h*3600&&t<range.start+(h+1)*3600).length}));
+   const complete=Boolean(coverage?.plugin_pipeline&&coverage?.plugin_publications)&&!meta.stale&&['product','publication','success'].every(k=>!uploadPending[k])&&!(snapshot?.status?.collection_errors?.length);
+   const hours=Array.from({length:Math.ceil((range.end-range.start)/3600)},(_,h)=>({start:range.start+h*3600,seconds_observed:Math.max(0,Math.min(3600,range.end-range.start-h*3600,now-range.start-h*3600)),successes:today.filter(t=>t>=range.start+h*3600&&t<range.start+(h+1)*3600).length}));
    const attempts=(await q(`SELECT body->>'module' module,count(*) attempts,
        count(*) FILTER (WHERE body->>'error_class' IS NOT NULL) errors,
        avg((body->>'duration_seconds')::float8) mean_seconds,max((body->>'duration_seconds')::float8) max_seconds
        FROM flowhub_system_entities WHERE deployment=$1 AND kind='event'
        AND (body->>'finished')::float8 >= $2 AND (body->>'finished')::float8 < $3 GROUP BY body->>'module'`,[deployment,range.start,Math.min(range.end,now)])).rows;
-   return json({...meta,date:range.date,timezone:'Asia/Shanghai',complete,successes:today.length,
+   return json({...meta,date:range.date,range:{from:range.start,to:range.end},timezone:'Asia/Shanghai',complete,successes:today.length,
       last_60_minutes:stamps.filter(t=>t>now-3600&&t<=now).length,hours,
       cohort:{enrolled:pubs.length,verified,not_verified:pubs.length-verified,success_rate_including_pending:pubs.length?verified/pubs.length:null},
       observed_failures:(await q(`SELECT body->>'category' category,count(*) count FROM flowhub_system_entities WHERE deployment=$1 AND kind='failure' AND (body->>'transition_observed_at')::float8 >= $2 AND (body->>'transition_observed_at')::float8 < $3 GROUP BY body->>'category'`,[deployment,range.start,Math.min(range.end,now)])).rows,

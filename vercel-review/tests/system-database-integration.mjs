@@ -29,6 +29,7 @@ try{
  check((await call('products/s?seller_id=a')).items.filter(r=>r.kind==='product').length===1);
  const page=await call('tasks?limit=1');check(page.items.length===1);check(Boolean(page.next_cursor));check((await call('tasks?limit=1&cursor='+page.next_cursor)).items[0].body.seller==='b');
  check((await call('errors')).items[0].error_class==='sqlite_lock');
+ const range=await call('throughput?from='+(now-7200)+'&to='+now);check(range.hours.length===2);check(range.range.from===now-7200);check((await call('throughput?from=bad&to='+now)).httpStatus===422);
  const command={action:'pause',idempotency_key:'one',expected_state_version:'v',target_revision:'r',expires_at:now+100};
  const parallel=await Promise.all([call('commands',command),call('commands',command)]);check(parallel.filter(r=>r.httpStatus===202).length===1);check(parallel.some(r=>r.replayed));
  const cmd=parallel[0].command;check((await call('commands',{...command,action:'stop'})).httpStatus===409);
