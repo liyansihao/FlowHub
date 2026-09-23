@@ -177,7 +177,13 @@ async def _advance(db, owner, sku, seller, *, native_follow=False):
     from .pipeline_modules.database_work import run as database_work
     await database_work(route_bridge,bridge, DATA, (owner, sku, seller))
     def save():
-        with db.connect() as c:c.execute('INSERT OR REPLACE INTO plugin_publications VALUES(?,?,?,?,?)',(owner,sku,seller,json.dumps(record),time.time()))
+        with db.connect() as c:
+            observed = time.time()
+            c.execute('INSERT OR REPLACE INTO plugin_publications VALUES(?,?,?,?,?)',(owner,sku,seller,json.dumps(record),observed))
+            from .pipeline_modules.favorite_shadow import record_business_state
+            record_business_state(c, 'publication:'+json.dumps([owner,sku,seller]),
+                                  record.get('phase','unknown'), observed,
+                                  favorite_id=record.get('favorite_id'))
     from .pipeline_modules.transport import StepTransport
     transport_args={'namespace':fingerprint({'token':keys['erp_token']}),
                     'circuit_namespace':getattr(bridge,'execution_route','local')}
