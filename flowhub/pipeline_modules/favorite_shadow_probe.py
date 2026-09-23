@@ -29,6 +29,7 @@ async def run(data, output):
         def rows(table):return [dict(r) for r in c.execute('SELECT * FROM '+table)] if table in tables else []
         stores=rows('stores');pubs=rows('plugin_publications');queues=rows('plugin_pipeline')
         details=rows('source_details');acqs=rows('acquisition_tasks');bindings=rows('acquisition_bindings')
+        producer_events=rows('favorite_dependency_observations')
     version=subprocess.check_output(['git','-C',str(data.parent),'rev-parse','HEAD'],text=True).strip()
     groups={}
     for r in stores:
@@ -95,7 +96,9 @@ async def run(data, output):
                             observed_at=time.time(),duration_seconds=time.time()-started))
     report=dict(at=time.time(),production_version=version,mode='shadow_read_only',accounts=reports,
                 safe_delete_count=len(ledger.candidates()),new_safe_last_24h=sum(x['eligible_at']>=time.time()-86400 for x in ledger.candidates()),
-                lifecycle_coverage='incomplete: production hooks not deployed; all releases disabled',
+                lifecycle_coverage='incomplete: release certificates disabled',
+                producer_observations=dict(events=len(producer_events),consumers=len({x['consumer'] for x in producer_events}),
+                    latest=max((x['observed'] for x in producer_events),default=None)),
                 observations=observations)
     target=output/('observation-'+str(time.time_ns())+'.json')
     target.write_text(json.dumps(report,ensure_ascii=False,indent=2))
