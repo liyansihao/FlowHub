@@ -129,7 +129,7 @@ async def test_only_reads_retry_transient_connection_failure(monkeypatch):
             self.calls+=1
             if self.calls==1:raise TimeoutError()
             return {}
-    client=cleanup.Client.__new__(cleanup.Client);client.api=API()
+    client=cleanup.Client.__new__(cleanup.Client);client.api=API();client.requests=client.retries=0
     assert await client.call('/read')=={} and client.api.calls==2
     client.api=API()
     with pytest.raises(TimeoutError):await client.call('/write',method='POST')
@@ -262,3 +262,121 @@ def test_evidence_product_index_preserves_all_archive_evidence(tmp_path):
         assert 'sourcing_evidence_product' in plan and 'sku=?' in plan
         backup=cleanup.archive(db,c,item,{'id':7},{})
     assert backup['evidence']==expected
+
+@pytest.mark.asyncio
+async def test_unrelated_favorite_churn_does_not_abort_exact_cleanup(tmp_path):
+    db,owner,item=setup(tmp_path)
+    class Churn(Fake):
+        calls=0
+        async def call(self,path,**kwargs):
+            r=await super().call(path,**kwargs)
+            if path.endswith('favorite/lists'):
+                assert kwargs['params']['sku']=='123'
+                self.calls+=1;r['used']=3000-self.calls
+            return r
+    api=Churn(db=db)
+    result=await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db)|{'clear_completed':True},api)
+    assert result['deleted']==1 and api.writes==1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('bad',['ignored_filter','truncated','duplicate_identity'])
+async def test_exact_query_never_proves_absence_from_invalid_results(bad):
+    class Bad:
+        async def call(self,*args,**kwargs):
+            data=[{'id':7,'sku':'123'}];total=1
+            if bad=='ignored_filter':data[0]['sku']='456'
+            if bad=='truncated':total=2
+            if bad=='duplicate_identity':data=data*2;total=2
+            return {'total':total,'data':data}
+    with pytest.raises(ValueError):await cleanup.exact_favorites(Bad(),'123')
+
+@pytest.mark.asyncio
+async def test_fair_rotation_survives_new_database_handle(tmp_path):
+    db,owner,item=setup(tmp_path)
+    items=[item|{'sku':str(i)} for i in range(100,140)]
+    class Absent:
+        def __init__(self):self.seen=[]
+        async def call(self,path,**kw):
+            self.seen.append(kw['params']['sku'])
+            return {'total':0,'data':[],'used':3000,'limit':3000}
+    api=Absent();settings=cleanup.config(db)|{'max_checks_per_cycle':10}
+    for _ in range(4):
+        await cleanup.clean_account(Database(tmp_path),owner,'account',items,settings,api)
+    assert len(api.seen)==40 and len(set(api.seen))==40
+    assert set(api.seen)=={x['sku'] for x in items}
+
+@pytest.mark.asyncio
+async def test_unconfirmed_receipt_reconciled_without_candidate(tmp_path):
+    db,owner,item=setup(tmp_path);api=Fake('unknown_present',db)
+    await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
+    api.present=False
+    await cleanup.clean_account(db,owner,'account',[],cleanup.config(db),api)
+    assert api.writes==1
+    with db.connect() as c:assert c.execute('SELECT state FROM favorite_cleanup_receipts').fetchone()[0]=='deleted'
+
+@pytest.mark.asyncio
+async def test_remote_item_failure_does_not_block_next_product(tmp_path):
+    import httpx
+    db,owner,item=setup(tmp_path)
+    class Partial(Fake):
+        async def call(self,path,method='GET',params=None,body=None):
+            if params and params.get('sku')=='100':raise httpx.ConnectTimeout('offline')
+            return await super().call(path,method,params,body)
+    api=Partial(db=db)
+    result=await cleanup.clean_account(db,owner,'account',[item|{'sku':'100'},item],cleanup.config(db),api)
+    assert result['deleted']==1 and result['reasons']['remote_ConnectTimeout']==1
+    assert api.writes==1
+
+@pytest.mark.asyncio
+async def test_hanging_transport_has_total_deadline_and_single_write():
+    import asyncio
+    class Hanging:
+        def __init__(self):self.calls=0
+        async def erp(self,*a,**kw):
+            self.calls+=1
+            await asyncio.Event().wait()
+    client=cleanup.Client.__new__(cleanup.Client)
+    client.api=Hanging();client.requests=client.retries=0;client.request_seconds=.02
+    started=time.monotonic()
+    with pytest.raises(TimeoutError):await client.call('/test',method='POST')
+    assert time.monotonic()-started<.5 and client.api.calls==1
+
+@pytest.mark.asyncio
+async def test_cycle_deadline_retains_unknown_intent_without_replaying(tmp_path):
+    import asyncio
+    db,owner,item=setup(tmp_path)
+    class HangingWrite(Fake):
+        async def call(self,path,method='GET',params=None,body=None):
+            if method=='POST':
+                self.writes+=1
+                await asyncio.Event().wait()
+            return await super().call(path,method,params,body)
+    api=HangingWrite(db=db);settings=cleanup.config(db)|{'cycle_seconds':.05}
+    result=await cleanup.clean_account(db,owner,'account',[item],settings,api)
+    assert result['reasons']['remote_TimeoutError']==1
+    with db.connect() as c:assert c.execute('SELECT state FROM favorite_cleanup_receipts').fetchone()[0]=='intent'
+    await cleanup.clean_account(db,owner,'account',[item],settings,api)
+    assert api.writes==1
+
+@pytest.mark.asyncio
+async def test_historically_cleaned_skus_do_not_delay_new_completed_work(tmp_path):
+    db,owner,item=setup(tmp_path)
+    with db.connect() as c:
+        c.execute('INSERT INTO favorite_cleanup_receipts VALUES(?,?,?,?,?,?,?)',('account','42',owner,'old','deleted',db.seal({}),time.time()-1000))
+    work,count=cleanup.scheduled_work(db,'account',[item|{'sku':'old'},item],[],cleanup.config(db)|{'max_checks_per_cycle':1})
+    assert count==2 and work[0]['item']['sku']=='123'
+    cleanup.checked(db,'account','sku:123','favorite_absent',300)
+    work,count=cleanup.scheduled_work(db,'account',[item|{'sku':'old'},item],[],cleanup.config(db)|{'max_checks_per_cycle':1})
+    assert work[0]['item']['sku']=='old'  # History never permanently removes work.
+
+@pytest.mark.asyncio
+async def test_pending_receipt_backlog_cannot_occupy_all_cleanup_slots(tmp_path):
+    db,owner,item=setup(tmp_path)
+    prior=[{'favorite_id':str(i),'sku':str(i)} for i in range(85)]
+    work,count=cleanup.scheduled_work(db,'account',[item],prior,cleanup.config(db)|{'max_checks_per_cycle':4})
+    assert count==86 and work[0]['kind']=='candidate'
+    assert sum(w['kind']=='receipt' for w in work)==3
+    more=[item|{'sku':str(200+i)} for i in range(20)]
+    work,_=cleanup.scheduled_work(db,'account',more,prior,cleanup.config(db)|{'max_checks_per_cycle':8})
+    assert [w['kind'] for w in work]==['candidate','candidate','candidate','receipt']*2
