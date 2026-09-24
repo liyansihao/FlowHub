@@ -12,6 +12,7 @@ evaluate = ReviewModule().run
 advance = PublicationModule().run
 from .source_library import SourceLibrary
 from .official_api import OfficialDeferred
+from .cluster_routing import ProductionWorkerUnavailable
 
 
 def schema(db):
@@ -267,6 +268,11 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
         if state!='needs_fields':body.pop('error',None)
     except OfficialDeferred as error:
         delay=max(1,error.until-time.time());body['dependency_wait']=error.reason;dependency_wait=True
+    except ProductionWorkerUnavailable as error:
+        # The original Windows route may still hold an unknown remote write.
+        # Keep its binding and journal; avoid a five-second lock retry loop.
+        delay=300;body['dependency_wait']='windows_production_worker_unavailable'
+        body['offline_device']=error.device;dependency_wait=True
     except BlockingIOError:
         # No ERP attempt occurred: retain resumable state without reporting an old error.
         delay=5;lock_wait=True

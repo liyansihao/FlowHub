@@ -4,6 +4,12 @@ import os
 from pathlib import Path
 
 
+class ProductionWorkerUnavailable(BlockingIOError):
+    def __init__(self, device):
+        super().__init__('Windows production worker unavailable')
+        self.device=device
+
+
 def route_bridge(bridge, directory, key):
     config = Path(directory) / 'cluster' / 'production-routing.json'
     if not config.exists():
@@ -24,7 +30,7 @@ def route_bridge(bridge, directory, key):
         if not ready:
             # Busy/unavailable is handled by the existing pipeline without
             # changing the approval or journal state.
-            raise BlockingIOError('Windows production worker unavailable')
+            raise ProductionWorkerUnavailable(selected)
         script = Path(__file__).resolve().parents[1] / 'bridges/cluster-flowb.mjs'
         # Per-instance environment, never mutate os.environ across workers.
         original = bridge.call

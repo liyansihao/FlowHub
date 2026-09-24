@@ -104,3 +104,29 @@ async def test_lock_wait_retains_previous_error_but_does_not_report_it_as_new(tm
         assert json.loads(row['body'])['error']=='AuthenticationFailed: historical'
         assert event['outcome']=='waiting_lock' and json.loads(event['details'])['reason'] is None
         assert c.execute('SELECT count(*) FROM plugin_pipeline_leases').fetchone()[0]==0
+
+
+@pytest.mark.asyncio
+async def test_offline_windows_route_waits_as_dependency_without_rebinding(tmp_path,monkeypatch):
+    import json,time
+    from test_modular_pipeline import setup
+    from flowhub import plugin_pipeline as pipeline
+    from flowhub.cluster_routing import ProductionWorkerUnavailable
+    db,_=setup(tmp_path)
+    with db.connect() as c:
+        c.execute("UPDATE plugin_pipeline SET state='publishing',attempts=3,due=0,body=?",
+                  (json.dumps({'phase':'ready','submitted':True}),))
+        c.execute('CREATE TABLE plugin_routes(owner TEXT,sku TEXT,seller TEXT,store_id TEXT)')
+        c.execute("INSERT INTO plugin_routes VALUES('a','1','2','original-store')")
+        route=c.execute('SELECT store_id FROM plugin_routes LIMIT 1').fetchone()[0]
+    async def offline(*args):raise ProductionWorkerUnavailable('original-device')
+    monkeypatch.setattr(pipeline,'advance',offline)
+    before=time.time()
+    assert await pipeline.tick(db,lane='submit')
+    with db.connect() as c:
+        row=c.execute('SELECT state,attempts,due,body FROM plugin_pipeline').fetchone()
+        event=c.execute('SELECT outcome,details FROM pipeline_module_events ORDER BY id DESC LIMIT 1').fetchone()
+        assert row['attempts']==3 and row['due']>=before+300
+        assert json.loads(row['body'])['dependency_wait']=='windows_production_worker_unavailable'
+        assert event['outcome']=='waiting_dependency'
+        assert c.execute('SELECT store_id FROM plugin_routes LIMIT 1').fetchone()[0]==route
