@@ -6,7 +6,7 @@ import json
 import os
 import re
 import time
-from .pipeline_modules.database_work import run as database_work
+from .pipeline_modules.database_work import run as database_work, cancelled_cleanup
 from pathlib import Path
 
 from .modules import ModuleError, Pending
@@ -232,6 +232,21 @@ class SourceCollector:
             return await dispatch(self)
         return await self.collect_legacy()
 
+    def restore_failed_favorite_lookup(self, data):
+        if data.get("favorite_attempted"):
+            with self.db.connect() as db:
+                db.execute(
+                    "UPDATE source_details SET state='favorite_started',body=?,updated=? "
+                    "WHERE key=? AND state='claimed' AND updated=?",
+                    (self.db.seal(data), time.time(), self.key, self.claim_updated),
+                )
+        elif not data.get('replaces_deleted_draft_id'):
+            with self.db.connect() as db:
+                db.execute(
+                    "DELETE FROM source_details WHERE key=? AND state='claimed' AND updated=?",
+                    (self.key, self.claim_updated),
+                )
+
     async def collect_legacy(self):
         # Claim once per source/account. A crashed collecting call is not repeated blindly.
         with self.db.connect() as db:
@@ -290,20 +305,11 @@ class SourceCollector:
         try:
             favorite = await self.find_favorite(claimed=True)
             await database_work(self.renew_claim)
-        except BaseException:
-            if data.get("favorite_attempted"):
-                with self.db.connect() as db:
-                    db.execute(
-                        "UPDATE source_details SET state='favorite_started',body=?,updated=? "
-                        "WHERE key=? AND state='claimed' AND updated=?",
-                        (self.db.seal(data), time.time(), self.key, self.claim_updated),
-                    )
-            elif not data.get('replaces_deleted_draft_id'):
-                with self.db.connect() as db:
-                    db.execute(
-                        "DELETE FROM source_details WHERE key=? AND state='claimed' AND updated=?",
-                        (self.key, self.claim_updated),
-                    )
+        except BaseException as error:
+            if isinstance(error, asyncio.CancelledError):
+                await cancelled_cleanup(database_work(self.restore_failed_favorite_lookup, data))
+            else:
+                await database_work(self.restore_failed_favorite_lookup, data)
             raise
         if favorite is None:
             if data.get("favorite_attempted"):

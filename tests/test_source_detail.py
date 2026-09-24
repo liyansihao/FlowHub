@@ -1,3 +1,7 @@
+import asyncio
+import sqlite3
+import time
+
 import pytest
 
 from flowhub.db import Database
@@ -429,6 +433,42 @@ async def test_lost_favorite_acknowledgement_is_not_replayed_after_read_failure(
     with pytest.raises(Pending):
         await collector.collect()
     assert len(writes) == 1
+
+
+@pytest.mark.parametrize('favorite_attempted', [False, True])
+async def test_failed_favorite_lookup_db_wait_does_not_block_loop(tmp_path, context, favorite_attempted):
+    db = Database(tmp_path)
+    collector = SourceCollector(db, context)
+    if favorite_attempted:
+        collector.save('favorite_started', {'favorite_attempted': True})
+        age_collection(collector)
+    started = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def failed_lookup(*, claimed):
+        started.set()
+        await proceed.wait()
+        raise TimeoutError('read failed')
+
+    collector.find_favorite = failed_lookup
+    task = asyncio.create_task(collector.collect())
+    await asyncio.wait_for(started.wait(), 1)
+    lock = sqlite3.connect(db.path)
+    try:
+        lock.execute('BEGIN IMMEDIATE')
+        proceed.set()
+        begin = time.monotonic()
+        await asyncio.sleep(0.05)
+        assert time.monotonic() - begin < 0.5
+        assert not task.done()
+    finally:
+        lock.rollback()
+        lock.close()
+    with pytest.raises(TimeoutError, match='read failed'):
+        await asyncio.wait_for(task, 2)
+    with db.connect() as connection:
+        row = connection.execute('SELECT state FROM source_details WHERE key=?', (collector.key,)).fetchone()
+    assert (row[0] if row else None) == ('favorite_started' if favorite_attempted else None)
 
 
 async def test_imported_favorite_recovers_existing_draft_without_import(tmp_path, context):
