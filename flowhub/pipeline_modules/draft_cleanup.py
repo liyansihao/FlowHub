@@ -167,7 +167,7 @@ async def clean_account(db,owner,account,items,settings,client=None):
     read_started=time.time()
     header,remote=await listing(client)
     from ..collection_capacity import observe
-    observe(db,account,header,read_started)
+    await database_work(observe,db,account,header,read_started)
     present={str(r['id']):r for r in remote}
     # Unknown prior writes are reconciled by absence only, never replayed.
     with db.connect() as c:prior=c.execute('SELECT * FROM draft_cleanup_receipts WHERE account=?',(account,)).fetchall()
@@ -234,7 +234,7 @@ async def clean_account(db,owner,account,items,settings,client=None):
     if touched:
         read_started=time.time()
         after,remote=await listing(client);remaining={str(r['id']) for r in remote}
-        observe(db,account,after,read_started)
+        await database_work(observe,db,account,after,read_started)
         for draft in touched:
             if draft in remaining:continue
             with db.connect() as c:r=c.execute('SELECT * FROM draft_cleanup_receipts WHERE account=? AND draft_id=?',(account,draft)).fetchone()

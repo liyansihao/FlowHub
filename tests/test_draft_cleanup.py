@@ -48,6 +48,27 @@ async def test_cleanup_exact_backup_and_unknown_delete_never_replayed(tmp_path,m
 
 
 @pytest.mark.asyncio
+async def test_capacity_observation_does_not_block_cleanup_event_loop(tmp_path,monkeypatch):
+ from flowhub import collection_capacity
+ db,owner,item=setup(tmp_path);api=Fake()
+ original=collection_capacity.observe
+ calls=[]
+ def slow_observe(*args):
+  calls.append(threading.get_ident())
+  time.sleep(.15)
+  return original(*args)
+ monkeypatch.setattr(collection_capacity,'observe',slow_observe)
+ task=asyncio.create_task(cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api))
+ start=time.monotonic()
+ await asyncio.sleep(.03)
+ assert time.monotonic()-start<.12
+ result=await task
+ assert result['deleted']==1
+ assert len(calls)==2
+ assert all(tid!=threading.get_ident() for tid in calls)
+
+
+@pytest.mark.asyncio
 async def test_pause_prevents_delete_after_reads(tmp_path):
  from flowhub.pipeline_modules.control import set_paused
  db,owner,item=setup(tmp_path);api=Fake();set_paused(db,'seed',True)
