@@ -259,6 +259,7 @@ async def tick(db):
                     previous_cursor=c.execute('SELECT last_rowid FROM draft_cleanup_scan_cursors WHERE owner=?',(owner,)).fetchone()
             groups=await asyncio.to_thread(candidates,db,owner,settings)
             processed=0
+            retry_page=False
             for account,items in groups.items():
                 with db.connect() as c:
                     c.execute('CREATE TABLE IF NOT EXISTS draft_cleanup_backoff(account TEXT PRIMARY KEY,failures INTEGER,due REAL)')
@@ -268,6 +269,7 @@ async def tick(db):
                 started=time.time()
                 try:result=await clean_account(db,owner,account,items,settings)
                 except Exception as error:result={'state':'error','error_type':type(error).__name__}
+                if result['state'] in ('error','paused','disabled'):retry_page=True
                 # A paged scan that found no candidate must advance to the next
                 # page on schedule. Back off actual remote/database failures.
                 empty_page=(settings.get('paged_scan') and result['state']=='no_safe_candidates'
@@ -278,8 +280,9 @@ async def tick(db):
                     c.execute('INSERT OR REPLACE INTO draft_cleanup_backoff VALUES(?,?,?)',(account,failures,time.time()+delay))
                 result.update(consecutive_no_progress=failures,next_scan_after_seconds=delay)
                 control.record(db,'seed',owner,'',started,'draft_cleanup',result);results.append(result)
-            if groups and not processed and settings.get('paged_scan'):
-                # No account could consume this page; retry it when backoff ends.
+            if groups and (not processed or retry_page) and settings.get('paged_scan'):
+                # A failed or paused account must see this page again after
+                # backoff; successful receipts make a repeated page safe.
                 with db.connect() as c:
                     if previous_cursor is None:c.execute('DELETE FROM draft_cleanup_scan_cursors WHERE owner=?',(owner,))
                     else:c.execute('INSERT OR REPLACE INTO draft_cleanup_scan_cursors VALUES(?,?)',(owner,previous_cursor[0]))
