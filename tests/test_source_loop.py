@@ -1,3 +1,4 @@
+import asyncio
 import json
 import pytest
 from flowhub.db import Database
@@ -159,3 +160,21 @@ async def test_seed_resolution_can_succeed_on_final_budgeted_attempt(tmp_path):
     assert (await loop.resolve_one(db,'a',good,100))['state']=='resolved'
     with db.connect() as c:
         assert json.loads(c.execute('SELECT body FROM sourcing_seeds').fetchone()[0])['seller_id']=='13'
+
+
+@pytest.mark.asyncio
+async def test_seed_resolution_write_wait_does_not_block_event_loop(tmp_path):
+    db=setup(tmp_path)
+    with db.connect() as c:
+        c.execute("UPDATE sourcing_seeds SET body='{}'")
+        c.execute('INSERT INTO sourcing_settings VALUES(?,1,?,?)',('a','{}',db.seal({'erp_token':'test'})))
+    async def good(*args):return {'data':{'sku':'123','sellerId':13}}
+    with db.connect() as writer:
+        writer.execute('BEGIN IMMEDIATE')
+        task=asyncio.create_task(loop.resolve_one(db,'a',good,100))
+        started=asyncio.get_running_loop().time()
+        await asyncio.sleep(.1)
+        assert asyncio.get_running_loop().time()-started<.5
+        assert not task.done()
+        writer.rollback()
+    assert (await asyncio.wait_for(task,2))['state']=='resolved'

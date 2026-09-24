@@ -81,33 +81,40 @@ def sync_stores(db, owner, run_id, now=None):
 
 async def resolve_one(db,owner,request=erp_request,now=None):
     now=time.time() if now is None else now
-    with db.connect() as c:
-        seed=c.execute("""SELECT s.*,COALESCE(r.attempts,0) AS resolution_attempts FROM sourcing_seeds s LEFT JOIN source_seed_resolutions r
-          ON r.owner=s.owner AND r.sku=s.sku WHERE s.owner=? AND s.archived=0
-          AND (json_extract(s.body,'$.seller_id') IS NULL OR json_extract(s.body,'$.seller_id')='')
-          AND COALESCE(r.due,0)<=? AND COALESCE(r.state,'')!='retry_exhausted'
-          AND NOT EXISTS(SELECT 1 FROM blocks b WHERE b.owner=s.owner AND b.source_key=s.sku)
-          ORDER BY COALESCE(s.sales,0) DESC,s.sku LIMIT 1""",(owner,now)).fetchone()
-        setting=c.execute('SELECT secret FROM sourcing_settings WHERE owner=? AND enabled=1',(owner,)).fetchone()
-    if not seed or not setting:return {'state':'no_due_seed'}
+    def load_resolution():
+        with db.connect() as c:
+            seed=c.execute("""SELECT s.*,COALESCE(r.attempts,0) AS resolution_attempts FROM sourcing_seeds s LEFT JOIN source_seed_resolutions r
+              ON r.owner=s.owner AND r.sku=s.sku WHERE s.owner=? AND s.archived=0
+              AND (json_extract(s.body,'$.seller_id') IS NULL OR json_extract(s.body,'$.seller_id')='')
+              AND COALESCE(r.due,0)<=? AND COALESCE(r.state,'')!='retry_exhausted'
+              AND NOT EXISTS(SELECT 1 FROM blocks b WHERE b.owner=s.owner AND b.source_key=s.sku)
+              ORDER BY COALESCE(s.sales,0) DESC,s.sku LIMIT 1""",(owner,now)).fetchone()
+            setting=c.execute('SELECT secret FROM sourcing_settings WHERE owner=? AND enabled=1',(owner,)).fetchone()
+            return (dict(seed) if seed else None,setting[0] if setting else None)
+    seed,secret=await database_read(load_resolution)
+    if not seed or not secret:return {'state':'no_due_seed'}
     sku=seed['sku'];seller=None;reason=None;evidence={}
     if seed['resolution_attempts']>=SEED_RESOLUTION_MAX_ATTEMPTS:
         # Retain the old evidence/attempt count. An exhausted seed must not
         # consume another remote request or prevent the next seed from running.
-        with db.connect() as c:
-            c.execute("UPDATE source_seed_resolutions SET state='retry_exhausted',updated=? WHERE owner=? AND sku=?",
-                      (now,owner,sku))
+        def mark_exhausted():
+            with db.connect() as c:
+                c.execute("UPDATE source_seed_resolutions SET state='retry_exhausted',updated=? WHERE owner=? AND sku=?",
+                          (now,owner,sku))
+        await database_work(mark_exhausted)
         return {'state':'retry_exhausted','sku':sku,'seller':None,'reason':'seed_resolution_retry_budget_exhausted'}
     try:
         # Reuse exact page observations already in this owner's library first.
         # Multiple sellers for a SKU require a current direct resolution.
-        with db.connect() as c:
-            known=c.execute("""SELECT DISTINCT seller FROM sourcing_products WHERE owner=? AND sku=?
-              AND json_extract(body,'$.coverage') IN ('storefront-page','maozi-exact-seller-page')""",(owner,sku)).fetchall()
+        def known_sellers():
+            with db.connect() as c:
+                return [r[0] for r in c.execute("""SELECT DISTINCT seller FROM sourcing_products WHERE owner=? AND sku=?
+                  AND json_extract(body,'$.coverage') IN ('storefront-page','maozi-exact-seller-page')""",(owner,sku))]
+        known=await database_read(known_sellers)
         if len(known)==1:
-            data={'sku':sku,'seller_id':known[0][0]};channel='exact-source-library'
+            data={'sku':sku,'seller_id':known[0]};channel='exact-source-library'
         else:
-            result=await request('/api.chrome/sku3',{'sku':sku},db.open(setting[0])['erp_token'])
+            result=await request('/api.chrome/sku3',{'sku':sku},db.open(secret)['erp_token'])
             data=result.get('data',result) if isinstance(result,dict) else {};channel='maozi-sku3'
         evidence={'channel':channel,'requested_sku':sku,'observed_at':now,
                   'returned_sku':data.get('sku') if isinstance(data,dict) else None,
@@ -120,16 +127,18 @@ async def resolve_one(db,owner,request=erp_request,now=None):
         from ..source_acquisition import AcquisitionError
         seller=None;reason=str(error)[:120] if isinstance(error,(ValueError,AcquisitionError)) else type(error).__name__
     state='resolved' if seller else ('retry_exhausted' if seed['resolution_attempts']+1>=SEED_RESOLUTION_MAX_ATTEMPTS else 'waiting')
-    with db.connect() as c:
-        c.execute('BEGIN IMMEDIATE')
-        c.execute('''INSERT INTO source_seed_resolutions VALUES(?,?,?,?,?,?,1,?,?)
-         ON CONFLICT(owner,sku) DO UPDATE SET state=excluded.state,seller=excluded.seller,
-         reason=excluded.reason,due=excluded.due,attempts=attempts+1,evidence=excluded.evidence,updated=excluded.updated''',
-         (owner,sku,state,seller,reason,now+(86400 if seller else 21600),json.dumps(evidence),now))
-        if seller:
-            for r in c.execute('SELECT shop,offer,body FROM sourcing_seeds WHERE owner=? AND sku=?',(owner,sku)).fetchall():
-                body=json.loads(r['body']);body.update(seller_id=seller,seller_resolution=evidence)
-                c.execute('UPDATE sourcing_seeds SET body=? WHERE owner=? AND shop=? AND offer=?',(json.dumps(body),owner,r['shop'],r['offer']))
+    def persist_resolution():
+        with db.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            c.execute('''INSERT INTO source_seed_resolutions VALUES(?,?,?,?,?,?,1,?,?)
+             ON CONFLICT(owner,sku) DO UPDATE SET state=excluded.state,seller=excluded.seller,
+             reason=excluded.reason,due=excluded.due,attempts=attempts+1,evidence=excluded.evidence,updated=excluded.updated''',
+             (owner,sku,state,seller,reason,now+(86400 if seller else 21600),json.dumps(evidence),now))
+            if seller:
+                for r in c.execute('SELECT shop,offer,body FROM sourcing_seeds WHERE owner=? AND sku=?',(owner,sku)).fetchall():
+                    body=json.loads(r['body']);body.update(seller_id=seller,seller_resolution=evidence)
+                    c.execute('UPDATE sourcing_seeds SET body=? WHERE owner=? AND shop=? AND offer=?',(json.dumps(body),owner,r['shop'],r['offer']))
+    await database_work(persist_resolution)
     return {'state':state,'sku':sku,'seller':seller,'reason':reason}
 
 
