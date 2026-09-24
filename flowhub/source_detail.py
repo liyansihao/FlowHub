@@ -51,7 +51,7 @@ class SourceAcquisitionFailure(ModuleError):
 class SourceCollector:
     recovery_pages = {}
     read_failures = {}
-    def __init__(self, db, context):
+    def __init__(self, db, context, *, ensure_schema=True):
         self.db, self.c = db, context
         self.keys = context["store"]["credentials"]
         self.sku = str(context["candidate"]["source_key"])
@@ -66,10 +66,11 @@ class SourceCollector:
                 + self.sku
             ).encode()
         ).hexdigest()
-        with db.connect() as connection:
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS source_details(key TEXT PRIMARY KEY,state TEXT NOT NULL,body TEXT NOT NULL,updated REAL NOT NULL)"
-            )
+        if ensure_schema:
+            with db.connect() as connection:
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS source_details(key TEXT PRIMARY KEY,state TEXT NOT NULL,body TEXT NOT NULL,updated REAL NOT NULL)"
+                )
 
     async def call(self, path, method="GET", query=None, body=None):
         self.last_timing={}

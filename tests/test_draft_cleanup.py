@@ -56,6 +56,20 @@ async def test_pause_prevents_delete_after_reads(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_certified_released_favorite_draft_is_never_deleted(tmp_path):
+ db,owner,item=setup(tmp_path);api=Fake()
+ with db.connect() as c:
+  c.execute('''CREATE TABLE favorite_release_certificates(
+   account TEXT,favorite_id TEXT,sku TEXT,source_key TEXT,draft_id TEXT,
+   state TEXT,proof TEXT,updated REAL,PRIMARY KEY(account,favorite_id))''')
+  c.execute('INSERT INTO favorite_release_certificates VALUES(?,?,?,?,?,?,?,?)',
+            ('account','7','123','source','8','deleted','{}',time.time()))
+ result=await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
+ assert result['deleted']==0 and api.writes==0
+ with db.connect() as c:assert c.execute('SELECT count(*) FROM draft_cleanup_receipts').fetchone()[0]==0
+
+
+@pytest.mark.asyncio
 async def test_mismatched_source_and_below_threshold_do_not_delete(tmp_path):
  db,owner,item=setup(tmp_path);api=Fake();item['sku']='999'
  await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
@@ -85,6 +99,28 @@ def test_only_old_locally_created_sold_drafts_are_candidates(tmp_path,kind):
  if kind!='recent':
   with db.connect() as c:c.execute('UPDATE source_details SET updated=?',(time.time()-7200,))
  assert bool(cleanup.candidates(db,owner,cleanup.config(db)))==(kind=='eligible')
+
+
+def test_paged_candidate_scan_advances_and_wraps_without_full_queue_walk(tmp_path):
+ from flowhub.source_detail import SourceCollector
+ db,owner,item=setup(tmp_path)
+ with db.connect() as c:
+  c.execute('INSERT INTO stores(id,owner,name,kind,config,secret) VALUES(?,?,?,?,?,?)',
+            ('s',owner,'test','maozi','{"shop_id":"4"}',db.seal({'erp_token':'test'})))
+  for sku in ('123','124','125'):
+   if sku!='123':c.execute('INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)',(owner,sku,'2','selling','{"offer_id":"offer"}',0,0))
+   c.execute('INSERT INTO plugin_routes VALUES(?,?,?,?,?,?)',(owner,sku,'2','s',0,'test'))
+ ctx={'owner':owner,'candidate':{'source_key':'125'},'store':{'config':{'shop_id':'4'},'credentials':{'erp_token':'test'}}}
+ SourceCollector(db,ctx).save('ready',{'draft_id':8,'favorite_id':7,'source_key':'125','detail':{'skus':[{}]}})
+ with db.connect() as c:c.execute('UPDATE source_details SET updated=?',(time.time()-7200,))
+ settings=cleanup.config(db)|{'paged_scan':True,'candidate_page_size':1}
+ seen=[]
+ for _ in range(4):
+  groups=cleanup.candidates(db,owner,settings)
+  seen.extend(item['sku'] for items in groups.values() for item in items)
+ assert seen==['125']
+ with db.connect() as c:
+  assert c.execute('SELECT last_rowid FROM draft_cleanup_scan_cursors WHERE owner=?',(owner,)).fetchone()[0]>0
 
 
 @pytest.mark.asyncio

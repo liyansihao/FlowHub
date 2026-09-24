@@ -9,15 +9,18 @@ from ..maozi import MaoziPublisher
 from ..source_detail import SourceCollector
 from . import control
 
-DEFAULTS={'enabled':False,'threshold_ratio':0.85,'target_ratio':0.80,'batch_size':20,'scan_limit':20,'interval_seconds':300,'minimum_age_seconds':3600}
+DEFAULTS={'enabled':False,'threshold_ratio':0.85,'target_ratio':0.80,'batch_size':20,'scan_limit':20,'interval_seconds':300,'minimum_age_seconds':3600,
+          'paged_scan':False,'candidate_page_size':100}
 
 
 def schema(db):
     with db.connect() as c:
+        c.execute('CREATE TABLE IF NOT EXISTS source_details(key TEXT PRIMARY KEY,state TEXT NOT NULL,body TEXT NOT NULL,updated REAL NOT NULL)')
         c.execute('''CREATE TABLE IF NOT EXISTS draft_cleanup_receipts(
             account TEXT,draft_id TEXT,owner TEXT,sku TEXT,state TEXT,body TEXT,updated REAL,
             PRIMARY KEY(account,draft_id))''')
         c.execute('CREATE TABLE IF NOT EXISTS draft_cleanup_cursors(account TEXT PRIMARY KEY,draft_id TEXT,updated REAL)')
+        c.execute('CREATE TABLE IF NOT EXISTS draft_cleanup_scan_cursors(owner TEXT PRIMARY KEY,last_rowid INTEGER)')
 
 
 def config(db):
@@ -26,6 +29,8 @@ def config(db):
     if not 0<d['target_ratio']<d['threshold_ratio']<=1:raise ValueError('invalid cleanup thresholds')
     if not 1<=d['batch_size']<=1000 or not 1<=d['scan_limit']<=100 or d['minimum_age_seconds']<0 or d['interval_seconds']<60:
         raise ValueError('invalid cleanup limits')
+    if not isinstance(d['paged_scan'],bool) or not 1<=d['candidate_page_size']<=256:
+        raise ValueError('invalid cleanup candidate page')
     return d
 
 
@@ -68,15 +73,22 @@ def journal(db,account,draft_id,owner,sku,state,body):
 
 def candidates(db,owner,settings):
     with db.connect() as c:
-        found=c.execute('''SELECT q.sku,q.seller,q.body,s.id AS store_id,s.config,s.secret FROM plugin_pipeline q
+        query='''SELECT q.rowid queue_rowid,q.sku,q.seller,q.body,s.id AS store_id,s.config,s.secret FROM plugin_pipeline q
             JOIN plugin_routes r USING(owner,sku,seller) JOIN stores s ON s.id=r.store_id AND s.owner=q.owner
-            WHERE q.owner=? AND q.state='selling' ORDER BY q.due''',(owner,)).fetchall()
+            WHERE q.owner=? AND q.state='selling' '''
+        if settings.get('paged_scan'):
+            cursor=c.execute('SELECT last_rowid FROM draft_cleanup_scan_cursors WHERE owner=?',(owner,)).fetchone()
+            after=cursor[0] if cursor else 0
+            found=c.execute(query+' AND q.rowid>? ORDER BY q.rowid LIMIT ?',(owner,after,settings['candidate_page_size'])).fetchall()
+            if not found:found=c.execute(query+' AND q.rowid>? ORDER BY q.rowid LIMIT ?',(owner,0,settings['candidate_page_size'])).fetchall()
+            if found:c.execute('INSERT OR REPLACE INTO draft_cleanup_scan_cursors VALUES(?,?)',(owner,found[-1]['queue_rowid']))
+        else:found=c.execute(query+' ORDER BY q.due',(owner,)).fetchall()
     groups={};snapshot_index=None
     for r in found:
         ctx={'owner':owner,'candidate':{'source_key':r['sku']},'store':{'config':json.loads(r['config']),'credentials':db.open(r['secret'])}}
         token=ctx['store']['credentials'].get('erp_token')
         if not token:continue
-        collector=SourceCollector(db,ctx);state,snapshot,updated=collector.load()
+        collector=SourceCollector(db,ctx,ensure_schema=False);state,snapshot,updated=collector.load()
         # Credential rotation changes the collector cache key. The immutable,
         # owner/SKU/seller-bound publication retains the exact source draft used.
         # Never search another owner's unbound source cache by SKU alone.
@@ -241,7 +253,7 @@ async def tick(db):
         with db.connect() as c:owners=[r[0] for r in c.execute('SELECT p.owner FROM pipeline_campaigns p JOIN users u ON u.id=p.owner WHERE p.enabled=1 AND u.active=1')]
         results=[]
         for owner in owners:
-            for account,items in candidates(db,owner,settings).items():
+            for account,items in (await asyncio.to_thread(candidates,db,owner,settings)).items():
                 with db.connect() as c:
                     c.execute('CREATE TABLE IF NOT EXISTS draft_cleanup_backoff(account TEXT PRIMARY KEY,failures INTEGER,due REAL)')
                     backoff=c.execute('SELECT failures,due FROM draft_cleanup_backoff WHERE account=?',(account,)).fetchone()
