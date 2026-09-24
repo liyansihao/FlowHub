@@ -53,6 +53,25 @@ async def test_manual_sample_pause_is_not_resumed(tmp_path):
     assert s.next_request('o','other-seller-10','10')['state']=='paused'
 
 
+@pytest.mark.asyncio
+async def test_sample_due_query_does_not_block_event_loop(tmp_path,monkeypatch):
+    import asyncio
+    from contextlib import contextmanager
+    from flowhub.other_sellers import sample_one
+    db=Database(tmp_path);schema(db);prepare_samples(db,'o')
+    original=db.connect
+    @contextmanager
+    def slow_connect():
+        time.sleep(.35)
+        with original() as connection:yield connection
+    monkeypatch.setattr(db,'connect',slow_connect)
+    task=asyncio.create_task(sample_one(db,'o',{}))
+    began=time.monotonic()
+    await asyncio.sleep(.02)
+    assert time.monotonic()-began<.2
+    assert (await task)['state']=='no_due_sample'
+
+
 def test_pending_second_generation_requires_explicit_exploration_policy(tmp_path):
     db=Database(tmp_path);schema(db);lib=SourceLibrary(db)
     p={'sku':'123','seller_id':'10','title':'t','image':'https://example.com/i',

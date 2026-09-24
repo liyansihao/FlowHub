@@ -6,7 +6,7 @@ import time
 from html.parser import HTMLParser
 from urllib.parse import urljoin,urlsplit,parse_qs
 from .source_library import SourceLibrary,SourceFilters,assess,identity
-from .pipeline_modules.database_work import run as database_work
+from .pipeline_modules.database_work import run as database_work, read as database_read
 
 class OffersHTML(HTMLParser):
     def __init__(self):
@@ -197,9 +197,7 @@ def prepare_samples(db,owner,limit=20):
                 (owner,row['seller'],run,'pending_sample',json.dumps({'seed_sku':row['seed_sku']}),time.time())).rowcount
     return added
 
-async def sample_one(db,owner,config,seller=None):
-    from .browser_source import BrowserSource
-    from .pipeline_modules.source_loop import collect
+def due_sample(db,owner,seller):
     with db.connect() as c:
         row=c.execute("""SELECT d.* FROM source_discovered_stores d JOIN browser_source_scans s
           ON s.owner=d.owner AND s.seller=d.seller AND s.run_id=d.run_id
@@ -207,19 +205,36 @@ async def sample_one(db,owner,config,seller=None):
             (d.state='pending_sample' AND s.state='ready') OR
             (d.state='retry_wait' AND s.state IN ('ready','blocked') AND d.updated+300<=?))
           ORDER BY d.updated LIMIT 1""",(owner,seller,seller,time.time())).fetchone()
-    if not row:return {'state':'no_due_sample'}
+    return dict(row) if row else None
+
+
+def mark_sampling(db,owner,row):
+    from .browser_source import BrowserSource
     s=BrowserSource(db);key=(owner,row['run_id'],row['seller'])
     if row['state']=='retry_wait' and s.next_request(*key)['state']=='blocked':s.control(*key,'retry')
     with db.connect() as c:c.execute("UPDATE source_discovered_stores SET state='sampling',updated=? WHERE owner=? AND seller=?",(time.time(),owner,row['seller']))
-    previous=json.loads(row['body']);attempts=previous.get('sample_attempts',0)
-    task=dict(row)|{'failures':attempts,'state':'ready'}
-    result=await collect(db,task,config|{'pages_per_store':1})
+
+
+def finish_sample(db,owner,row,result,attempts):
+    key=(owner,row['run_id'],row['seller'])
     with db.connect() as c:
         page=c.execute('SELECT 1 FROM browser_source_pages WHERE owner=? AND run_id=? AND seller=?',key).fetchone()
         state='awaiting_qualified_product' if page else 'retry_wait' if result['state']=='retry_wait' else 'blocked'
         body=json.loads(row['body']);body.update(sample_result=result,sample_attempts=attempts+1)
         c.execute('UPDATE source_discovered_stores SET state=?,body=?,updated=? WHERE owner=? AND seller=?',
             (state,json.dumps(body),time.time(),owner,row['seller']))
+    return state
+
+
+async def sample_one(db,owner,config,seller=None):
+    from .pipeline_modules.source_loop import collect
+    row=await database_read(due_sample,db,owner,seller)
+    if not row:return {'state':'no_due_sample'}
+    await database_work(mark_sampling,db,owner,row)
+    previous=json.loads(row['body']);attempts=previous.get('sample_attempts',0)
+    task=dict(row)|{'failures':attempts,'state':'ready'}
+    result=await collect(db,task,config|{'pages_per_store':1})
+    state=await database_work(finish_sample,db,owner,row,result,attempts)
     return {'state':state,'seller':row['seller']}
 
 
