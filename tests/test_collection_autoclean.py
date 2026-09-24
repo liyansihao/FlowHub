@@ -17,28 +17,25 @@ def configured(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('used,expected',[(849,False),(850,True),(1000,True)])
-async def test_threshold_automatically_invokes_archived_maintenance(tmp_path,used,expected):
+@pytest.mark.parametrize('used,expected',[(849,'below_threshold'),(850,'worker_cleanup_active'),(1000,'worker_cleanup_active')])
+async def test_threshold_never_invokes_full_box_maintenance(tmp_path,used,expected):
     db=configured(tmp_path)
     client=AsyncMock();client.call.return_value={'used':used,'limit':1000}
-    run=AsyncMock(return_value={'state':'complete','result':{'used':0,'complete':True}})
-    result=await tick(db,client_factory=lambda _:client,run_maintenance=run)
-    assert run.await_count==int(expected)
-    if expected:assert run.call_args.kwargs=={'automatic':True} and result['used_after']==0
-    else:assert result['state']=='below_threshold'
+    result=await tick(db,client_factory=lambda _:client)
+    assert result['state']==expected and 'maintenance' not in result
 
 
 @pytest.mark.asyncio
 async def test_pause_and_persistent_failure_backoff(tmp_path):
     db=configured(tmp_path);client=AsyncMock();client.call.return_value={'used':900,'limit':1000}
-    run=AsyncMock(side_effect=TimeoutError())
     control.set_paused(db,'publication',True)
-    assert (await tick(db,client_factory=lambda _:client,run_maintenance=run))['state']=='paused'
+    assert (await tick(db,client_factory=lambda _:client))['state']=='paused'
     client.call.assert_not_awaited()
     control.set_paused(db,'publication',False)
-    assert (await tick(db,client_factory=lambda _:client,run_maintenance=run))['state']=='error'
-    await tick(db,client_factory=lambda _:client,run_maintenance=run)
-    assert run.await_count==1 and client.call.await_count==1
+    client.call.side_effect=TimeoutError()
+    assert (await tick(db,client_factory=lambda _:client))['state']=='error'
+    await tick(db,client_factory=lambda _:client)
+    assert client.call.await_count==1
 
 
 @pytest.mark.asyncio
@@ -47,11 +44,19 @@ async def test_database_lock_retries_only_local_observation(tmp_path,monkeypatch
     from unittest.mock import Mock
     from flowhub import collection_autoclean
     db=configured(tmp_path);client=AsyncMock();client.call.return_value={'used':850,'limit':1000}
-    run=AsyncMock(return_value={'state':'complete','result':{'used':0}})
     observe=Mock(side_effect=[sqlite3.OperationalError('database is locked'),None])
     monkeypatch.setattr(collection_autoclean,'observe',observe)
-    await tick(db,client_factory=lambda _:client,run_maintenance=run)
-    assert observe.call_count==2 and client.call.await_count==1 and run.await_count==1
+    await tick(db,client_factory=lambda _:client)
+    assert observe.call_count==2 and client.call.await_count==1
+
+
+def test_existing_database_entry_initializes_connection_without_migration(tmp_path):
+    from flowhub.db import Database
+    db=configured(tmp_path)
+    opened=Database.open_existing(tmp_path)
+    with opened.connect() as c:
+        assert c.execute('SELECT count(*) FROM stores').fetchone()[0]==1
+    assert opened._journal_configured
 
 
 @pytest.mark.asyncio

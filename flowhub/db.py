@@ -34,6 +34,22 @@ def private_write(path, content):
 
 
 class Database:
+    @classmethod
+    def open_existing(cls, directory):
+        """Open an existing database without startup migrations or file creation."""
+        instance=cls.__new__(cls)
+        instance.directory=Path(directory).resolve()
+        instance.path=instance.directory/'flowhub.sqlite3'
+        key=instance.directory/'master.key'
+        if not instance.path.is_file() or not key.is_file():
+            raise ValueError('existing database and key required')
+        instance._schema_ready=set()
+        instance._schema_lock=threading.RLock()
+        instance._journal_configured=False
+        instance._journal_lock=threading.Lock()
+        instance.cipher=Fernet(key.read_bytes())
+        return instance
+
     def __init__(self, directory=DATA):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)

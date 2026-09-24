@@ -215,11 +215,7 @@ def main():
     args=parser.parse_args()
     if not args.execute:parser.error('--execute is required for explicitly authorized maintenance')
     # Maintenance opens the existing database without running application migrations.
-    from cryptography.fernet import Fernet
-    db=Database.__new__(Database)
-    db.directory=args.data.resolve();db.path=db.directory/'flowhub.sqlite3'
-    if not db.path.is_file():raise ValueError('existing production database required')
-    db.cipher=Fernet((db.directory/'master.key').read_bytes())
+    db=Database.open_existing(args.data)
     with db.connect() as c:stores=c.execute('SELECT * FROM stores WHERE enabled=1').fetchall()
     contexts={}
     for row in stores:

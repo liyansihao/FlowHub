@@ -9,7 +9,6 @@ import time
 from pathlib import Path
 
 from .collection_capacity import account, observe
-from .collection_reset import maintenance
 from .pipeline_modules.draft_cleanup import Client
 from .db import Database
 
@@ -19,7 +18,7 @@ def atomic(path, value):
     tmp.chmod(0o600);tmp.replace(path)
 
 
-async def tick(db, *, client_factory=Client, run_maintenance=maintenance):
+async def tick(db, *, client_factory=Client):
     policy_path=db.directory/'collection-autoclean.json'
     policy=json.loads(policy_path.read_text()) if policy_path.exists() else {}
     if not policy.get('enabled'):return {'state':'disabled'}
@@ -61,13 +60,12 @@ async def tick(db, *, client_factory=Client, run_maintenance=maintenance):
             if used<limit*threshold:
                 status['state']='below_threshold'
             else:
-                status['state']='running';atomic(path,status)
-                receipt=await run_maintenance(db,ctx,automatic=True)
-                status['maintenance']=receipt
-                status['state']=receipt['state']
-                if receipt.get('result'):status['used_after']=receipt['result']['used']
-                if status['state'] not in ('complete','paused'):
-                    status['retry_at']=time.time()+1800
+                # The old maintenance emptied the whole box and drained all
+                # publishing lanes. The bounded, completed-only cleanup runs
+                # inside the sole worker and keeps per-draft safety checks.
+                worker_policy=db.directory/'draft-cleanup.json'
+                worker=json.loads(worker_policy.read_text()) if worker_policy.exists() else {}
+                status['state']='worker_cleanup_active' if worker.get('enabled') else 'worker_cleanup_disabled'
         except Exception as error:
             status.update(state='error',error_type=type(error).__name__,retry_at=time.time()+1800)
         status['finished_at']=time.time();atomic(path,status)
@@ -80,10 +78,7 @@ async def tick(db, *, client_factory=Client, run_maintenance=maintenance):
 def main():
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--data',type=Path,required=True)
     args=parser.parse_args()
-    from cryptography.fernet import Fernet
-    db=Database.__new__(Database);db.directory=args.data.resolve();db.path=db.directory/'flowhub.sqlite3'
-    if not db.path.is_file():raise ValueError('existing production database required')
-    db.cipher=Fernet((db.directory/'master.key').read_bytes())
+    db=Database.open_existing(args.data)
     try:result=asyncio.run(tick(db))
     except Exception as error:
         result={'state':'error','error_type':type(error).__name__,'checked_at':time.time(),'retry_at':time.time()+1800}
