@@ -114,6 +114,43 @@ def test_publication_backlog_does_not_lower_valuation_budget(tmp_path):
     assert admit_one(db,owner)['state']=='admitted'
 
 
+def test_stalled_dependencies_release_valuation_slots_but_keep_total_bound(tmp_path):
+    from tests.test_continuous_admission import setup as admission_setup
+    from flowhub.pipeline_modules.admission import admit_one
+    db,owner=admission_setup(tmp_path)
+    (tmp_path/'repair-workflow.json').write_text('{"enabled":true,"valuation_queue_limit":1}')
+    with db.connect() as c:
+        c.execute('INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)',
+                  (owner,'blocked','3','needs_fields',json.dumps({'repair_workflow':{'admission_parked':True}}),0,0))
+        c.execute("UPDATE pipeline_campaigns SET body=json_set(body,'$.max_repair_pending',2)")
+    assert admit_one(db,owner)['state']=='admitted'
+    result=admit_one(db,owner)
+    assert result['state']=='backpressure' and result['repair_pending']==1
+
+
+@pytest.mark.asyncio
+async def test_dependency_without_progress_parks_only_admission_slot(tmp_path,monkeypatch):
+    from flowhub.pipeline_modules import repair_workflow
+    from flowhub.pipeline_modules.repair import PriceRepairModule
+    db,owner=configured(tmp_path,publication=False)
+    with db.connect() as c:
+        route=c.execute('SELECT store_id FROM plugin_routes WHERE owner=? AND sku=? AND seller=?',(owner,'1','2')).fetchone()[0]
+        queue=json.loads(c.execute('SELECT body FROM plugin_pipeline WHERE sku="1"').fetchone()[0])
+        repair_workflow.schema(c)
+        work={'identity':repair_workflow.fingerprint(queue,route),'kind':'valuation','stage':'source',
+              'state':'waiting','last_progress_at':time.time()-3600,'attempts':{'source':2},
+              'dependency_attempts':2,'next_at':0}
+        c.execute('INSERT INTO repair_workflows VALUES(?,?,?,?,?)',(owner,'1','2',json.dumps(work),time.time()))
+        c.execute('INSERT INTO plugin_pipeline_leases VALUES(?,?,?,?,?)',(owner,'1','2','lease',time.time()+60))
+    async def waiting(self,*args,**kwargs):
+        return {'state':'waiting','reason':'favorite outcome unknown','failure_class':'remote_pending'}
+    monkeypatch.setattr(PriceRepairModule,'run_stage',waiting)
+    result=await repair_workflow.run_one(PriceRepairModule(),db,owner,'1','2')
+    assert result['state']=='waiting' and result['workflow']['admission_parked']
+    with db.connect() as c:
+        assert c.execute('SELECT count(*) FROM plugin_pipeline WHERE state="needs_fields"').fetchone()[0]==1
+
+
 @pytest.mark.asyncio
 async def test_completed_source_validation_is_not_starved_by_older_source_backlog(tmp_path,monkeypatch):
     db,owner=configured(tmp_path);seen=[]

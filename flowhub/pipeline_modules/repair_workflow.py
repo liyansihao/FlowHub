@@ -15,13 +15,16 @@ PUBLICATION_SQL="(COALESCE(json_extract(q.body,'$.official_dossier_pending'),0)=
 def config(db):
     path=db.directory/'repair-workflow.json'
     cfg={'enabled':False,'valuation_workers':1,'publication_workers':1,'valuation_queue_limit':16,
-         'facts_timeout':60,'source_timeout':120,'validate_timeout':120}
+         'facts_timeout':60,'source_timeout':120,'validate_timeout':120,
+         'dependency_slot_timeout_seconds':1800}
     if path.exists():cfg.update(json.loads(path.read_text()))
     if any(cfg[k] not in (1,2) for k in ('valuation_workers','publication_workers')):
         raise ValueError('repair workers must remain bounded to one or two per lane')
     if not 1<=cfg['valuation_queue_limit']<=48:raise ValueError('invalid valuation queue bound')
     if any(not 1<=cfg[k]<=180 for k in ('facts_timeout','source_timeout','validate_timeout')):
         raise ValueError('invalid repair stage timeout')
+    if not 300<=cfg['dependency_slot_timeout_seconds']<=86400:
+        raise ValueError('invalid dependency slot timeout')
     return cfg
 
 
@@ -89,7 +92,8 @@ async def run_one(module,db,owner,sku,seller):
     now=time.time();work['attempts'][stage]=work['attempts'].get(stage,0)+1
     work.update(last_elapsed_seconds=round(now-began,3),updated_at=now,missing_fields=result.get('missing_fields',[]),reason=result['reason'])
     if result['state'] in ('ready','progress'):
-        work.update(state=result['state'],next_at=now,last_progress_at=now,dependency_attempts=0,failures=0,failure_class=None)
+        work.update(state=result['state'],next_at=now,last_progress_at=now,dependency_attempts=0,
+                    failures=0,failure_class=None,admission_parked=False)
         if result['state']=='progress':
             work['stage']=result['next_stage']
             work['next_at']=now+result.get('retry_after',0)
@@ -97,6 +101,11 @@ async def run_one(module,db,owner,sku,seller):
         category=result.get('failure_class') or 'missing_fields';work['failure_class']=category
         dependency=category in ('network','remote_pending','capacity','rate_deferred','operation_timeout','auth_expired')
         name='dependency_attempts' if dependency else 'failures';work[name]=work.get(name,0)+1
+        # A long unresolved remote write remains in its original journal and
+        # keeps retrying safely, but must not consume a fresh valuation slot.
+        if dependency and work[name]>=3 and now-work['last_progress_at']>=cfg['dependency_slot_timeout_seconds']:
+            work['admission_parked']=True
+            work.setdefault('admission_parked_at',now)
         manual=not dependency and (stage=='validate' or work[name]>=3 or category=='identity_mismatch')
         delay=result.get('retry_after') or (min(900,30*2**min(work[name]-1,5)) if dependency else 300)
         work.update(state='manual' if manual else 'waiting',next_at=now+delay)
