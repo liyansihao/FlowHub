@@ -471,6 +471,29 @@ async def test_failed_favorite_lookup_db_wait_does_not_block_loop(tmp_path, cont
     assert (row[0] if row else None) == ('favorite_started' if favorite_attempted else None)
 
 
+async def test_initial_source_claim_db_wait_does_not_block_loop(tmp_path, context):
+    db = Database(tmp_path)
+    collector = SourceCollector(db, context)
+
+    async def stop_after_claim(*, claimed):
+        raise Pending('stop after claim')
+
+    collector.find_favorite = stop_after_claim
+    lock = sqlite3.connect(db.path)
+    lock.execute('BEGIN IMMEDIATE')
+    task = asyncio.create_task(collector.collect_legacy())
+    try:
+        began = time.monotonic()
+        await asyncio.sleep(0.05)
+        assert time.monotonic() - began < 0.5
+        assert not task.done()
+    finally:
+        lock.rollback()
+        lock.close()
+    with pytest.raises(Pending, match='stop after claim'):
+        await asyncio.wait_for(task, 2)
+
+
 async def test_imported_favorite_recovers_existing_draft_without_import(tmp_path, context):
     collector = SourceCollector(Database(tmp_path), context)
     collector.recovery_pages.clear()

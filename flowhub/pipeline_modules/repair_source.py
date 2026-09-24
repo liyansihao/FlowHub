@@ -1,5 +1,6 @@
 """One source-dossier acquisition stage using the existing durable write journal."""
 import time
+from .database_work import run as database_work
 
 async def supplement(db,owner,sku,seller,p,review,context,evidence,require_dossier,official_pending):
     from .repair import missing_fields, valuation_ready, merge_draft
@@ -15,7 +16,8 @@ async def supplement(db,owner,sku,seller,p,review,context,evidence,require_dossi
     acquired=False
     if ((not can_value or require_dossier) and any(k in missing_fields(p) for k in ('weight_g','dimensions_mm','attributes','title','image','url','fresh_dossier'))) or (official_pending and not p.get('ozon_dossier',{}).get('attributes')):
         from ..acquisition import saved_candidate
-        existing=saved_candidate(db,SourceCollector(db,context|{'owner':owner,'candidate':{'source_key':sku}}).key)
+        key=SourceCollector(db,context|{'owner':owner,'candidate':{'source_key':sku}},ensure_schema=False).key
+        existing=await database_work(saved_candidate,db,key)
         quote=sale_price(p)
         if quote is None:
             # A stored real reference price may seed acquisition metadata only.
@@ -42,7 +44,8 @@ async def supplement(db,owner,sku,seller,p,review,context,evidence,require_dossi
         draft_context=context|{'owner':owner,'existing_favorite_only':draft_price is None,
             'candidate':{'source_key':sku,'title':p.get('title',''),'image':p.get('image',''),'price':draft_price}}
         try:
-            snapshot=await SourceCollector(db,draft_context).collect()
+            collector=await database_work(SourceCollector,db,draft_context)
+            snapshot=await collector.collect()
             from ..cluster_compute import remote
             packet=await remote('dossier',{'sku':str(p['sku']),'snapshot':snapshot})
             p=merge_draft(p,snapshot,now=time.time(),packet=packet)

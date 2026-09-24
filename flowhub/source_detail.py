@@ -249,15 +249,15 @@ class SourceCollector:
 
     async def collect_legacy(self):
         # Claim once per source/account. A crashed collecting call is not repeated blindly.
-        with self.db.connect() as db:
-            inserted = (
-                db.execute(
+        def claim_once():
+            with self.db.connect() as db:
+                return db.execute(
                     "INSERT OR IGNORE INTO source_details VALUES(?,?,?,?)",
                     (self.key, "claimed", self.db.seal({}), time.time()),
-                ).rowcount
-                == 1
-            )
-        state, data, updated = self.load()
+                ).rowcount == 1
+
+        inserted = await database_work(claim_once)
+        state, data, updated = await database_work(self.load)
         observed = data.get('observed_at')
         if (state == "ready" and 0 <= time.time() - updated < 21600
                 and isinstance(observed, (int, float)) and not isinstance(observed, bool)
@@ -265,16 +265,22 @@ class SourceCollector:
             return data
         if data.get('draft_id'):
             from .collection_capacity import account
-            with self.db.connect() as db:
-                exists=db.execute("SELECT 1 FROM sqlite_master WHERE name='draft_cleanup_receipts'").fetchone()
-                deleted=db.execute("SELECT 1 FROM draft_cleanup_receipts WHERE account=? AND draft_id=? AND sku=? AND state='deleted'",
-                    (account(self.c),str(data['draft_id']),self.sku)).fetchone() if exists else None
-                if deleted:
+            def reclaim_deleted_draft():
+                with self.db.connect() as db:
+                    exists=db.execute("SELECT 1 FROM sqlite_master WHERE name='draft_cleanup_receipts'").fetchone()
+                    deleted=db.execute("SELECT 1 FROM draft_cleanup_receipts WHERE account=? AND draft_id=? AND sku=? AND state='deleted'",
+                        (account(self.c),str(data['draft_id']),self.sku)).fetchone() if exists else None
+                    if not deleted:
+                        return None
                     replacement={'source_key':self.sku,'replaces_deleted_draft_id':data['draft_id']}
-                    inserted=db.execute("UPDATE source_details SET state='claimed',body=?,updated=? WHERE key=? AND state=? AND updated=?",
+                    claimed=db.execute("UPDATE source_details SET state='claimed',body=?,updated=? WHERE key=? AND state=? AND updated=?",
                         (self.db.seal(replacement),time.time(),self.key,state,updated)).rowcount==1
-                    if not inserted:raise Pending('source acquisition changed during draft reclamation')
-                    state,data='claimed',replacement
+                    if not claimed:raise Pending('source acquisition changed during draft reclamation')
+                    return replacement
+            replacement=await database_work(reclaim_deleted_draft)
+            if replacement is not None:
+                inserted=True
+                state,data='claimed',replacement
         if data.get("draft_id"):
             detail = await self.call(
                 "/api.product.collect/detail", query={"id": data["draft_id"], "is_online": 0}
@@ -291,17 +297,16 @@ class SourceCollector:
             # is recovered by lookup only; the write itself is never replayed.
             if state == "favorite_started":
                 data["favorite_attempted"] = True
-            with self.db.connect() as db:
-                inserted = (
-                    db.execute(
+            def renew_stale_claim():
+                with self.db.connect() as db:
+                    return db.execute(
                         "UPDATE source_details SET state='claimed',body=?,updated=? WHERE key=? AND state=? AND updated=?",
                         (self.db.seal(data), time.time(), self.key, state, updated),
-                    ).rowcount
-                    == 1
-                )
+                    ).rowcount == 1
+            inserted = await database_work(renew_stale_claim)
         if not inserted:
             raise Pending("source draft outcome unresolved; not creating another draft")
-        self.claim_updated = self.load()[2]
+        self.claim_updated = (await database_work(self.load))[2]
         try:
             favorite = await self.find_favorite(claimed=True)
             await database_work(self.renew_claim)
@@ -346,7 +351,7 @@ class SourceCollector:
                 raise
             # Keep the unknown marker while renewing the lease for a long lookup.
             await database_work(self.save,"claimed", {"source_key": self.sku, "favorite_attempted": True})
-            self.claim_updated = self.load()[2]
+            self.claim_updated = (await database_work(self.load))[2]
             favorite = await self.find_favorite(claimed=True)
             await database_work(self.renew_claim)
         if favorite is None:
