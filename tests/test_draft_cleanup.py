@@ -1,4 +1,4 @@
-import json,time
+import asyncio,json,threading,time
 import pytest
 from flowhub.db import Database
 from flowhub.pipeline_modules.admission import schema as pipeline_schema
@@ -172,6 +172,37 @@ async def test_remote_failure_retries_same_candidate_page_after_backoff(tmp_path
  assert (await cleanup.tick(db))[0]['state']=='no_safe_candidates'
  with db.connect() as c:
   assert c.execute('SELECT last_rowid FROM draft_cleanup_scan_cursors WHERE owner=?',(owner,)).fetchone()[0]==12
+
+
+@pytest.mark.asyncio
+async def test_backoff_write_wait_does_not_block_event_loop(tmp_path,monkeypatch):
+ db,owner,item=setup(tmp_path)
+ monkeypatch.setattr(cleanup,'candidates',lambda *args:{'account':[item]})
+ entered=threading.Event();release=threading.Event();holder=[]
+ def hold_writer():
+  with db.connect() as c:
+   c.execute('BEGIN IMMEDIATE')
+   entered.set()
+   release.wait(2)
+ async def no_candidates(*args,**kwargs):
+  holder.append(asyncio.create_task(asyncio.to_thread(hold_writer)))
+  await asyncio.to_thread(entered.wait)
+  return {'state':'no_safe_candidates','deleted':0,'examined':1}
+ monkeypatch.setattr(cleanup,'clean_account',no_candidates)
+ task=asyncio.create_task(cleanup.tick(db))
+ try:
+  await asyncio.wait_for(asyncio.to_thread(entered.wait),1)
+  async def heartbeat():
+   for _ in range(5):await asyncio.sleep(.02)
+  await asyncio.wait_for(heartbeat(),.3)
+  assert not task.done()
+ finally:
+  release.set()
+  await asyncio.gather(*holder)
+ result=await asyncio.wait_for(task,2)
+ assert result[0]['next_scan_after_seconds']==600
+ with db.connect() as c:
+  assert c.execute('SELECT failures FROM draft_cleanup_backoff WHERE account="account"').fetchone()[0]==1
 
 
 @pytest.mark.asyncio

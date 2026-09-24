@@ -8,6 +8,7 @@ from pathlib import Path
 from ..maozi import MaoziPublisher
 from ..source_detail import SourceCollector
 from . import control
+from .database_work import run as database_work
 
 DEFAULTS={'enabled':False,'threshold_ratio':0.85,'target_ratio':0.80,'batch_size':20,'scan_limit':20,'interval_seconds':300,'minimum_age_seconds':3600,
           'paged_scan':False,'candidate_page_size':100}
@@ -243,27 +244,51 @@ async def clean_account(db,owner,account,items,settings,client=None):
     return summary|{'state':'cleaned' if summary['deleted'] else 'no_safe_candidates','examined':examined}
 
 
+def active_owners(db):
+    with db.connect() as c:
+        return [r[0] for r in c.execute('SELECT p.owner FROM pipeline_campaigns p JOIN users u ON u.id=p.owner WHERE p.enabled=1 AND u.active=1')]
+
+
+def scan_cursor(db,owner):
+    with db.connect() as c:
+        return c.execute('SELECT last_rowid FROM draft_cleanup_scan_cursors WHERE owner=?',(owner,)).fetchone()
+
+
+def account_backoff(db,account):
+    with db.connect() as c:
+        c.execute('CREATE TABLE IF NOT EXISTS draft_cleanup_backoff(account TEXT PRIMARY KEY,failures INTEGER,due REAL)')
+        return c.execute('SELECT failures,due FROM draft_cleanup_backoff WHERE account=?',(account,)).fetchone()
+
+
+def save_backoff(db,account,failures,delay):
+    with db.connect() as c:
+        c.execute('INSERT OR REPLACE INTO draft_cleanup_backoff VALUES(?,?,?)',(account,failures,time.time()+delay))
+
+
+def restore_scan_cursor(db,owner,previous_cursor):
+    with db.connect() as c:
+        if previous_cursor is None:c.execute('DELETE FROM draft_cleanup_scan_cursors WHERE owner=?',(owner,))
+        else:c.execute('INSERT OR REPLACE INTO draft_cleanup_scan_cursors VALUES(?,?)',(owner,previous_cursor[0]))
+
+
 async def tick(db):
     settings=config(db)
-    if not settings['enabled'] or control.paused(db,'seed'):return []
-    schema(db)
+    if not settings['enabled'] or await database_work(control.paused,db,'seed'):return []
+    await database_work(schema,db)
     with (Path(db.directory)/'draft-cleanup.lock').open('a') as lock:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:return []
-        with db.connect() as c:owners=[r[0] for r in c.execute('SELECT p.owner FROM pipeline_campaigns p JOIN users u ON u.id=p.owner WHERE p.enabled=1 AND u.active=1')]
+        owners=await database_work(active_owners,db)
         results=[]
         for owner in owners:
             previous_cursor=None
             if settings.get('paged_scan'):
-                with db.connect() as c:
-                    previous_cursor=c.execute('SELECT last_rowid FROM draft_cleanup_scan_cursors WHERE owner=?',(owner,)).fetchone()
-            groups=await asyncio.to_thread(candidates,db,owner,settings)
+                previous_cursor=await database_work(scan_cursor,db,owner)
+            groups=await database_work(candidates,db,owner,settings)
             processed=0
             retry_page=False
             for account,items in groups.items():
-                with db.connect() as c:
-                    c.execute('CREATE TABLE IF NOT EXISTS draft_cleanup_backoff(account TEXT PRIMARY KEY,failures INTEGER,due REAL)')
-                    backoff=c.execute('SELECT failures,due FROM draft_cleanup_backoff WHERE account=?',(account,)).fetchone()
+                backoff=await database_work(account_backoff,db,account)
                 if backoff and backoff['due']>time.time():continue
                 processed+=1
                 started=time.time()
@@ -276,16 +301,13 @@ async def tick(db):
                             and result.get('examined',0)==0)
                 failures=(backoff['failures'] if backoff else 0)+1 if result['state']=='error' or (result['state']=='no_safe_candidates' and not empty_page) else 0
                 delay=min(1800,settings['interval_seconds']*2**min(failures,5)) if failures else settings['interval_seconds']
-                with db.connect() as c:
-                    c.execute('INSERT OR REPLACE INTO draft_cleanup_backoff VALUES(?,?,?)',(account,failures,time.time()+delay))
+                await database_work(save_backoff,db,account,failures,delay)
                 result.update(consecutive_no_progress=failures,next_scan_after_seconds=delay)
-                control.record(db,'seed',owner,'',started,'draft_cleanup',result);results.append(result)
+                await database_work(control.record,db,'seed',owner,'',started,'draft_cleanup',result);results.append(result)
             if groups and (not processed or retry_page) and settings.get('paged_scan'):
                 # A failed or paused account must see this page again after
                 # backoff; successful receipts make a repeated page safe.
-                with db.connect() as c:
-                    if previous_cursor is None:c.execute('DELETE FROM draft_cleanup_scan_cursors WHERE owner=?',(owner,))
-                    else:c.execute('INSERT OR REPLACE INTO draft_cleanup_scan_cursors VALUES(?,?)',(owner,previous_cursor[0]))
+                await database_work(restore_scan_cursor,db,owner,previous_cursor)
         return results
 
 
@@ -296,5 +318,5 @@ async def run(db):
             await tick(db)
             interval=config(db)['interval_seconds']
         except Exception as error:
-            control.record(db,'seed','','',time.time(),'draft_cleanup_error',{'error_type':type(error).__name__})
+            await database_work(control.record,db,'seed','','',time.time(),'draft_cleanup_error',{'error_type':type(error).__name__})
         await asyncio.sleep(interval)
