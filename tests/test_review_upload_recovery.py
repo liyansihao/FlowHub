@@ -10,7 +10,7 @@ from PIL import Image
 from comparebot.adapters.alibaba1688.image_search import (
     Alibaba1688ImageSearchAdapter, SearchUnavailable, prepare_search_image,
 )
-from flowhub.comparebot_process import ScreeningFailure, ScreeningWorker
+from flowhub.comparebot_process import ScreeningExecutionError, ScreeningFailure, ScreeningWorker
 
 
 def test_upload_copy_is_bounded_and_original_unchanged():
@@ -83,6 +83,39 @@ def test_broken_worker_protocol_stops_worker():
         worker.stop = AsyncMock()
         with pytest.raises(ValueError):
             await worker.call('rank', {}, '')
+        worker.stop.assert_awaited_once()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('error_type,expected', [
+    ('RuntimeError', 'RuntimeError'),
+    ('Api-Key: private', 'unknown_error'),
+])
+def test_nonreusable_worker_error_records_safe_stage_and_stops_worker(error_type, expected):
+    async def run():
+        worker = ScreeningWorker()
+        worker.process = SimpleNamespace(returncode=None, stdin=SimpleNamespace(write=Mock(), drain=AsyncMock()),
+            stdout=SimpleNamespace(readline=AsyncMock(return_value=json.dumps({
+                'ok': False, 'reusable': False, 'error': error_type,
+            }).encode())))
+        worker.stop = AsyncMock()
+        with pytest.raises(ScreeningExecutionError) as failure:
+            await worker.call('screen', {}, '')
+        assert failure.value.diagnostic == {'stage': 'screen', 'code': expected}
+        assert 'private' not in str(failure.value)
+        worker.stop.assert_awaited_once()
+    asyncio.run(run())
+
+
+def test_exited_worker_records_safe_stage_and_stops_worker():
+    async def run():
+        worker = ScreeningWorker()
+        worker.process = SimpleNamespace(returncode=None, stdin=SimpleNamespace(write=Mock(), drain=AsyncMock()),
+            stdout=SimpleNamespace(readline=AsyncMock(return_value=b'')))
+        worker.stop = AsyncMock()
+        with pytest.raises(ScreeningExecutionError) as failure:
+            await worker.call('rank', {}, '')
+        assert failure.value.diagnostic == {'stage': 'rank', 'code': 'worker_exited'}
         worker.stop.assert_awaited_once()
     asyncio.run(run())
 

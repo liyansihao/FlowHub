@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from .modules import ModuleError
@@ -14,6 +15,15 @@ class ScreeningFailure(ModuleError):
     def __init__(self, diagnostic):
         self.diagnostic = diagnostic
         super().__init__(f"compareBot {diagnostic['stage']}/{diagnostic['code']}")
+
+
+class ScreeningExecutionError(ModuleError):
+    """A failed worker request with only its safe stage and exception class."""
+    def __init__(self, mode, error_type):
+        stage = mode if mode in ('rank', 'screen') else 'unknown'
+        code = error_type if isinstance(error_type, str) and re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', error_type) else 'unknown_error'
+        self.diagnostic = {'stage': stage, 'code': code}
+        super().__init__(f'compareBot {stage}/{code}')
 
 
 class ScreeningWorker:
@@ -46,13 +56,13 @@ class ScreeningWorker:
                 await self.process.stdin.drain()
                 line = await asyncio.wait_for(self.process.stdout.readline(), 90 if mode == 'rank' else 70)
                 if not line:
-                    raise RuntimeError('compareBot worker exited; review remains unapproved')
+                    raise ScreeningExecutionError(mode, 'worker_exited')
                 result = json.loads(line)
                 if not result.get('ok'):
                     diagnostic = result.get('diagnostic')
                     if result.get('reusable') and isinstance(diagnostic, dict):
                         raise ScreeningFailure(diagnostic)
-                    raise RuntimeError('compareBot worker failed; review remains unapproved')
+                    raise ScreeningExecutionError(mode, result.get('error'))
             except ScreeningFailure:
                 # The request failed upstream; the DINO model remains healthy.
                 raise
