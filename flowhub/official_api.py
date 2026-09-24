@@ -7,6 +7,7 @@ can batch them explicitly. Writes are dispatched once and are never retried here
 import asyncio
 import hashlib
 import json
+import os
 import time
 import weakref
 from email.utils import parsedate_to_datetime
@@ -79,7 +80,9 @@ class OfficialTransport(httpx.AsyncBaseTransport):
         self.db, self.interval = db, interval
         # Never persist the API key, and changing credentials unblocks only that binding.
         self.account = hashlib.sha256((str(keys["client_id"]) + "\0" + keys["api_key"]).encode()).hexdigest()
-        self.inner = transport if transport is not None else httpx.AsyncHTTPTransport(retries=0)
+        self.inner = transport if transport is not None else httpx.AsyncHTTPTransport(
+            retries=0, proxy=os.environ.get("FLOWHUB_OZON_SELLER_PROXY") or None
+        )
         schema(db)
 
     def metric(self, path, *, cached=False, error=False, elapsed=0):

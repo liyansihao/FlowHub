@@ -1,6 +1,7 @@
 """Existing FlowEF Maozi protocol, parameterized with this user's store credentials only."""
 
 from datetime import datetime
+import os
 
 import httpx
 
@@ -44,6 +45,7 @@ class MaoziPublisher:
             headers={"Client-Id": self.keys["client_id"], "Api-Key": self.keys["api_key"]},
             timeout=25,
             trust_env=False,
+            proxy=os.environ.get("FLOWHUB_OZON_SELLER_PROXY") or None,
         ) as client:
             r = await client.post(path, json=body)
             r.raise_for_status()
