@@ -78,6 +78,8 @@ async def run(db, *, review_workers=2, submit_workers=2, reconcile_workers=2, se
         for index in range(count):
             start(f'{name}:{index}', lambda name=name, index=index: lane(name,index))
     start('repair_maintenance', repair_maintenance)
+    from ..collection_recheck import run as collection_recheck
+    start('collection_recheck', lambda: collection_recheck(db))
     start('isolated_readback', isolated_readback)
     from ..listing_controls import run as listing_control_loop
     from .admission import run as admission_loop
