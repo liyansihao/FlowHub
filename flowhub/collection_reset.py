@@ -69,6 +69,8 @@ async def clear(db, context, client=None, progress=print):
             with db.connect() as c:
                 if any(not control.paused(db, m) for m in control.MODULES):
                     raise RuntimeError('maintenance pause changed; stop deleting')
+                from .favorite_retention import draft_retained
+                if draft_retained(c,identifier):continue
                 inserted = c.execute('INSERT OR IGNORE INTO draft_cleanup_receipts VALUES(?,?,?,?,?,?,?)',
                     (scope, identifier, context['owner'], str(row.get('goods_id','')), 'intent', db.seal(backup), time.time())).rowcount
             if not inserted:
@@ -120,6 +122,8 @@ async def retry_authorized(db, context, identifiers, authorization_id, client=No
             c.execute('BEGIN IMMEDIATE')
             if any(not c.execute('SELECT paused FROM pipeline_module_control WHERE module=?',(m,)).fetchone()[0] for m in control.MODULES):
                 raise RuntimeError('maintenance pause changed')
+            from .favorite_retention import draft_retained
+            if draft_retained(c,identifier):raise ValueError('draft retained by released favorite; cannot delete refresh source')
             inserted=c.execute('INSERT OR IGNORE INTO collection_reset_overrides VALUES(?,?,?,?,?)',
                 (authorization_id,scope,identifier,db.seal(dict(old)),time.time())).rowcount
             if not inserted:continue

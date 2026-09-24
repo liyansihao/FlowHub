@@ -7,6 +7,7 @@ from flowhub.pipeline_modules import control
 from flowhub.pipeline_modules.draft_cleanup import schema, journal
 from flowhub.source_detail import SourceCollector
 from flowhub.modules import Pending
+from flowhub.favorite_retention import draft_retained
 
 
 def setup(tmp_path):
@@ -29,6 +30,36 @@ class API:
         self.present=False
         if self.mode=='lost_ack':raise TimeoutError()
         return {}
+
+
+def certify_retained_draft(db):
+    with db.connect() as c:
+        c.execute('''CREATE TABLE favorite_release_certificates(
+            account TEXT, favorite_id TEXT, sku TEXT, source_key TEXT, draft_id TEXT,
+            state TEXT, proof TEXT, updated REAL, PRIMARY KEY(account,favorite_id))''')
+        c.execute('INSERT INTO favorite_release_certificates VALUES(?,?,?,?,?,?,?,?)',
+                  ('scope','favorite','123','123','8','deleted','{}',time.time()))
+
+
+@pytest.mark.asyncio
+async def test_released_favorite_draft_survives_explicit_clear(tmp_path):
+    db,ctx=setup(tmp_path);api=API();certify_retained_draft(db)
+    with db.connect() as c:assert draft_retained(c,8)
+    result=await clear(db,ctx,api,lambda _:None)
+    assert result['remaining']==1 and api.writes==0
+    with db.connect() as c:assert c.execute('SELECT count(*) FROM draft_cleanup_receipts').fetchone()[0]==0
+
+
+@pytest.mark.asyncio
+async def test_released_favorite_draft_survives_approved_retry(tmp_path):
+    db,ctx=setup(tmp_path);schema(db);api=API();certify_retained_draft(db)
+    journal(db,account(ctx),'8','a','123','unconfirmed',{})
+    with pytest.raises(ValueError,match='retained'):
+        await retry_authorized(db,ctx,['8'],'explicit-approval',api)
+    assert api.writes==0
+    with db.connect() as c:
+        assert c.execute('SELECT state FROM draft_cleanup_receipts WHERE draft_id="8"').fetchone()[0]=='unconfirmed'
+        assert c.execute('SELECT count(*) FROM collection_reset_overrides').fetchone()[0]==0
 
 
 @pytest.mark.asyncio
