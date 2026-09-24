@@ -253,20 +253,36 @@ async def tick(db):
         with db.connect() as c:owners=[r[0] for r in c.execute('SELECT p.owner FROM pipeline_campaigns p JOIN users u ON u.id=p.owner WHERE p.enabled=1 AND u.active=1')]
         results=[]
         for owner in owners:
-            for account,items in (await asyncio.to_thread(candidates,db,owner,settings)).items():
+            previous_cursor=None
+            if settings.get('paged_scan'):
+                with db.connect() as c:
+                    previous_cursor=c.execute('SELECT last_rowid FROM draft_cleanup_scan_cursors WHERE owner=?',(owner,)).fetchone()
+            groups=await asyncio.to_thread(candidates,db,owner,settings)
+            processed=0
+            for account,items in groups.items():
                 with db.connect() as c:
                     c.execute('CREATE TABLE IF NOT EXISTS draft_cleanup_backoff(account TEXT PRIMARY KEY,failures INTEGER,due REAL)')
                     backoff=c.execute('SELECT failures,due FROM draft_cleanup_backoff WHERE account=?',(account,)).fetchone()
                 if backoff and backoff['due']>time.time():continue
+                processed+=1
                 started=time.time()
                 try:result=await clean_account(db,owner,account,items,settings)
                 except Exception as error:result={'state':'error','error_type':type(error).__name__}
-                failures=(backoff['failures'] if backoff else 0)+1 if result['state'] in ('no_safe_candidates','error') else 0
+                # A paged scan that found no candidate must advance to the next
+                # page on schedule. Back off actual remote/database failures.
+                empty_page=(settings.get('paged_scan') and result['state']=='no_safe_candidates'
+                            and result.get('examined',0)==0)
+                failures=(backoff['failures'] if backoff else 0)+1 if result['state']=='error' or (result['state']=='no_safe_candidates' and not empty_page) else 0
                 delay=min(1800,settings['interval_seconds']*2**min(failures,5)) if failures else settings['interval_seconds']
                 with db.connect() as c:
                     c.execute('INSERT OR REPLACE INTO draft_cleanup_backoff VALUES(?,?,?)',(account,failures,time.time()+delay))
                 result.update(consecutive_no_progress=failures,next_scan_after_seconds=delay)
                 control.record(db,'seed',owner,'',started,'draft_cleanup',result);results.append(result)
+            if groups and not processed and settings.get('paged_scan'):
+                # No account could consume this page; retry it when backoff ends.
+                with db.connect() as c:
+                    if previous_cursor is None:c.execute('DELETE FROM draft_cleanup_scan_cursors WHERE owner=?',(owner,))
+                    else:c.execute('INSERT OR REPLACE INTO draft_cleanup_scan_cursors VALUES(?,?)',(owner,previous_cursor[0]))
         return results
 
 

@@ -124,6 +124,34 @@ def test_paged_candidate_scan_advances_and_wraps_without_full_queue_walk(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_empty_candidate_page_keeps_paged_scan_cadence(tmp_path,monkeypatch):
+ db,owner,item=setup(tmp_path)
+ (tmp_path/'draft-cleanup.json').write_text(json.dumps({'enabled':True,'paged_scan':True,'interval_seconds':300}))
+ monkeypatch.setattr(cleanup,'candidates',lambda *args:{'account':[item]})
+ async def empty(*args,**kwargs):return {'state':'no_safe_candidates','deleted':0,'examined':0}
+ monkeypatch.setattr(cleanup,'clean_account',empty)
+ assert (await cleanup.tick(db))[0]['next_scan_after_seconds']==300
+ with db.connect() as c:
+  assert c.execute('SELECT failures FROM draft_cleanup_backoff WHERE account="account"').fetchone()[0]==0
+
+
+@pytest.mark.asyncio
+async def test_backed_off_account_does_not_lose_candidate_page(tmp_path,monkeypatch):
+ db,owner,item=setup(tmp_path)
+ (tmp_path/'draft-cleanup.json').write_text(json.dumps({'enabled':True,'paged_scan':True}))
+ with db.connect() as c:
+  c.execute('CREATE TABLE draft_cleanup_backoff(account TEXT PRIMARY KEY,failures INTEGER,due REAL)')
+  c.execute('INSERT INTO draft_cleanup_backoff VALUES(?,?,?)',('account',7,time.time()+1800))
+ def page(db,owner,settings):
+  with db.connect() as c:c.execute('INSERT OR REPLACE INTO draft_cleanup_scan_cursors VALUES(?,?)',(owner,12))
+  return {'account':[item]}
+ monkeypatch.setattr(cleanup,'candidates',page)
+ assert await cleanup.tick(db)==[]
+ with db.connect() as c:
+  assert c.execute('SELECT last_rowid FROM draft_cleanup_scan_cursors WHERE owner=?',(owner,)).fetchone() is None
+
+
+@pytest.mark.asyncio
 async def test_unstable_pagination_cannot_prove_absence():
  class Moving:
   async def call(self,path,method='GET',params=None):
