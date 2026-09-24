@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from dataclasses import asdict
 from decimal import Decimal
 from pathlib import Path
@@ -46,7 +47,12 @@ async def _run(args: argparse.Namespace) -> None:
         specifications=dict(selected.get("specifications") or {}),
     )
     ranker = DinoV2Ranker(device=args.device)
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True, trust_env=False) as client:
+    async with httpx.AsyncClient(
+        timeout=30,
+        follow_redirects=True,
+        trust_env=False,
+        proxy=os.environ.get("FLOWHUB_REVIEW_IMAGE_PROXY") or None,
+    ) as client:
         service = SearchAndRankService(
             Alibaba1688ImageSearchAdapter(),
             HttpImageLoader(client),
@@ -76,4 +82,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
