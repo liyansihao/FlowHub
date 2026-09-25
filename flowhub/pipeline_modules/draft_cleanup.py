@@ -181,7 +181,7 @@ async def clean_account(db,owner,account,items,settings,client=None):
             body=db.open(r['body']);body['absence_verified_at']=time.time()
             journal(db,account,r['draft_id'],owner,r['sku'],'deleted',body)
     used=int(header.get('used',header.get('total',0)));limit=int(header.get('limit',0))
-    summary={'used_before':used,'limit':limit,'deleted':0,'skipped':0}
+    summary={'used_before':used,'limit':limit,'deleted':0,'skipped':0,'read_errors':0,'ineligible':0}
     if not settings.get('clear_completed') and (limit<=0 or used<limit*settings['threshold_ratio']):return summary|{'state':'below_threshold'}
     count=min(settings['batch_size'],len(items) if settings.get('clear_completed') else max(0,used-int(limit*settings['target_ratio'])))
     touched=[];seen=set();examined=0
@@ -205,14 +205,15 @@ async def clean_account(db,owner,account,items,settings,client=None):
         current=client;offer=item['queue'].get('offer_id')
         try:online=await sold_observation(db,owner,item,current)
         except Exception:
-            summary['skipped']+=1;continue
+            summary['skipped']+=1;summary['read_errors']+=1;continue
         if online is None:
-            summary['skipped']+=1;continue
+            summary['skipped']+=1;summary['ineligible']+=1;continue
         try:
             detail=await current.call('/api.product.collect/detail',params={'id':int(draft),'is_online':0})
         except Exception:
-            summary['skipped']+=1;continue
-        if not isinstance(detail,dict) or not detail.get('skus'):continue
+            summary['skipped']+=1;summary['read_errors']+=1;continue
+        if not isinstance(detail,dict) or not detail.get('skus'):
+            summary['ineligible']+=1;continue
         backup={'source_snapshot':item['snapshot'],'fresh_detail':detail,'draft_row':row,'online':online,
                 'at':time.time(),'source_record':item['source_record'],'scope':'source draft only'}
         with db.connect() as c:
@@ -304,15 +305,22 @@ async def tick(db):
                 # page on schedule. Back off actual remote/database failures.
                 empty_page=(settings.get('paged_scan') and result['state']=='no_safe_candidates'
                             and result.get('examined',0)==0)
-                pressured_empty_page=(empty_page and result.get('limit',0)>0
+                # A page whose candidates were safely rejected is progress through
+                # the bounded scan, not a failed remote read. Keep failure backoff
+                # when any stock or draft-detail read raised an exception.
+                safe_skip_page=(settings.get('paged_scan') and result['state']=='no_safe_candidates'
+                                and result.get('examined',0)>0 and result.get('read_errors')==0)
+                advanceable_page=empty_page or safe_skip_page
+                pressured_advanceable_page=(advanceable_page and result.get('limit',0)>0
                                       and result.get('used_before',0)>=int(result['limit']*settings['threshold_ratio']))
-                failures=(backoff['failures'] if backoff else 0)+1 if result['state']=='error' or (result['state']=='no_safe_candidates' and not empty_page) else 0
-                # Advance empty pages promptly only under configured capacity pressure.
+                failures=(backoff['failures'] if backoff else 0)+1 if result['state']=='error' or (result['state']=='no_safe_candidates' and not advanceable_page) else 0
+                # Advance safe pages promptly only under configured capacity pressure.
                 # The per-cycle candidate and deletion bounds remain unchanged.
-                delay=(60 if pressured_empty_page else
+                delay=(60 if pressured_advanceable_page else
                        min(1800,settings['interval_seconds']*2**min(failures,5)) if failures else settings['interval_seconds'])
                 await database_work(save_backoff,db,account,failures,delay)
-                result.update(consecutive_no_progress=failures,next_scan_after_seconds=delay)
+                result.update(consecutive_no_progress=failures,next_scan_after_seconds=delay,
+                              short_page_scan=pressured_advanceable_page)
                 await database_work(control.record,db,'seed',owner,'',started,'draft_cleanup',result);results.append(result)
             if groups and (not processed or retry_page) and settings.get('paged_scan'):
                 # A failed or paused account must see this page again after
@@ -327,7 +335,8 @@ async def run(db):
         try:
             results=await tick(db)
             interval=config(db)['interval_seconds']
-            if results and all(r.get('state')=='no_safe_candidates' and r.get('examined')==0 for r in results):
+            if results and all(r.get('state')=='no_safe_candidates' and
+                               (r.get('examined')==0 or r.get('short_page_scan')) for r in results):
                 interval=min(interval,min(r['next_scan_after_seconds'] for r in results))
         except Exception as error:
             await database_work(control.record,db,'seed','','',time.time(),'draft_cleanup_error',{'error_type':type(error).__name__})

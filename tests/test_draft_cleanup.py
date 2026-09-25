@@ -38,7 +38,9 @@ async def test_cleanup_exact_backup_and_unknown_delete_never_replayed(tmp_path,m
  db,owner,item=setup(tmp_path);api=Fake(mode)
  result=await cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api)
  with db.connect() as c:r=c.execute('SELECT * FROM draft_cleanup_receipts').fetchone()
- if mode=='no_stock':assert r is None and api.writes==0
+ if mode=='no_stock':
+  assert r is None and api.writes==0
+  assert result['ineligible']==1 and result['read_errors']==0
  else:
   assert db.open(r['body'])['fresh_detail']['title']=='backup'
   assert r['state']==('unconfirmed' if mode=='unknown_present' else 'deleted')
@@ -195,6 +197,66 @@ async def test_empty_candidate_page_shortens_worker_sleep_only_for_empty_page(tm
   raise asyncio.CancelledError()
  async def empty(*args,**kwargs):return [{'state':'no_safe_candidates','examined':0,'next_scan_after_seconds':60}]
  monkeypatch.setattr(cleanup,'tick',empty)
+ monkeypatch.setattr(cleanup.asyncio,'sleep',sleep)
+ with pytest.raises(asyncio.CancelledError):await cleanup.run(db)
+ assert delays==[60]
+
+
+@pytest.mark.asyncio
+async def test_safely_ineligible_paged_candidates_advance_under_capacity_pressure(tmp_path,monkeypatch):
+ db,owner,item=setup(tmp_path)
+ (tmp_path/'draft-cleanup.json').write_text(json.dumps({'enabled':True,'paged_scan':True,'interval_seconds':300}))
+ monkeypatch.setattr(cleanup,'candidates',lambda *args:{'account':[item]})
+ async def ineligible(*args,**kwargs):
+  return {'state':'no_safe_candidates','deleted':0,'examined':2,'skipped':2,
+          'read_errors':0,'ineligible':2,'used_before':924,'limit':1000}
+ monkeypatch.setattr(cleanup,'clean_account',ineligible)
+ result=(await cleanup.tick(db))[0]
+ assert result['next_scan_after_seconds']==60 and result['short_page_scan'] is True
+ with db.connect() as c:
+  assert c.execute('SELECT failures FROM draft_cleanup_backoff WHERE account="account"').fetchone()[0]==0
+
+
+@pytest.mark.asyncio
+async def test_candidate_read_error_keeps_failure_backoff(tmp_path,monkeypatch):
+ db,owner,item=setup(tmp_path)
+ (tmp_path/'draft-cleanup.json').write_text(json.dumps({'enabled':True,'paged_scan':True,'interval_seconds':300}))
+ monkeypatch.setattr(cleanup,'candidates',lambda *args:{'account':[item]})
+ async def failed_read(*args,**kwargs):
+  return {'state':'no_safe_candidates','deleted':0,'examined':2,'skipped':2,
+          'read_errors':1,'ineligible':1,'used_before':924,'limit':1000}
+ monkeypatch.setattr(cleanup,'clean_account',failed_read)
+ result=(await cleanup.tick(db))[0]
+ assert result['next_scan_after_seconds']==600 and result['short_page_scan'] is False
+ with db.connect() as c:
+  assert c.execute('SELECT failures FROM draft_cleanup_backoff WHERE account="account"').fetchone()[0]==1
+
+
+@pytest.mark.asyncio
+async def test_ineligible_paged_candidates_keep_normal_cadence_below_pressure(tmp_path,monkeypatch):
+ db,owner,item=setup(tmp_path)
+ (tmp_path/'draft-cleanup.json').write_text(json.dumps({'enabled':True,'paged_scan':True,'interval_seconds':300}))
+ monkeypatch.setattr(cleanup,'candidates',lambda *args:{'account':[item]})
+ async def ineligible(*args,**kwargs):
+  return {'state':'no_safe_candidates','deleted':0,'examined':2,'skipped':2,
+          'read_errors':0,'ineligible':2,'used_before':800,'limit':1000}
+ monkeypatch.setattr(cleanup,'clean_account',ineligible)
+ result=(await cleanup.tick(db))[0]
+ assert result['next_scan_after_seconds']==300 and result['short_page_scan'] is False
+
+
+@pytest.mark.asyncio
+async def test_safely_ineligible_page_shortens_worker_sleep(tmp_path,monkeypatch):
+ db,owner,item=setup(tmp_path)
+ (tmp_path/'draft-cleanup.json').write_text(json.dumps({'enabled':True,'paged_scan':True,'interval_seconds':300}))
+ delays=[]
+ async def sleep(delay):
+  delays.append(delay)
+  raise asyncio.CancelledError()
+ async def ineligible(*args,**kwargs):
+  return [{'state':'no_safe_candidates','examined':2,'short_page_scan':True,
+           'next_scan_after_seconds':60}]
+ monkeypatch.setattr(cleanup,'tick',ineligible)
  monkeypatch.setattr(cleanup.asyncio,'sleep',sleep)
  with pytest.raises(asyncio.CancelledError):await cleanup.run(db)
  assert delays==[60]
