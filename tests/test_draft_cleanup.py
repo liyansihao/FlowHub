@@ -69,6 +69,25 @@ async def test_capacity_observation_does_not_block_cleanup_event_loop(tmp_path,m
 
 
 @pytest.mark.asyncio
+async def test_contended_prior_receipt_read_does_not_block_cleanup_event_loop(tmp_path,monkeypatch):
+ db,owner,item=setup(tmp_path);api=Fake()
+ original=cleanup.prior_receipts
+ loop=asyncio.get_running_loop();responded=loop.create_future();calls=[]
+ def slow_receipts(*args):
+  calls.append((threading.get_ident(),time.monotonic()))
+  loop.call_soon_threadsafe(lambda:responded.set_result(time.monotonic()))
+  time.sleep(.15)
+  return original(*args)
+ monkeypatch.setattr(cleanup,'prior_receipts',slow_receipts)
+ task=asyncio.create_task(cleanup.clean_account(db,owner,'account',[item],cleanup.config(db),api))
+ resumed_at=await asyncio.wait_for(responded,2)
+ assert resumed_at-calls[0][1]<.12
+ result=await task
+ assert result['deleted']==1 and api.writes==1
+ assert calls[0][0]!=threading.get_ident()
+
+
+@pytest.mark.asyncio
 async def test_pause_prevents_delete_after_reads(tmp_path):
  from flowhub.pipeline_modules.control import set_paused
  db,owner,item=setup(tmp_path);api=Fake();set_paused(db,'seed',True)

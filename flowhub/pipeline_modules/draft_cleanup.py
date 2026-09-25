@@ -8,7 +8,7 @@ from pathlib import Path
 from ..maozi import MaoziPublisher
 from ..source_detail import SourceCollector
 from . import control
-from .database_work import run as database_work
+from .database_work import read as database_read, run as database_work
 
 DEFAULTS={'enabled':False,'threshold_ratio':0.85,'target_ratio':0.80,'batch_size':20,'scan_limit':20,'interval_seconds':300,'minimum_age_seconds':3600,
           'paged_scan':False,'candidate_page_size':100}
@@ -70,6 +70,11 @@ def journal(db,account,draft_id,owner,sku,state,body):
     with db.connect() as c:
         c.execute('INSERT OR REPLACE INTO draft_cleanup_receipts VALUES(?,?,?,?,?,?,?)',
                   (account,str(draft_id),owner,sku,state,db.seal(body),time.time()))
+
+
+def prior_receipts(db,account):
+    with db.connect() as c:
+        return c.execute('SELECT * FROM draft_cleanup_receipts WHERE account=?',(account,)).fetchall()
 
 
 def candidates(db,owner,settings):
@@ -170,7 +175,7 @@ async def clean_account(db,owner,account,items,settings,client=None):
     await database_work(observe,db,account,header,read_started)
     present={str(r['id']):r for r in remote}
     # Unknown prior writes are reconciled by absence only, never replayed.
-    with db.connect() as c:prior=c.execute('SELECT * FROM draft_cleanup_receipts WHERE account=?',(account,)).fetchall()
+    prior=await database_read(prior_receipts,db,account)
     for r in prior:
         if r['state']!='deleted' and r['draft_id'] not in present:
             body=db.open(r['body']);body['absence_verified_at']=time.time()
