@@ -226,6 +226,7 @@ async def tick(db,config):
             await database_work(control.record,db,'seed',owner,result.get('sku',''),now,result['state'],result)
             await database_work(sync_stores,db,owner,config['run_id'])
         if await database_work(control.paused,db,'seed'):return {'state':'paused'}
+        sample=None
         if config.get('other_sellers_enabled'):
             from .. import other_sellers
             await database_work(other_sellers.schema,db)
@@ -244,11 +245,12 @@ async def tick(db,config):
                 await database_work(other_sellers.prepare_samples,db,owner)
             if discovery_due and backlog<config.get('max_source_backlog',2000):
                 result=await other_sellers.sample_one(db,owner,config)
-                if result['state']!='no_due_sample':return result
+                if result['state']!='no_due_sample':sample=result
         if backlog>=config.get('max_source_backlog',2000):return {'state':'source_backpressure','backlog':backlog}
         task=await database_work(choose,db,owner)
-        result=await collect(db,task,config) if task else {'state':'no_due_store'}
-        return result|{'enrolled':enrolled,'backlog':backlog}
+        result=await collect(db,task,config) if task else sample or {'state':'no_due_store'}
+        return result|{'enrolled':enrolled,'backlog':backlog,
+                       **({'sample_state':sample['state'],'sample_seller':sample['seller']} if task and sample else {})}
 
 
 async def run(db):

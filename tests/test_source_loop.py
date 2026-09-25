@@ -29,6 +29,33 @@ def test_discovery_idempotent_manual_pause_and_fair_rotation(tmp_path):
     assert loop.choose(db,'a',120)['seller']=='13'
 
 
+@pytest.mark.asyncio
+async def test_due_primary_store_runs_after_other_seller_sample(tmp_path,monkeypatch):
+    from flowhub import other_sellers
+    db=setup(tmp_path)
+    calls=[]
+    monkeypatch.setattr(other_sellers,'prepare_samples',lambda *args:None)
+    monkeypatch.setattr(other_sellers,'promote_qualified',lambda *args:None)
+    monkeypatch.setattr(other_sellers,'replenish',lambda *args,**kwargs:None)
+    async def discover(*args):return {'state':'no_due_discovery'}
+    async def sample(*args):
+        calls.append('sample')
+        return {'state':'retry_wait','seller':'99'}
+    async def collect(db,task,config):
+        calls.append('primary')
+        assert task['seller']=='12'
+        return {'state':'ready','seller':'12'}
+    monkeypatch.setattr(other_sellers,'discover_one',discover)
+    monkeypatch.setattr(other_sellers,'sample_one',sample)
+    monkeypatch.setattr(loop,'collect',collect)
+    result=await loop.tick(db,{'enabled':True,'owner':'a','run_id':'scan',
+                               'other_sellers_enabled':True})
+    assert calls==['sample','primary']
+    assert result['state']=='ready'
+    assert result['sample_state']=='retry_wait'
+    assert result['sample_seller']=='99'
+
+
 def test_network_retries_bounded_challenge_isolated_manual_retry(tmp_path):
     db=setup(tmp_path);loop.sync_stores(db,'a','scan',100);s=BrowserSource(db)
     task=loop.choose(db,'a',100);s.fail('a','scan','12','browser_navigation_TimeoutError')
