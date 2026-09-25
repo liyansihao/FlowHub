@@ -323,11 +323,12 @@ async def tick(db):
                 started=time.time()
                 try:result=await clean_account(db,owner,account,items,settings)
                 except Exception as error:result={'state':'error','error_type':type(error).__name__}
-                if result['state'] in ('error','paused','disabled'):retry_page=True
+                read_failed=result.get('read_errors',0)>0
+                if result['state'] in ('error','paused','disabled') or read_failed:retry_page=True
                 # A paged scan that found no candidate must advance to the next
                 # page on schedule. Back off actual remote/database failures.
                 empty_page=(settings.get('paged_scan') and result['state']=='no_safe_candidates'
-                            and result.get('examined',0)==0)
+                            and result.get('examined',0)==0 and not read_failed)
                 # A page whose candidates were safely rejected is progress through
                 # the bounded scan, not a failed remote read. Keep failure backoff
                 # when any stock or draft-detail read raised an exception.
@@ -336,7 +337,7 @@ async def tick(db):
                 advanceable_page=empty_page or safe_skip_page
                 pressured_advanceable_page=(advanceable_page and result.get('limit',0)>0
                                       and result.get('used_before',0)>=int(result['limit']*settings['threshold_ratio']))
-                failures=(backoff['failures'] if backoff else 0)+1 if result['state']=='error' or (result['state']=='no_safe_candidates' and not advanceable_page) else 0
+                failures=(backoff['failures'] if backoff else 0)+1 if result['state']=='error' or read_failed or (result['state']=='no_safe_candidates' and not advanceable_page) else 0
                 # Advance safe pages promptly only under configured capacity pressure.
                 # The per-cycle candidate and deletion bounds remain unchanged.
                 delay=(60 if pressured_advanceable_page else

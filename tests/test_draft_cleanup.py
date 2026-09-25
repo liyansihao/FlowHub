@@ -251,18 +251,44 @@ async def test_safely_ineligible_paged_candidates_advance_under_capacity_pressur
 
 
 @pytest.mark.asyncio
-async def test_candidate_read_error_keeps_failure_backoff(tmp_path,monkeypatch):
+@pytest.mark.parametrize('examined',[0,2])
+async def test_candidate_read_error_keeps_failure_backoff(tmp_path,monkeypatch,examined):
  db,owner,item=setup(tmp_path)
  (tmp_path/'draft-cleanup.json').write_text(json.dumps({'enabled':True,'paged_scan':True,'interval_seconds':300}))
- monkeypatch.setattr(cleanup,'candidates',lambda *args:{'account':[item]})
+ with db.connect() as c:c.execute('INSERT OR REPLACE INTO draft_cleanup_scan_cursors VALUES(?,?)',(owner,7))
+ def page(db,owner,settings):
+  with db.connect() as c:c.execute('INSERT OR REPLACE INTO draft_cleanup_scan_cursors VALUES(?,?)',(owner,12))
+  return {'account':[item]}
+ monkeypatch.setattr(cleanup,'candidates',page)
  async def failed_read(*args,**kwargs):
-  return {'state':'no_safe_candidates','deleted':0,'examined':2,'skipped':2,
-          'read_errors':1,'ineligible':1,'used_before':924,'limit':1000}
+  return {'state':'no_safe_candidates','deleted':0,'examined':examined,'skipped':examined,
+          'read_errors':1,'ineligible':max(0,examined-1),'used_before':924,'limit':1000}
  monkeypatch.setattr(cleanup,'clean_account',failed_read)
  result=(await cleanup.tick(db))[0]
  assert result['next_scan_after_seconds']==600 and result['short_page_scan'] is False
  with db.connect() as c:
   assert c.execute('SELECT failures FROM draft_cleanup_backoff WHERE account="account"').fetchone()[0]==1
+  assert c.execute('SELECT last_rowid FROM draft_cleanup_scan_cursors WHERE owner=?',(owner,)).fetchone()[0]==7
+
+
+@pytest.mark.asyncio
+async def test_partial_cleanup_with_read_error_retries_same_page(tmp_path,monkeypatch):
+ db,owner,item=setup(tmp_path)
+ (tmp_path/'draft-cleanup.json').write_text(json.dumps({'enabled':True,'paged_scan':True,'interval_seconds':300}))
+ with db.connect() as c:c.execute('INSERT OR REPLACE INTO draft_cleanup_scan_cursors VALUES(?,?)',(owner,7))
+ def page(db,owner,settings):
+  with db.connect() as c:c.execute('INSERT OR REPLACE INTO draft_cleanup_scan_cursors VALUES(?,?)',(owner,12))
+  return {'account':[item]}
+ monkeypatch.setattr(cleanup,'candidates',page)
+ async def partially_cleaned(*args,**kwargs):
+  return {'state':'cleaned','deleted':1,'examined':2,'skipped':1,
+          'read_errors':1,'ineligible':0,'used_before':924,'limit':1000}
+ monkeypatch.setattr(cleanup,'clean_account',partially_cleaned)
+ result=(await cleanup.tick(db))[0]
+ assert result['next_scan_after_seconds']==600
+ with db.connect() as c:
+  assert c.execute('SELECT failures FROM draft_cleanup_backoff WHERE account="account"').fetchone()[0]==1
+  assert c.execute('SELECT last_rowid FROM draft_cleanup_scan_cursors WHERE owner=?',(owner,)).fetchone()[0]==7
 
 
 @pytest.mark.asyncio
