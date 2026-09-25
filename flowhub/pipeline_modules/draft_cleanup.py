@@ -260,6 +260,17 @@ def scan_cursor(db,owner):
         return c.execute('SELECT last_rowid FROM draft_cleanup_scan_cursors WHERE owner=?',(owner,)).fetchone()
 
 
+def single_account_capacity(db):
+    """Return a recent capacity snapshot only when its account is unambiguous."""
+    with db.connect() as c:
+        if not c.execute("SELECT 1 FROM sqlite_master WHERE name='collection_capacity'").fetchone():return None
+        rows=c.execute('SELECT used,capacity,observed FROM collection_capacity').fetchall()
+    if (len(rows)!=1 or rows[0]['used'] is None or rows[0]['capacity'] is None
+            or rows[0]['capacity']<=0 or rows[0]['observed'] is None
+            or not 0<=time.time()-rows[0]['observed']<=300):return None
+    return rows[0]['used'],rows[0]['capacity']
+
+
 def account_backoff(db,account):
     with db.connect() as c:
         c.execute('CREATE TABLE IF NOT EXISTS draft_cleanup_backoff(account TEXT PRIMARY KEY,failures INTEGER,due REAL)')
@@ -290,7 +301,19 @@ async def tick(db):
             previous_cursor=None
             if settings.get('paged_scan'):
                 previous_cursor=await database_work(scan_cursor,db,owner)
+            page_started=time.time()
             groups=await database_work(candidates,db,owner,settings)
+            if settings.get('paged_scan') and not groups:
+                current_cursor=await database_work(scan_cursor,db,owner)
+                if current_cursor and (previous_cursor is None or current_cursor[0]!=previous_cursor[0]):
+                    capacity=await database_work(single_account_capacity,db)
+                    if capacity and capacity[0]>=int(capacity[1]*settings['threshold_ratio']):
+                        result={'state':'no_safe_candidates','deleted':0,'skipped':0,'examined':0,
+                                'read_errors':0,'ineligible':0,'used_before':capacity[0],
+                                'limit':capacity[1],'next_scan_after_seconds':60,
+                                'short_page_scan':True,'consecutive_no_progress':0}
+                        await database_work(control.record,db,'seed',owner,'',page_started,'draft_cleanup',result)
+                        results.append(result)
             processed=0
             retry_page=False
             for account,items in groups.items():

@@ -203,6 +203,39 @@ async def test_empty_candidate_page_shortens_worker_sleep_only_for_empty_page(tm
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('used,age,expected_interval',[(924,0,60),(800,0,None),(924,3600,None)])
+async def test_empty_local_candidate_page_shortens_only_under_fresh_capacity_pressure(tmp_path,used,age,expected_interval):
+ db,owner,item=setup(tmp_path)
+ (tmp_path/'draft-cleanup.json').write_text(json.dumps({'enabled':True,'paged_scan':True,
+                                                        'candidate_page_size':1,'interval_seconds':300}))
+ with db.connect() as c:
+  c.execute('INSERT INTO stores(id,owner,name,kind,config,secret) VALUES(?,?,?,?,?,?)',
+            ('s',owner,'test','maozi','{"shop_id":"4"}',db.seal({'erp_token':'test'})))
+  c.execute('INSERT INTO plugin_routes VALUES(?,?,?,?,?,?)',(owner,'123','2','s',0,'test'))
+  c.execute('CREATE TABLE collection_capacity(account TEXT PRIMARY KEY,used INTEGER,capacity INTEGER,observed REAL,blocked INTEGER)')
+  c.execute('INSERT INTO collection_capacity VALUES(?,?,?,?,?)',('account',used,1000,time.time()-age,0))
+ results=await cleanup.tick(db)
+ assert ([r['next_scan_after_seconds'] for r in results] if results else None)==(
+  [expected_interval] if expected_interval else None)
+ with db.connect() as c:
+  assert c.execute('SELECT last_rowid FROM draft_cleanup_scan_cursors WHERE owner=?',(owner,)).fetchone()[0]>0
+  assert c.execute('SELECT count(*) FROM draft_cleanup_receipts').fetchone()[0]==0
+
+
+@pytest.mark.asyncio
+async def test_no_local_page_advance_keeps_normal_sleep_even_under_pressure(tmp_path):
+ db,owner,item=setup(tmp_path)
+ (tmp_path/'draft-cleanup.json').write_text(json.dumps({'enabled':True,'paged_scan':True,
+                                                        'candidate_page_size':1,'interval_seconds':300}))
+ with db.connect() as c:
+  c.execute('CREATE TABLE collection_capacity(account TEXT PRIMARY KEY,used INTEGER,capacity INTEGER,observed REAL,blocked INTEGER)')
+  c.execute('INSERT INTO collection_capacity VALUES(?,?,?,?,?)',('account',924,1000,time.time(),0))
+ assert await cleanup.tick(db)==[]
+ with db.connect() as c:
+  assert c.execute('SELECT count(*) FROM draft_cleanup_scan_cursors').fetchone()[0]==0
+
+
+@pytest.mark.asyncio
 async def test_safely_ineligible_paged_candidates_advance_under_capacity_pressure(tmp_path,monkeypatch):
  db,owner,item=setup(tmp_path)
  (tmp_path/'draft-cleanup.json').write_text(json.dumps({'enabled':True,'paged_scan':True,'interval_seconds':300}))
