@@ -4,6 +4,7 @@ import pytest
 from flowhub.db import Database
 from flowhub.browser_source import BrowserSource
 from flowhub.pipeline_modules import source_loop as loop
+from flowhub.pipeline_modules.source_recovery import rearm
 from flowhub.pipeline_modules.control import set_paused
 from test_storefront import packet
 
@@ -39,6 +40,44 @@ def test_network_retries_bounded_challenge_isolated_manual_retry(tmp_path):
     assert loop.choose(db,'a',5000) is None
     s.control('a','scan','12','retry')
     assert loop.choose(db,'a',5000)['seller']=='12'
+
+
+def test_operator_rearms_only_proven_route_failures_without_resetting_cursor(tmp_path):
+    db=setup(tmp_path)
+    with db.connect() as c:
+        for seller in ('13','14'):
+            c.execute('INSERT INTO sourcing_seeds VALUES(?,?,?,?,?,0,1,?)',
+                      ('a','shop','offer'+seller,seller,json.dumps({'seller_id':seller}),100))
+    loop.sync_stores(db,'a','scan',100)
+    service=BrowserSource(db)
+    for seller,reason in [('12','browser_access_challenge'),
+                          ('13','browser_navigation_TimeoutError'),
+                          ('14','cursor_mismatch')]:
+        with db.connect() as c:
+            c.execute('UPDATE browser_source_scans SET page=3,next_url=? WHERE seller=?',
+                      (f'https://www.ozon.ru/seller/{seller}/products/?page=3',seller))
+        service.fail('a','scan',seller,reason)
+        task=loop.choose(db,'a',100)
+        assert task['seller']==seller
+        loop.finish(db,task,101)
+    with db.connect() as c:
+        c.execute("UPDATE source_loop_stores SET last_state='retry_exhausted' WHERE seller='13'")
+        before=[tuple(r) for r in c.execute('SELECT seller,page,next_url FROM browser_source_scans ORDER BY seller')]
+    with pytest.raises(ValueError,match='source_recovery_limit_out_of_range'):
+        rearm(db,'a','scan',limit=11,now=200)
+    with pytest.raises(ValueError,match='invalid_source_recovery_seller'):
+        rearm(db,'a','scan',seller='not-a-seller',now=200)
+    first=rearm(db,'a','scan',limit=1,seller='13',now=200)
+    assert len(first)==1 and first[0]['seller']=='13'
+    assert loop.choose(db,'a',200)['seller']=='13'
+    second=rearm(db,'a','scan',limit=10,now=201)
+    assert [r['seller'] for r in second]==['12']
+    with db.connect() as c:
+        after=[tuple(r) for r in c.execute('SELECT seller,page,next_url FROM browser_source_scans ORDER BY seller')]
+        assert after==before
+        assert c.execute("SELECT state FROM browser_source_scans WHERE seller='14'").fetchone()[0]=='blocked'
+        assert c.execute('SELECT COUNT(*) FROM browser_source_pages').fetchone()[0]==0
+        assert c.execute('SELECT COUNT(*) FROM browser_source_failures').fetchone()[0]==3
 
 
 @pytest.mark.asyncio
