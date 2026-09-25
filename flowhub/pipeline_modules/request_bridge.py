@@ -14,6 +14,10 @@ from flowef.application.errors import (ExternalContractError, RateLimited, Reque
 POOLS = {}
 
 
+def selected_erp_proxy(config):
+    return config.get('erp_proxy') or os.environ.get('FLOWHUB_MAOZI_ERP_PROXY') or None
+
+
 class Slot:
     process = None
 
@@ -30,10 +34,14 @@ async def close_requests():
 
 
 class PublicationBridge(FlowBBridge):
+    def __init__(self, workspace, *, execute=False, token=None, erp_proxy=None):
+        super().__init__(workspace, execute=execute, token=token)
+        self.erp_proxy = erp_proxy
+
     async def call(self, action, **args):
         if action != 'request':
             return await super().call(action, **args)
-        key=(asyncio.get_running_loop(),str(self.workspace),hashlib.sha256(self.token.encode()).hexdigest())
+        key=(asyncio.get_running_loop(),str(self.workspace),hashlib.sha256(self.token.encode()).hexdigest(),self.erp_proxy)
         if key not in POOLS:
             queue=asyncio.LifoQueue();slots=[Slot() for _ in range(5)]
             for slot in slots:queue.put_nowait(slot)
@@ -43,9 +51,12 @@ class PublicationBridge(FlowBBridge):
         dispatched=False
         try:
             if not slot.process or slot.process.returncode is not None:
+                env=os.environ|{'FLOWEF_LEGACY_ROOT':str(self.workspace),'MAOZI_ACCESS_TOKEN':self.token,'MAOZI_HTTP_BACKEND':'native','MAOZI_REQUIRE_FEISHU_DELIST':'1'}
+                if self.erp_proxy:
+                    env.update({'NODE_USE_ENV_PROXY':'1','HTTPS_PROXY':self.erp_proxy,'https_proxy':self.erp_proxy,'NO_PROXY':'','no_proxy':''})
                 slot.process=await asyncio.create_subprocess_exec('node',str(Path(__file__).resolve().parents[2]/'bridges/publication-request.mjs'),
                     stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL,
-                    limit=16*1024*1024,env=os.environ|{'FLOWEF_LEGACY_ROOT':str(self.workspace),'MAOZI_ACCESS_TOKEN':self.token,'MAOZI_HTTP_BACKEND':'native','MAOZI_REQUIRE_FEISHU_DELIST':'1'})
+                    limit=16*1024*1024,env=env)
             identity=str(time.monotonic_ns())
             payload={'id':identity,'action':action,'execute':self.execute,**args}
             slot.process.stdin.write(json.dumps(payload).encode()+b'\n');dispatched=True

@@ -101,6 +101,38 @@ async def test_native_process_reused_and_unknown_write_not_replayed(monkeypatch)
     assert bridge.last_timing['pool_wait_ms']>=0
     await request_bridge.close_requests()
 
+
+@pytest.mark.asyncio
+async def test_native_erp_proxy_is_opt_in_and_separates_process_pools(monkeypatch):
+    await request_bridge.close_requests()
+    monkeypatch.delenv('NODE_USE_ENV_PROXY', raising=False)
+    processes=[]; environments=[]
+    async def spawn(*a, **k):
+        processes.append(Process());environments.append(k['env'])
+        return processes[-1]
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', spawn)
+    direct=request_bridge.PublicationBridge(Path('/workspace'), execute=True, token='test')
+    fallback=request_bridge.PublicationBridge(Path('/workspace'), execute=True, token='test', erp_proxy='http://127.0.0.1:7897')
+    explicit=request_bridge.PublicationBridge(Path('/workspace'), execute=True, token='test', erp_proxy='http://127.0.0.1:7898')
+    for bridge in (direct, fallback, fallback, explicit):
+        await bridge.call('request', path='/api.product.import_logs/index', method='GET')
+    assert len(processes)==3
+    assert [p.writes for p in processes]==[1,2,1]
+    assert environments[0].get('NODE_USE_ENV_PROXY') != '1'
+    for env, proxy in zip(environments[1:], ('http://127.0.0.1:7897','http://127.0.0.1:7898')):
+        assert env['NODE_USE_ENV_PROXY']=='1'
+        assert env['HTTPS_PROXY']==env['https_proxy']==proxy
+        assert env['NO_PROXY']==env['no_proxy']==''
+    await request_bridge.close_requests()
+
+
+def test_selected_erp_proxy_preserves_explicit_store_precedence(monkeypatch):
+    monkeypatch.setenv('FLOWHUB_MAOZI_ERP_PROXY','http://127.0.0.1:7897')
+    assert request_bridge.selected_erp_proxy({})=='http://127.0.0.1:7897'
+    assert request_bridge.selected_erp_proxy({'erp_proxy':'http://127.0.0.1:7898'})=='http://127.0.0.1:7898'
+    monkeypatch.delenv('FLOWHUB_MAOZI_ERP_PROXY')
+    assert request_bridge.selected_erp_proxy({}) is None
+
 @pytest.mark.asyncio
 async def test_favorite_imported_view_and_truncation_are_explicit():
     from flowhub.pipeline_modules.favorite_lookup import PublicationSourceAdapter

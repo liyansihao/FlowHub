@@ -171,8 +171,9 @@ async def _advance(db, owner, sku, seller, *, native_follow=False):
     shop=str(config['shop_id']);warehouse=str(config['warehouse_id']);watermark=str(config['watermark_id'])
     journal=TestListingJournal(DATA/'plugin-production.sqlite3')
     ownership=ProductionOwnership(journal,ROOT/'maozi_direct_new_method/state/global-sku-claims','flowhub-plugin-production-v1')
-    from .pipeline_modules.request_bridge import PublicationBridge, MeasuredTransport
-    bridge=PublicationBridge(ROOT,execute=True,token=keys['erp_token'])
+    from .pipeline_modules.request_bridge import PublicationBridge, MeasuredTransport, selected_erp_proxy
+    bridge=PublicationBridge(ROOT,execute=True,token=keys['erp_token'],
+        erp_proxy=selected_erp_proxy(config))
     from .cluster_routing import route_bridge
     from .pipeline_modules.database_work import run as database_work
     await database_work(route_bridge,bridge, DATA, (owner, sku, seller))
