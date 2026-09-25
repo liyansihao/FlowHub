@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 from .source_library import identity
 
 ORIGIN = "https://www.ozon.ru"
+TRANSPORT_QUERY_KEYS = frozenset({"__rr"})
 
 
 class StorefrontError(ValueError):
@@ -73,7 +74,10 @@ def parse_packet(html, seller, requested_url):
         actual_url = shop_url(info["url"], seller, urlsplit(info["url"]).path)
         wanted_query = parse_qs(urlsplit(requested_url).query)
         actual_query = parse_qs(urlsplit(actual_url).query)
-        if actual_query != wanted_query:
+        # Ozon may add its risk-control redirect marker after the browser has
+        # passed verification. It is not a catalog cursor or a seller filter.
+        if ({k: v for k, v in actual_query.items() if k not in TRANSPORT_QUERY_KEYS}
+                != {k: v for k, v in wanted_query.items() if k not in TRANSPORT_QUERY_KEYS}):
             raise StorefrontError("cursor_mismatch")
         if parser.canonical:
             shop_url(parser.canonical, seller, urlsplit(actual_url).path)

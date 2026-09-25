@@ -51,6 +51,21 @@ def test_actual_cursor_sources_and_recommendations():
     assert parse_packet(packet(2, continuation=False), "12", "/seller/12/products/?page=2")["explicit_end"]
 
 
+def test_verified_seller_redirect_marker_does_not_change_catalog_cursor():
+    body = packet().replace('/seller/12/products/?page=2',
+                            '/seller/liansheng02/products/?__rr=1&page=2')
+    body = body.replace('"/seller/12/products/"',
+                        '"/seller/liansheng02/products/?__rr=1"')
+    parsed = parse_packet(body, '12', '/seller/12/products/')
+    assert parsed['page'] == 1
+    assert parsed['products'][0]['seller_id'] == '12'
+    assert 'page=2' in parsed['next_url']
+    with pytest.raises(StorefrontError, match='cursor_mismatch'):
+        parse_packet(body.replace('__rr=1"', '__rr=1&page=2"'), '12', '/seller/12/products/')
+    with pytest.raises(StorefrontError, match='identity_mismatch'):
+        parse_packet(body, '13', '/seller/13/products/')
+
+
 def test_pause_restart_replay_and_rollback(tmp_path):
     c = collector(tmp_path)
     c.prepare("a", {"12": [{"sku": "1"}]})
