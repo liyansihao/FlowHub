@@ -164,15 +164,40 @@ def test_paged_candidate_scan_advances_and_wraps_without_full_queue_walk(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_empty_candidate_page_keeps_paged_scan_cadence(tmp_path,monkeypatch):
+async def test_empty_candidate_page_advances_with_bounded_short_cadence(tmp_path,monkeypatch):
  db,owner,item=setup(tmp_path)
  (tmp_path/'draft-cleanup.json').write_text(json.dumps({'enabled':True,'paged_scan':True,'interval_seconds':300}))
  monkeypatch.setattr(cleanup,'candidates',lambda *args:{'account':[item]})
- async def empty(*args,**kwargs):return {'state':'no_safe_candidates','deleted':0,'examined':0}
+ async def empty(*args,**kwargs):return {'state':'no_safe_candidates','deleted':0,'examined':0,'used_before':924,'limit':1000}
  monkeypatch.setattr(cleanup,'clean_account',empty)
- assert (await cleanup.tick(db))[0]['next_scan_after_seconds']==300
+ assert (await cleanup.tick(db))[0]['next_scan_after_seconds']==60
  with db.connect() as c:
   assert c.execute('SELECT failures FROM draft_cleanup_backoff WHERE account="account"').fetchone()[0]==0
+
+
+@pytest.mark.asyncio
+async def test_empty_page_at_low_capacity_keeps_normal_cadence(tmp_path,monkeypatch):
+ db,owner,item=setup(tmp_path)
+ (tmp_path/'draft-cleanup.json').write_text(json.dumps({'enabled':True,'paged_scan':True,'interval_seconds':300}))
+ monkeypatch.setattr(cleanup,'candidates',lambda *args:{'account':[item]})
+ async def empty(*args,**kwargs):return {'state':'no_safe_candidates','deleted':0,'examined':0,'used_before':800,'limit':1000}
+ monkeypatch.setattr(cleanup,'clean_account',empty)
+ assert (await cleanup.tick(db))[0]['next_scan_after_seconds']==300
+
+
+@pytest.mark.asyncio
+async def test_empty_candidate_page_shortens_worker_sleep_only_for_empty_page(tmp_path,monkeypatch):
+ db,owner,item=setup(tmp_path)
+ (tmp_path/'draft-cleanup.json').write_text(json.dumps({'enabled':True,'paged_scan':True,'interval_seconds':300}))
+ delays=[]
+ async def sleep(delay):
+  delays.append(delay)
+  raise asyncio.CancelledError()
+ async def empty(*args,**kwargs):return [{'state':'no_safe_candidates','examined':0,'next_scan_after_seconds':60}]
+ monkeypatch.setattr(cleanup,'tick',empty)
+ monkeypatch.setattr(cleanup.asyncio,'sleep',sleep)
+ with pytest.raises(asyncio.CancelledError):await cleanup.run(db)
+ assert delays==[60]
 
 
 @pytest.mark.asyncio

@@ -304,8 +304,13 @@ async def tick(db):
                 # page on schedule. Back off actual remote/database failures.
                 empty_page=(settings.get('paged_scan') and result['state']=='no_safe_candidates'
                             and result.get('examined',0)==0)
+                pressured_empty_page=(empty_page and result.get('limit',0)>0
+                                      and result.get('used_before',0)>=int(result['limit']*settings['threshold_ratio']))
                 failures=(backoff['failures'] if backoff else 0)+1 if result['state']=='error' or (result['state']=='no_safe_candidates' and not empty_page) else 0
-                delay=min(1800,settings['interval_seconds']*2**min(failures,5)) if failures else settings['interval_seconds']
+                # Advance empty pages promptly only under configured capacity pressure.
+                # The per-cycle candidate and deletion bounds remain unchanged.
+                delay=(60 if pressured_empty_page else
+                       min(1800,settings['interval_seconds']*2**min(failures,5)) if failures else settings['interval_seconds'])
                 await database_work(save_backoff,db,account,failures,delay)
                 result.update(consecutive_no_progress=failures,next_scan_after_seconds=delay)
                 await database_work(control.record,db,'seed',owner,'',started,'draft_cleanup',result);results.append(result)
@@ -320,8 +325,10 @@ async def run(db):
     while True:
         interval=300
         try:
-            await tick(db)
+            results=await tick(db)
             interval=config(db)['interval_seconds']
+            if results and all(r.get('state')=='no_safe_candidates' and r.get('examined')==0 for r in results):
+                interval=min(interval,min(r['next_scan_after_seconds'] for r in results))
         except Exception as error:
             await database_work(control.record,db,'seed','','',time.time(),'draft_cleanup_error',{'error_type':type(error).__name__})
         await asyncio.sleep(interval)
