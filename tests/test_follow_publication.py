@@ -161,6 +161,85 @@ async def test_publication_repair_is_released_without_running_old_stages(tmp_pat
     assert b['publication_migrations'][0]['previous']['repair_retry']['total_attempts']==10
 
 
+@pytest.mark.asyncio
+async def test_follow_valuation_missing_direct_facts_goes_to_review_without_draft(tmp_path,monkeypatch):
+    from flowhub.maozi import MaoziPublisher
+    from flowhub.source_detail import SourceCollector
+    db,owner=configured(tmp_path,publication=False);enable(db)
+    async def no_price(self,*args,**kwargs):
+        return {'status':{'update_sales':True},'data':{'sku':'1','sellerId':'2'}}
+    monkeypatch.setattr(MaoziPublisher,'erp',no_price)
+    monkeypatch.setattr(SourceCollector,'collect',AsyncMock(side_effect=AssertionError('follow valuation must not create a draft')))
+    assert await pipeline.tick(db,lane='seed_repair',repair_kind='valuation')
+    with db.connect() as c:
+        row=c.execute('SELECT state,body FROM plugin_pipeline').fetchone()
+        assert row['state']=='needs_review'
+        assert 'direct_valuation_facts_unavailable' in json.loads(row['body'])['reason']
+        assert not c.execute("SELECT 1 FROM sqlite_master WHERE name='source_details'").fetchone()
+
+
+@pytest.mark.asyncio
+async def test_follow_valuation_exact_direct_package_facts_reaches_review(tmp_path,monkeypatch):
+    from flowhub.pipeline_modules.repair_reads import RepairReads
+    from flowhub.source_detail import SourceCollector
+    db,owner=configured(tmp_path,publication=False);enable(db)
+    (tmp_path/'direct-first.json').write_text('{"enabled":true}')
+    with db.connect() as c:
+        row=c.execute('SELECT body FROM sourcing_products').fetchone()
+        product=json.loads(row[0]);product['plugin_detail']={}
+        product['proposed_sale_price']={'value':20,'currency':'CNY','observed_at':time.time()}
+        product['source_relation']={'seller_id':'2','root_seeds':[{'sku':'1','shop':'1','offer':'original'}]}
+        c.execute('UPDATE sourcing_products SET body=?',(json.dumps(product),))
+    async def package(cls,api,path,*,params=None):
+        assert path=='/api.tool/get_category_by_sku' and params=={'keyword':'1'}
+        return {'sku':'1','cate':[1,2,3],
+                'product_info':{'weight':20,'depth':10,'width':10,'height':1}}
+    monkeypatch.setattr(RepairReads,'get',classmethod(package))
+    monkeypatch.setattr(SourceCollector,'collect',AsyncMock(side_effect=AssertionError('direct follow must not create a draft')))
+    assert await pipeline.tick(db,lane='seed_repair',repair_kind='valuation')
+    with db.connect() as c:
+        row=c.execute('SELECT state FROM plugin_pipeline').fetchone()
+        product=json.loads(c.execute('SELECT body FROM sourcing_products').fetchone()[0])
+    assert row['state']=='queued'
+    assert product['plugin_detail']['weight_g']==20
+    assert product['plugin_detail']['field_observations']['weight_g']['source']=='maozi-category-by-sku'
+
+
+@pytest.mark.asyncio
+async def test_follow_valuation_transport_error_keeps_bounded_retry_without_draft(tmp_path,monkeypatch):
+    from flowhub.maozi import MaoziPublisher
+    from flowhub.source_detail import SourceCollector
+    db,owner=configured(tmp_path,publication=False);enable(db)
+    async def offline(self,*args,**kwargs):raise TimeoutError('remote unavailable')
+    monkeypatch.setattr(MaoziPublisher,'erp',offline)
+    monkeypatch.setattr(SourceCollector,'collect',AsyncMock(side_effect=AssertionError('follow valuation must not create a draft')))
+    assert await pipeline.tick(db,lane='seed_repair',repair_kind='valuation')
+    with db.connect() as c:
+        row=c.execute('SELECT state,body FROM plugin_pipeline').fetchone();body=json.loads(row['body'])
+    assert row['state']=='needs_fields'
+    assert body['repair_workflow']['failure_class']=='network'
+    assert body['repair_workflow']['stage']=='facts'
+
+
+@pytest.mark.asyncio
+async def test_follow_valuation_preserves_unconfirmed_source_journal(tmp_path,monkeypatch):
+    from flowhub.source_detail import SourceCollector
+    from flowhub.pipeline_modules.repair import PriceRepairModule
+    from flowhub.pipeline_modules import repair_source
+    db,owner=configured(tmp_path,publication=False);enable(db)
+    context={'owner':owner,'store':{'credentials':{'erp_token':'test'}},'candidate':{'source_key':'1'}}
+    collector=SourceCollector(db,context)
+    with db.connect() as c:
+        c.execute('INSERT INTO source_details VALUES(?,?,?,?)',(collector.key,'claimed',db.seal({}),time.time()))
+    called=[]
+    async def existing(*args):called.append(True);return args[4],False
+    monkeypatch.setattr(repair_source,'supplement',existing)
+    result=await PriceRepairModule().run_stage(db,owner,'1','2',stage='source',purpose='valuation')
+    assert called and result['state']=='waiting'
+    with db.connect() as c:
+        assert c.execute('SELECT state FROM source_details WHERE key=?',(collector.key,)).fetchone()[0]=='claimed'
+
+
 async def test_approval_skips_both_new_and_old_dossier_gates(native,monkeypatch):
     db,owner,_,review,_=native
     (db.directory/'acquisition-policy.json').write_text('{"enabled":true}')

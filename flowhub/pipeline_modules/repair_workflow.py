@@ -106,7 +106,8 @@ async def run_one(module,db,owner,sku,seller):
         if dependency and work[name]>=3 and now-work['last_progress_at']>=cfg['dependency_slot_timeout_seconds']:
             work['admission_parked']=True
             work.setdefault('admission_parked_at',now)
-        manual=not dependency and (stage=='validate' or work[name]>=3 or category=='identity_mismatch')
+        manual=result['state']=='manual' or (not dependency and
+            (stage=='validate' or work[name]>=3 or category=='identity_mismatch'))
         delay=result.get('retry_after') or (min(900,30*2**min(work[name]-1,5)) if dependency else 300)
         work.update(state='manual' if manual else 'waiting',next_at=now+delay)
         result.update(state='manual' if manual else 'waiting',retry_after=delay)

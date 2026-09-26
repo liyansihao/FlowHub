@@ -144,6 +144,16 @@ class PriceRepairModule:
         evidence={'at':time.time(),'before':before,'steps':[]};context={'store':{'id':route['store_id'],'config':json.loads(store['config']),'credentials':db.open(store['secret'])}}
         from ..acquisition import enabled as acquisition_enabled
         if acquisition_enabled(db,sku):context['acquisition_gateway']=True
+        from ..follow_publication import selected, full_dossier_required, legacy_source_hold
+        from .database_work import read as database_read
+        direct_follow_valuation=(purpose=='valuation' and not full_dossier and
+            not acquisition_enabled(db,sku) and
+            await database_read(selected,db,(owner,sku,seller)) and not full_dossier_required(db))
+        historical_source_hold=(await database_read(legacy_source_hold,db,owner,sku,context['store']['credentials']['erp_token'])
+            if direct_follow_valuation else None)
+        # Earlier source-stage checkpoints without an uncertain write may resume
+        # with direct facts. A pending favorite/draft keeps its original journal.
+        if stage=='source' and direct_follow_valuation and not historical_source_hold:stage='facts'
         if stage in (None,'facts'):
             from .repair_facts import supplement
             p=await supplement(db,owner,sku,seller,p,review,context,evidence,require_dossier)
@@ -152,6 +162,14 @@ class PriceRepairModule:
             await database_work(save_progress,db,owner,sku,seller,p,evidence)
             if purpose=='valuation' and valuation_ready(p):
                 return {'state':'ready','reason':'valuation_inputs_ready','missing_fields':evidence['after']}
+            if direct_follow_valuation and not historical_source_hold:
+                from .repair_retry import classify
+                failure=classify(evidence)
+                if failure in ('network','remote_pending'):
+                    return {'state':'waiting','reason':'direct_valuation_facts_pending',
+                            'failure_class':failure,'missing_fields':evidence['after']}
+                return {'state':'manual','reason':'direct_valuation_facts_unavailable',
+                        'missing_fields':evidence['after']}
             return {'state':'progress','reason':'basic_facts_checkpointed','next_stage':'source','missing_fields':evidence['after']}
         acquired=False
         if stage in (None,'source'):
