@@ -258,6 +258,36 @@ export async function maoziProfit({purchasePrice}){return {
     assert response["evidence"]["profit"]["assessment"]["total_cost_cny"] == 20.5
 
 
+async def test_comparebot_bridge_uses_configured_erp_proxy(monkeypatch, candidate):
+    environments = []
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self, _):
+            return b'{"ok":true,"result":{"rejected":"protected_product"}}', b''
+
+    async def spawn(*_, **kwargs):
+        environments.append(kwargs["env"])
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.delenv("NODE_USE_ENV_PROXY", raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://unrelated-proxy:8080")
+    monkeypatch.setenv("FLOWHUB_MAOZI_ERP_PROXY", "http://127.0.0.1:7897")
+    await comparebot.compat.invoke("match", {"candidate": candidate}, "token", source={})
+    assert environments[0]["NODE_USE_ENV_PROXY"] == "1"
+    assert environments[0]["HTTPS_PROXY"] == environments[0]["https_proxy"] == "http://127.0.0.1:7897"
+    assert environments[0]["NO_PROXY"] == environments[0]["no_proxy"] == ""
+
+    await comparebot.compat.invoke("match", {"candidate": candidate}, "token")
+    assert "NODE_USE_ENV_PROXY" not in environments[1]
+
+    monkeypatch.delenv("FLOWHUB_MAOZI_ERP_PROXY")
+    await comparebot.compat.invoke("match", {"candidate": candidate}, "token", source={})
+    assert "NODE_USE_ENV_PROXY" not in environments[2]
+
+
 @pytest.mark.parametrize("score,size,verdict,conflict,valid", [
     (.81, "unknown", "match", False, False),
     (.82, "unknown", "match", False, True),

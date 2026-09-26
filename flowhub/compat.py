@@ -47,6 +47,9 @@ async def invoke(operation, context, token, *, source=None):
         "MAOZI_EXPANSION_SOURCE_FILE": str(root / "flow_b_ef/state/source.json"),
         "MAOZI_REQUIRE_FEISHU_DELIST": "1",
     }
+    if source is not None and (erp_proxy := os.environ.get("FLOWHUB_MAOZI_ERP_PROXY")):
+        env.update({"NODE_USE_ENV_PROXY": "1", "HTTPS_PROXY": erp_proxy,
+                    "https_proxy": erp_proxy, "NO_PROXY": "", "no_proxy": ""})
     p = await asyncio.create_subprocess_exec(
         "node",
         str(bridge),
