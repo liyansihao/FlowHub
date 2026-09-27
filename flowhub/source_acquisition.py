@@ -424,6 +424,9 @@ class SourceAcquirer:
         rows, last = page_data(data, task["page"], 100)
         if any(str(r.get("shop_id")) != shop for r in rows):
             raise AcquisitionError("identity_mismatch")
+        return await database_work(self._commit_orders, task, rows, last, now, shop)
+
+    def _commit_orders(self, task, rows, last, now, shop):
         from .source_library import fingerprint
 
         signature = fingerprint(sorted(str(r.get("posting_number")) for r in rows))

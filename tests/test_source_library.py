@@ -1,4 +1,6 @@
+import asyncio
 import json
+import threading
 import time
 
 import pytest
@@ -205,6 +207,50 @@ async def test_own_sales_dedupes_and_cancellation_retracts(library):
     await acquirer.cycle("a", "token", 45000)
     with library.db.connect() as c:
         assert c.execute("SELECT COUNT(*) FROM sourcing_orders").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_own_orders_commit_keeps_loop_responsive_and_drains_cancellation(library, monkeypatch):
+    library.enqueue("a", "own_orders", {"shop_id": "7"})
+
+    async def request(path, query, token):
+        return {
+            "total": 1,
+            "last_page": 1,
+            "data": [
+                dict(
+                    posting_number="p",
+                    shop_id=7,
+                    status="delivered",
+                    products=[dict(offer_id="offer", quantity=2)],
+                )
+            ],
+        }
+
+    acquirer = SourceAcquirer(library, request, no_delists)
+    entered = threading.Event()
+    release = threading.Event()
+    original_commit = acquirer._commit_orders
+
+    def blocked_commit(*args):
+        entered.set()
+        assert release.wait(5)
+        return original_commit(*args)
+
+    monkeypatch.setattr(acquirer, "_commit_orders", blocked_commit)
+    cycle = asyncio.create_task(acquirer.cycle("a", "token", 1000))
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 2), 3)
+        cycle.cancel()
+        await asyncio.sleep(0)
+        assert not cycle.done()
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await cycle
+    with library.db.connect() as c:
+        assert c.execute("SELECT SUM(quantity) FROM sourcing_orders").fetchone()[0] == 2
+        assert c.execute("SELECT lease FROM sourcing_tasks WHERE kind='own_orders'").fetchone()[0] is None
 
 
 @pytest.mark.asyncio
