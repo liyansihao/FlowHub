@@ -257,3 +257,30 @@ async def test_unrecorded_duplicate_sku_group_archived_without_replaying_unknown
     with db.connect() as c:
         r=c.execute("SELECT body FROM favorite_cleanup_receipts WHERE favorite_id='7'").fetchone()
         proof=db.open(r[0]);assert {x['id'] for x in proof['favorite_group']}=={7,8}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('lost_ack',[False,True])
+async def test_live_sku_delete_can_remove_different_id_without_unknown_replay(tmp_path,lost_ack):
+    db,ctx,settings=setup(tmp_path)
+    class ActualERP(Fake):
+        async def call(self,path,method='GET',params=None,body=None):
+            if method=='GET':return await super().call(path,method,params,body)
+            self.writes.append(str(body['productInfo']['id']))
+            self.rows.pop()  # Live evidence: oldest duplicate is removed by SKU.
+            if lost_ack:raise TimeoutError()
+            return []
+    api=ActualERP([{'id':41,'sku':'123','is_imported':0},{'id':40,'sku':'123','is_imported':0}])
+    favorite=dict(api.rows[0])
+    reason=await reclaim.clean_one(db,'a',ctx,favorite,settings,api)
+    if lost_ack:
+        assert reason=='unconfirmed_present'
+        await reclaim.clean_one(db,'a',ctx,favorite,settings,api)
+        assert api.writes==['41'] and len(api.rows)==1
+    else:
+        assert reason=='group_progress'
+        with db.connect() as c:
+            row=c.execute("SELECT * FROM favorite_cleanup_receipts WHERE favorite_id='40'").fetchone()
+            assert row['state']=='deleted' and db.open(row['body'])['requested_favorite_id']=='41'
+        assert await reclaim.clean_one(db,'a',ctx,favorite,settings,api)=='deleted'
+        assert api.writes==['41','41'] and not api.rows

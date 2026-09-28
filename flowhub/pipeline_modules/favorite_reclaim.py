@@ -164,6 +164,38 @@ def save_archive(db, account, context, favorite, settings, favorite_group=None):
     return ('intent', proof) if changed else ('receipt_retained', None)
 
 
+async def reconcile_delete(db, account, receipt, client):
+    from . import favorite_cleanup as old
+    _, rows = await old.exact_favorites(client, receipt['sku'])
+    present = {str(r['id']) for r in rows}
+    requested = receipt['favorite_id']
+    if requested not in present:
+        proof = db.open(receipt['body']); proof['absence_verified_at'] = time.time()
+        await database_work(old.update_receipt, db, account, requested, 'deleted', proof)
+        return 'deleted'
+    proof = db.open(receipt['body'])
+    group = {str(r['id']) for r in proof.get('favorite_group', [])}
+    removed = group - present
+    # The live API removes one SKU member, not necessarily productInfo.id.
+    # Only a positive acknowledgement plus an exact one-member difference can
+    # settle that request. Lost acknowledgements remain read-only.
+    if receipt['state'] == 'acknowledged' and len(group) > 1 and len(removed) == 1 and present <= group:
+        actual = next(iter(removed))
+        proof.update(requested_favorite_id=requested, confirmed_deleted_favorite_id=actual,
+                     remaining_favorite_ids=sorted(present), absence_verified_at=time.time())
+        def settle():
+            with db.connect() as c:
+                c.execute('BEGIN IMMEDIATE')
+                if c.execute('SELECT 1 FROM favorite_cleanup_receipts WHERE account=? AND favorite_id=?',
+                             (account, actual)).fetchone():
+                    return False
+                return bool(c.execute("UPDATE favorite_cleanup_receipts SET favorite_id=?,state='deleted',body=?,updated=? WHERE account=? AND favorite_id=? AND state='acknowledged'",
+                    (actual, db.seal(proof), time.time(), account, requested)).rowcount)
+        if await database_work(settle):
+            return 'group_progress'
+    return 'unconfirmed_present'
+
+
 async def clean_one(db, account, context, favorite, settings, client):
     from . import favorite_cleanup as old
     sku, fid = str(favorite['sku']), str(favorite['id'])
@@ -172,7 +204,7 @@ async def clean_one(db, account, context, favorite, settings, client):
         if prior:
             if prior['state'] == 'deleted':
                 return 'receipt_retained'
-            return await old.reconcile_one(db, account, prior, client, lambda: False)
+            return await reconcile_delete(db, account, prior, client)
         # Explicit views avoid the ERP default hiding imported records.
         current = []
         for imported in (0, 1):
@@ -192,8 +224,8 @@ async def clean_one(db, account, context, favorite, settings, client):
                 continue
             receipt = await database_work(old.receipt, db, account, str(sibling['id']))
             if receipt and receipt['state'] != 'deleted':
-                reason = await old.reconcile_one(db, account, receipt, client, lambda: False)
-                if reason != 'deleted':
+                reason = await reconcile_delete(db, account, receipt, client)
+                if reason not in ('deleted', 'group_progress'):
                     return reason
         state, proof = await database_work(save_archive, db, account, context, exact[0], settings, current)
         if state != 'intent':
@@ -208,7 +240,7 @@ async def clean_one(db, account, context, favorite, settings, client):
         else:
             await database_work(old.update_receipt, db, account, fid, 'acknowledged', proof)
         prior = await database_work(old.receipt, db, account, fid)
-        return await old.reconcile_one(db, account, prior, client, lambda: False)
+        return await reconcile_delete(db, account, prior, client)
 
 
 def contexts(db):
@@ -304,11 +336,13 @@ async def tick(db, settings, client_factory=None):
                 break  # Retain cursor/receipt; bounded next-cycle retry.
             if reason in ('busy', 'unconfirmed_present', 'paused'):
                 batch['retained'].append(item | {'reason': reason})
-            elif reason == 'deleted':
+            elif reason in ('deleted', 'group_progress'):
                 batch['deleted'] += 1
             else:
                 batch['retained'].append(item | {'reason': reason})
-            batch['pending'].pop(0); batch['scanned'] += 1; checked += 1
+            if reason != 'group_progress':
+                batch['pending'].pop(0)
+            batch['scanned'] += 1; checked += 1
             await database_work(save_batch, db, account, batch)
         if not batch['pending']:
             # Revisit protected records once after progress, so consumers which
