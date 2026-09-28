@@ -227,6 +227,11 @@ class SourceCollector:
         return data
 
     async def collect(self):
+        from .pipeline_modules.favorite_reclaim import source_guard
+        with source_guard(self.db.directory, self.sku):
+            return await self._collect_guarded()
+
+    async def _collect_guarded(self):
         from .acquisition import enabled, enrolled, dispatch
         if enabled(self.db,self.sku) or enrolled(self.db,self.key):
             return await dispatch(self)

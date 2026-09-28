@@ -86,6 +86,12 @@ def approved(review, rules, now=None, allow_unknown=False, *, native_follow=Fals
 
 
 async def advance(db, owner, sku, seller):
+    from .pipeline_modules.favorite_reclaim import source_guard
+    with source_guard(db.directory, sku):
+        return await _guarded_advance(db, owner, sku, seller)
+
+
+async def _guarded_advance(db, owner, sku, seller):
     # Exclusive maintenance locks can drain all operations. Independent stores
     # proceed concurrently; one SKU or one target store can never overlap.
     import hashlib
@@ -287,6 +293,8 @@ async def _advance(db, owner, sku, seller, *, native_follow=False):
                 inventory=ScheduledInventoryAdapter(official_client,shop_id=shop,warehouse_id=warehouse,journal=journal,stock_guard=stock_guard)
                 inventory.identity_verified=True
         port=PublicationAdapter(client,journal,stock_guard,verify_target,publish_guard=quota,observations=observations,inventory=inventory)
+        from .collection_capacity import account as favorite_account
+        port.favorite_capacity_context=(db,favorite_account({'owner':owner,'store':{'credentials':keys}}))
         service=ProductionListingService(port,journal,preflight,stock_guard=stock_guard)
         before=journal.read(offer)['phase']
         from .pipeline_modules.favorite_recovery import recover_favorite

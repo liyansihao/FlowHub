@@ -34,4 +34,77 @@ class FavoriteViews:
 
 
 class PublicationSourceAdapter(FavoriteViews,MaoziZeroStockAdapter):pass
-class PublicationAdapter(FavoriteViews,MaoziProductionAdapter):pass
+class PublicationAdapter(FavoriteViews,MaoziProductionAdapter):
+    async def add_favorite(self, plan):
+        return await _capacity_add(self, plan)
+
+
+# A documented business rejection of favorite creation is not an unknown write.
+from flowef.application.errors import RequestNotSent
+import asyncio
+import json
+import time
+import weakref
+
+_capacity_locks = weakref.WeakKeyDictionary()
+
+
+class FavoriteCapacityWait(RequestNotSent):
+    pass
+
+
+def capacity_rejection(message):
+    import re
+    message = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m[1], 16)), str(message))
+    return '/api.product.favorite/toggle' in message and '收藏数量已达上限' in message
+
+
+async def _capacity_add(self, plan):
+    from .database_work import run as database_work
+    from .favorite_reclaim import schema, observe
+    context = getattr(self, 'favorite_capacity_context', None)
+
+    async def send():
+        try:
+            return await super(PublicationAdapter, self).add_favorite(plan)
+        except ExternalContractError as error:
+            if not capacity_rejection(error):
+                raise
+            if context:
+                db, account = context
+                def block():
+                    with db.connect() as c:
+                        schema(c)
+                        c.execute('UPDATE favorite_capacity_state SET blocked_until=? WHERE account=?', (time.time()+60, account))
+                await database_work(block)
+            raise FavoriteCapacityWait('waiting_favorite_capacity: explicit ERP rejection') from error
+
+    if not context:
+        return await send()
+    db, account = context
+    path = db.directory / 'favorite-cleanup.json'
+    policy = json.loads(path.read_text()) if path.exists() else {}
+    if policy.get('mode') != 'reclaim_unused':
+        return await send()
+    locks = _capacity_locks.setdefault(asyncio.get_running_loop(), {})
+    async with locks.setdefault(account, asyncio.Lock()):
+        def read():
+            with db.connect() as c:
+                schema(c)
+                row = c.execute('SELECT * FROM favorite_capacity_state WHERE account=?', (account,)).fetchone()
+                return dict(row) if row else None
+        row = await database_work(read)
+        if row and row['blocked_until'] > time.time():
+            raise FavoriteCapacityWait('waiting_favorite_capacity')
+        if not row or not 0 <= time.time()-row['observed'] < 30:
+            header = await self._request('GET', '/api.product.favorite/lists', params={'page': 1, 'page_size': 1})
+            await database_work(observe, db, account, header)
+        def reserve():
+            with db.connect() as c:
+                c.execute('BEGIN IMMEDIATE')
+                row = c.execute('SELECT * FROM favorite_capacity_state WHERE account=?', (account,)).fetchone()
+                if row['used'] >= row['capacity'] or row['blocked_until'] > time.time():
+                    raise FavoriteCapacityWait('waiting_favorite_capacity')
+                c.execute('UPDATE favorite_capacity_state SET used=used+1 WHERE account=?', (account,))
+        await database_work(reserve)
+        return await send()

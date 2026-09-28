@@ -103,7 +103,9 @@ class ModuleHost:
         if module["driver"] == "maozi":
             from .maozi import MaoziPublisher
 
-            return await MaoziPublisher(context).invoke(operation)
+            from .pipeline_modules.favorite_reclaim import source_guard
+            with source_guard(self.db.directory, context.get('candidate', {}).get('source_key', 'legacy')):
+                return await MaoziPublisher(context).invoke(operation)
         if module["driver"] == "plugin":
             # Server-installed allowlist only; ordinary users cannot upload/import Python.
             manifest = self.db.directory.parent / "plugins/installed.json"

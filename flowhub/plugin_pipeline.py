@@ -14,6 +14,7 @@ from .source_library import SourceLibrary
 from .official_api import OfficialDeferred
 from .cluster_routing import ProductionWorkerUnavailable
 from flowef.application.errors import RateLimited
+from .pipeline_modules.favorite_lookup import FavoriteCapacityWait
 
 
 def schema(db):
@@ -280,6 +281,9 @@ async def tick(db, lane=None, *, target=None, run_paused=False, repair_kind=None
     except ValueError as error:
         state='needs_fields' if str(error) in ('price_evidence_stale','plugin_facts_missing_or_stale','pricing_facts_missing','fresh_comparebot_approval_required') else 'awaiting_remote' if str(error)=='hour_window_closed' and body.get('submitted') else 'needs_review';body['error']=str(error)
         if state=='awaiting_remote':delay=300
+    except FavoriteCapacityWait:
+        delay=60;body['dependency_wait']='waiting_favorite_capacity';dependency_wait=True
+        body.pop('error',None)
     except RateLimited as error:
         attempts+=1;body['error']=type(error).__name__+': '+str(error)[:200]
         delay=max(60,error.retry_after_seconds or 0)

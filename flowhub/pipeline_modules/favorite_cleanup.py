@@ -18,10 +18,13 @@ DEFAULTS={'enabled':False,'threshold_ratio':0.95,'target_ratio':2/3,'batch_size'
 def config(db):
     path=Path(db.directory)/'favorite-cleanup.json'
     value=DEFAULTS|(json.loads(path.read_text()) if path.exists() else {})
-    if not 0<value['target_ratio']<value['threshold_ratio']<=1:raise ValueError('invalid cleanup thresholds')
+    if not 0<=value['target_ratio']<value['threshold_ratio']<=1 or (value['target_ratio']==0 and value.get('mode')!='reclaim_unused'):raise ValueError('invalid cleanup thresholds')
+    if value.get('mode')=='reclaim_unused' and (value['target_ratio']!=0 or value.get('include_unrecorded') is not True or not value.get('authorization')):
+        raise ValueError('reclamation requires explicit unused/unrecorded authorization and target zero')
     if not 1<=value['batch_size']<=1000 or value['interval_seconds']<60 or value['minimum_age_seconds']<0:
         raise ValueError('invalid cleanup bounds')
     if not 1<=value['max_checks_per_cycle']<=100 or not 1<=value['cycle_seconds']<=300:raise ValueError('invalid cleanup work bounds')
+    if value.get('verification_delete_limit') is not None and (type(value['verification_delete_limit']) is not int or not 1<=value['verification_delete_limit']<=1000):raise ValueError('invalid verification limit')
     return value
 
 
@@ -311,6 +314,12 @@ async def clean_account(db,owner,account,items,settings,client=None):
 async def tick(db):
     settings=config(db)
     if not settings['enabled'] or await database_work(control.paused,db,'seed'):return []
+    if settings.get('mode')=='reclaim_unused':
+        from .favorite_reclaim import tick as reclaim
+        with (Path(db.directory)/'favorite-cleanup.lock').open('a') as lock:
+            try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:return []
+            return await reclaim(db,settings)
     await database_work(schema,db)
     with (Path(db.directory)/'favorite-cleanup.lock').open('a') as lock:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
@@ -334,6 +343,8 @@ async def tick(db):
 
 async def run(db):
     while True:
-        try:await tick(db)
+        results=[]
+        try:results=await tick(db)
         except Exception as e:await database_work(control.record,db,'seed','','',time.time(),'favorite_cleanup_error',{'error_type':type(e).__name__,'reason':str(e)[:160] if isinstance(e,ValueError) else type(e).__name__})
-        await asyncio.sleep(config(db)['interval_seconds'])
+        active=any(r.get('state')=='active' and not r.get('errors') for r in results)
+        await asyncio.sleep(1 if active else config(db)['interval_seconds'])
