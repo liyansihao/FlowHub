@@ -242,3 +242,18 @@ async def test_shared_sku_waiting_in_other_seller_is_not_released(tmp_path):
     api=Fake()
     assert 'pipeline:publishing' in await reclaim.clean_one(db,'a',ctx,api.rows[0],settings,api)
     assert not api.writes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode',['ok','unknown'])
+async def test_unrecorded_duplicate_sku_group_archived_without_replaying_unknown(tmp_path,mode):
+    db,ctx,settings=setup(tmp_path)
+    rows=[{'id':7,'sku':'123','is_imported':0},{'id':8,'sku':'123','is_imported':0}]
+    api=Fake(list(rows),mode=mode)
+    await reclaim.clean_one(db,'a',ctx,rows[0],settings,api)
+    await reclaim.clean_one(db,'a',ctx,rows[1],settings,api)
+    if mode=='unknown':assert api.writes==['7'] and len(api.rows)==2
+    else:assert api.writes==['7','8'] and not api.rows
+    with db.connect() as c:
+        r=c.execute("SELECT body FROM favorite_cleanup_receipts WHERE favorite_id='7'").fetchone()
+        proof=db.open(r[0]);assert {x['id'] for x in proof['favorite_group']}=={7,8}

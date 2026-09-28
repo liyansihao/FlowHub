@@ -123,7 +123,7 @@ def dependency_proof(db, context, favorite):
     return sorted(set(reasons)), proof
 
 
-def save_archive(db, account, context, favorite, settings):
+def save_archive(db, account, context, favorite, settings, favorite_group=None):
     from . import favorite_cleanup as old
     from . import control
     if control.paused(db, 'seed') or not old.config(db)['enabled']:
@@ -131,6 +131,7 @@ def save_archive(db, account, context, favorite, settings):
     reasons, proof = dependency_proof(db, context, favorite)
     if reasons:
         return 'protected:'+','.join(reasons), None
+    proof['favorite_group'] = favorite_group or [favorite]
     proof['policy'] = 'reclaim_unused_including_unrecorded'
     proof['authorization'] = settings['authorization']
     proof['account'] = account
@@ -181,9 +182,20 @@ async def clean_one(db, account, context, favorite, settings, client):
                 raise ValueError('incomplete_exact_favorite_lookup')
             current.extend(rows)
         exact = [r for r in current if str(r['id']) == fid]
-        if len(exact) != 1 or len({str(r['id']) for r in current}) != 1:
+        if len(exact) != 1 or len({str(r['id']) for r in current}) != len(current):
             return 'favorite_absent' if not exact else 'favorite_ambiguous'
-        state, proof = await database_work(save_archive, db, account, context, exact[0], settings)
+        # ERP can contain two distinct favorite IDs for the same SKU. Archive
+        # the whole group before a SKU-based removal; an unknown sibling write
+        # permits readback only, never another potentially overlapping removal.
+        for sibling in current:
+            if str(sibling['id']) == fid:
+                continue
+            receipt = await database_work(old.receipt, db, account, str(sibling['id']))
+            if receipt and receipt['state'] != 'deleted':
+                reason = await old.reconcile_one(db, account, receipt, client, lambda: False)
+                if reason != 'deleted':
+                    return reason
+        state, proof = await database_work(save_archive, db, account, context, exact[0], settings, current)
         if state != 'intent':
             return state
         try:
