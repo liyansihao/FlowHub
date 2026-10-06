@@ -120,31 +120,67 @@ async def test_discovery_persistence_waits_off_loop(tmp_path,monkeypatch,success
         blocker.close()
 
 
-def test_unchanged_source_assessments_do_not_take_a_write_transaction(tmp_path,monkeypatch):
+@pytest.mark.parametrize('historical_assessments',[[],[{'sku':'123','state':'needs_review'}]])
+def test_checked_stores_never_reload_products_even_after_updates(tmp_path,monkeypatch,historical_assessments):
     from contextlib import contextmanager
     from flowhub.other_sellers import promote_qualified
-    db=Database(tmp_path);BrowserSource(db);schema(db)
-    with db.connect() as c:c.execute('INSERT INTO source_discovery_seeds VALUES(?,?,?,0,0,?,?)',('o','123','queued','{}',time.time()))
-    ingest(db,'o','123',page(ids=('10',),count=1),'file');prepare_samples(db,'o')
-    with db.connect() as c:c.execute("UPDATE source_discovered_stores SET state='awaiting_qualified_product'")
-    assert promote_qualified(db,'o')==0
-    original=db.connect;changes=[]
+    db=Database(tmp_path);BrowserSource(db);schema(db);prepare_samples(db,'o')
+    with db.connect() as c:
+        c.execute('INSERT INTO source_discovered_stores VALUES(?,?,?,?,?,?)',
+                  ('o','10','other-seller-10','awaiting_qualified_product',
+                   json.dumps({'source_assessments':historical_assessments}),1))
+    # A later product update must not put an already checked store back in rotation.
+    SourceLibrary(db).put('o',{'sku':'123','seller_id':'10','title':'updated',
+                             'collected_at':time.time()},{'channel':'test'})
+    db=Database.open_existing(tmp_path)  # The decision survives process restarts.
+    original=db.connect;queries=[];changes=[]
     @contextmanager
     def observed():
         with original() as c:
-            before=c.total_changes
+            c.set_trace_callback(queries.append);before=c.total_changes
             yield c
             changes.append(c.total_changes-before)
     monkeypatch.setattr(db,'connect',observed)
-    assert promote_qualified(db,'o')==0
+    for _ in range(3):assert promote_qualified(db,'o')==0
+    assert not any('FROM sourcing_products' in q for q in queries)
     assert sum(changes)==0
-    SourceLibrary(db).put('o',{'sku':'123','seller_id':'10','title':'incomplete','collected_at':time.time()},{'channel':'test'})
-    changes.clear()
-    assert promote_qualified(db,'o')==0
-    assert sum(changes)==1
+    with original() as c:
+        row=c.execute('SELECT body,updated FROM source_discovered_stores').fetchone()
+        assert json.loads(row['body'])['source_assessments']==historical_assessments
+        assert row['updated']==1
+
+
+@pytest.mark.parametrize('qualified',[False,True])
+def test_only_new_stores_are_checked_once(tmp_path,monkeypatch,qualified):
+    from contextlib import contextmanager
+    from flowhub.other_sellers import promote_qualified
+    from flowhub.pipeline_modules.source_loop import schema as loop_schema
+    db=Database(tmp_path);loop_schema(db);schema(db);prepare_samples(db,'o')
     with db.connect() as c:
-        row=c.execute('SELECT state,body FROM source_discovered_stores').fetchone()
-        assert row['state']=='awaiting_qualified_product'
-        assert json.loads(row['body'])['source_assessments'][0]['sku']=='123'
-    changes.clear()
-    assert promote_qualified(db,'o')==0 and sum(changes)==0
+        for seller,body in [('10',{'source_assessments':[]}),('20',{})]:
+            c.execute('INSERT INTO source_discovered_stores VALUES(?,?,?,?,?,?)',
+                      ('o',seller,'other-seller-'+seller,'awaiting_qualified_product',json.dumps(body),1))
+    product={'sku':'456','seller_id':'20','title':'new','image':'https://example.com/i',
+             'collected_at':time.time(),'coverage':'storefront-page'}
+    if qualified:product.update(category_id='1',sales_schema='FBS')
+    SourceLibrary(db).put('o',product,{'channel':'test'})
+    original=db.connect;queries=[]
+    @contextmanager
+    def observed():
+        with original() as c:
+            c.set_trace_callback(queries.append)
+            yield c
+    monkeypatch.setattr(db,'connect',observed)
+    assert promote_qualified(db,'o')==int(qualified)
+    reads=[q for q in queries if 'FROM sourcing_products' in q]
+    assert len(reads)==1 and "seller='20'" in reads[0]
+    with original() as c:
+        row=c.execute("SELECT state,body FROM source_discovered_stores WHERE seller='20'").fetchone()
+        assert row['state']==('qualified' if qualified else 'awaiting_qualified_product')
+        if qualified:
+            assert json.loads(row['body'])['qualified_sku']=='456'
+            assert c.execute('SELECT seller FROM source_loop_stores').fetchone()[0]=='20'
+        else:assert json.loads(row['body'])['source_assessments'][0]['sku']=='456'
+    queries.clear()
+    for _ in range(3):assert promote_qualified(db,'o')==0
+    assert not any('FROM sourcing_products' in q for q in queries)

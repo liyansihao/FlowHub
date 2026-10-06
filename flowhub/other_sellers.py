@@ -243,7 +243,11 @@ def promote_qualified(db,owner):
     with db.connect() as c:
         setting=c.execute('SELECT body FROM sourcing_settings WHERE owner=?',(owner,)).fetchone()
         filters=SourceFilters(**json.loads(setting[0])) if setting else SourceFilters();promoted=0
-        for r in c.execute("SELECT * FROM source_discovered_stores WHERE owner=? AND state='awaiting_qualified_product'",(owner,)).fetchall():
+        # Existing assessments (including []) mean this store was already checked.
+        # Filter before loading products; automatic checks are for new stores only.
+        for r in c.execute("""SELECT * FROM source_discovered_stores
+          WHERE owner=? AND state='awaiting_qualified_product'
+          AND json_type(body,'$.source_assessments') IS NULL""",(owner,)).fetchall():
             products=c.execute('SELECT body FROM sourcing_products WHERE owner=? AND seller=?',(owner,r['seller'])).fetchall()
             qualified=next((json.loads(p[0]) for p in products if assess(json.loads(p[0]),filters)['state']=='qualified'),None)
             if not qualified:
