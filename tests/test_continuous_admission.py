@@ -329,21 +329,22 @@ def test_campaign_renewal_filters_terminal_and_missing_queues_without_losing_his
     db,owner=setup(tmp_path)
     with db.connect() as c:
         c.execute('CREATE TABLE IF NOT EXISTS plugin_publications(owner TEXT,sku TEXT,seller TEXT,body TEXT,updated REAL,PRIMARY KEY(owner,sku,seller))')
-        for sku,state in [('active','publishing'),('sold','selling'),('rejected','rejected'),('null',None),('missing',None),('future','queued'),('other','queued')]:
+        for sku,state in [('active','publishing'),('sold','selling'),('rejected','rejected'),('reserved','reserved'),('null',None),('missing',None),('future','queued'),('boundary','queued'),('other','queued')]:
             if sku!='missing':c.execute('INSERT INTO plugin_pipeline VALUES(?,?,?,?,?,?,?)',(owner,sku,'3',state,'{}',0,0))
-            c.execute('INSERT INTO plugin_routes VALUES(?,?,?,?,?,?)',(owner,sku,'3','test',500 if sku=='future' else 1,'other' if sku=='other' else 'test'))
+            c.execute('INSERT INTO plugin_routes VALUES(?,?,?,?,?,?)',(owner,sku,'3','test',500 if sku=='future' else 100 if sku=='boundary' else 1,'other' if sku=='other' else 'test'))
             c.execute('INSERT INTO plugin_publication_permissions VALUES(?,?,?,?,?)',(owner,sku,'3',1,'test'))
             c.execute('INSERT INTO plugin_publications VALUES(?,?,?,?,?)',(owner,sku,'3',json.dumps({'write_deadline':1,'continuations':[{'previous':'preserved'}]}),0))
     with db.connect() as c:
         c.execute('BEGIN IMMEDIATE')
         renew_campaign(c,owner,{'continuous':True,'run_id':'test','write_window_seconds':50,'until':130},100)
     with db.connect() as c:
-        for sku in ('active','null','sold','rejected','missing','future','other'):
-            expected=130 if sku in ('active','null') else 500 if sku=='future' else 1
+        for sku in ('active','null','sold','rejected','reserved','missing','future','boundary','other'):
+            # main has no product-reserve policy; preserve its existing nonterminal renewal semantics.
+            expected=130 if sku in ('active','null','reserved','boundary') else 500 if sku=='future' else 1
             assert c.execute('SELECT expires FROM plugin_routes WHERE sku=?',(sku,)).fetchone()[0]==expected
             b=json.loads(c.execute('SELECT body FROM plugin_publications WHERE sku=?',(sku,)).fetchone()[0])
             assert b['continuations'][0]=={'previous':'preserved'}
-            assert len(b['continuations'])==(2 if sku in ('active','null') else 1)
+            assert len(b['continuations'])==(2 if sku in ('active','null','reserved','boundary') else 1)
 
 
 def test_upgraded_admission_filters_identities_without_reading_product_table(tmp_path, monkeypatch):
@@ -365,6 +366,9 @@ def test_upgraded_admission_filters_identities_without_reading_product_table(tmp
 
     monkeypatch.setattr(db, 'connect', traced)
     assert admit_one(db, owner)['sku'] == '1'
+    from flowhub.pipeline_modules.admission import renew_campaign
+    with db.connect() as c:
+        renew_campaign(c, owner, {'continuous': True, 'run_id': 'test'}, 100)
     query = next(q for q in statements if q.startswith('SELECT p.id FROM sourcing_products'))
     with original() as c:
         root = c.execute("SELECT rootpage FROM sqlite_master WHERE name='sourcing_products'").fetchone()[0]
@@ -372,10 +376,11 @@ def test_upgraded_admission_filters_identities_without_reading_product_table(tmp
         table_cursors = {r[2] for r in ops if r[1] == 'OpenRead' and r[3] == root}
         assert not any(r[1] == 'Column' and r[2] in table_cursors for r in ops)
         assert c.execute("SELECT 1 FROM sqlite_master WHERE name='sourcing_admission_candidates'").fetchone()
-        plan = c.execute('''EXPLAIN QUERY PLAN SELECT r.* FROM plugin_pipeline q INDEXED BY plugin_pipeline_renewable_keys
-            CROSS JOIN plugin_routes r INDEXED BY plugin_routes_campaign_keys USING(owner,sku,seller)
-            WHERE r.owner=? AND r.run_id=? AND r.expires<=?
-              AND (q.state IS NULL OR q.state NOT IN ('selling','rejected'))''',
-            (owner, 'test', 100)).fetchall()
+        renewal = next(q for q in statements if q.startswith('SELECT r.* FROM plugin_pipeline'))
+        plan = c.execute('EXPLAIN QUERY PLAN ' + renewal).fetchall()
         assert any('COVERING INDEX plugin_routes_campaign_keys' in r[3] and 'expires<?' in r[3] for r in plan)
-        assert any('plugin_pipeline_renewable_keys' in r[3] for r in plan)
+        assert any('COVERING INDEX plugin_pipeline_owner_state_keys' in r[3] for r in plan)
+        root = c.execute("SELECT rootpage FROM sqlite_master WHERE name='plugin_pipeline'").fetchone()[0]
+        ops = c.execute('EXPLAIN ' + renewal).fetchall()
+        table_cursors = {r[2] for r in ops if r[1] == 'OpenRead' and r[3] == root}
+        assert not any(r[1] == 'Column' and r[2] in table_cursors for r in ops)

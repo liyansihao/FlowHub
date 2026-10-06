@@ -179,7 +179,7 @@ def renew_campaign(c, owner, policy, now):
     """Only an active continuous campaign authorizes a new write window; keep every old one."""
     if not policy.get('continuous'):return
     expiry=min(now+policy.get('write_window_seconds',21600),policy.get('until') or float('inf'))
-    for r in c.execute('''SELECT r.* FROM plugin_pipeline q INDEXED BY plugin_pipeline_renewable_keys
+    for r in c.execute('''SELECT r.* FROM plugin_pipeline q INDEXED BY plugin_pipeline_owner_state_keys
         CROSS JOIN plugin_routes r INDEXED BY plugin_routes_campaign_keys USING(owner,sku,seller)
         WHERE r.owner=? AND r.run_id=? AND r.expires<=?
           AND (q.state IS NULL OR q.state NOT IN ('selling','rejected'))''',
