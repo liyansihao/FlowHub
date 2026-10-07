@@ -647,3 +647,31 @@ def test_admission_index_keeps_exact_source_binding_rules(tmp_path):
         assert actual==expected==[('0',),('5',)]
         plan=' '.join(str(tuple(r)) for r in c.execute('EXPLAIN QUERY PLAN SELECT * FROM sourcing_products WHERE '+condition,('o',)))
         assert any(name in plan for name in ('sourcing_admission_candidates','sourcing_admission_candidate_keys'))
+
+
+def test_pending_source_index_preserves_attention_and_owner_boundaries(library):
+    sql = "SELECT id FROM jobs WHERE owner=? AND (phase NOT IN ('selling','rejected','attention') OR (phase='attention' AND json_extract(data,'$.candidate.source_contract')='flowhub-source-candidates-v1')) ORDER BY id"
+    with library.db.connect() as c:
+        for i, (phase, contract) in enumerate([
+            ('selling', 'flowhub-source-candidates-v1'),
+            ('rejected', 'flowhub-source-candidates-v1'),
+            ('attention', 'flowhub-source-candidates-v1'),
+            ('attention', 'legacy'), ('attention', None),
+            ('queued', None), ('matching', 'legacy'), ('selling', None),
+        ]):
+            for owner in ('a', 'b'):
+                key = owner + str(i)
+                c.execute("INSERT INTO jobs(id,owner,source_key,phase,data,modules,next_at,created,updated) VALUES(?,?,?,?,?,'{}',0,0,0)",
+                          (key, owner, key, phase, json.dumps({'candidate': {'source_contract': contract}})))
+        indexed = [r[0] for r in c.execute(sql, ('a',))]
+        assert indexed == ['a2', 'a5', 'a6']
+        c.execute('DROP INDEX jobs_source_pending_owner')
+        assert [r[0] for r in c.execute(sql, ('a',))] == indexed
+    reopened = Database.open_existing(library.db.directory)
+    SourceLibrary(reopened)
+    with reopened.connect() as c:
+        assert any('jobs_source_pending_owner' in r[3] for r in c.execute('EXPLAIN QUERY PLAN ' + sql, ('a',)))
+        c.execute("UPDATE jobs SET phase='selling' WHERE id='a5'")
+        c.execute("UPDATE jobs SET data=? WHERE id='a3'", (json.dumps({'candidate': {'source_contract': 'flowhub-source-candidates-v1'}}),))
+        c.execute("DELETE FROM jobs WHERE id='a6'")
+        assert [r[0] for r in c.execute(sql, ('a',))] == ['a2', 'a3']

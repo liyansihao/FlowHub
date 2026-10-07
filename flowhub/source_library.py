@@ -141,6 +141,9 @@ class SourceLibrary:
         def initialize():
             with db.connect() as c:
                 c.executescript("""
+            CREATE INDEX IF NOT EXISTS jobs_source_pending_owner ON jobs(owner)
+              WHERE phase NOT IN ('selling','rejected','attention')
+              OR (phase='attention' AND json_extract(data,'$.candidate.source_contract')='flowhub-source-candidates-v1');
             CREATE TABLE IF NOT EXISTS sourcing_products(
               id INTEGER PRIMARY KEY,owner TEXT NOT NULL,sku TEXT NOT NULL,seller TEXT NOT NULL,
               body TEXT NOT NULL,first_seen REAL NOT NULL,updated REAL NOT NULL,UNIQUE(owner,sku,seller));
