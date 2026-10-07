@@ -40,6 +40,9 @@ def sync_stores(db, owner, run_id, now=None):
     """Only evidenced roots enter discovery; collected products are not invented roots."""
     now=time.time() if now is None else now
     service=BrowserSource(db);manifest={}
+    from .. import ranking_sources
+    demand_required=bool(ranking_sources.policy(db,owner))
+    if demand_required:ranking_sources.activate(db,owner,now)
     with db.connect() as c:
         if c.execute("SELECT 1 FROM sqlite_master WHERE name='plugin_publications'").fetchone():
             def index_publication_roots():
@@ -58,16 +61,28 @@ def sync_stores(db, owner, run_id, now=None):
                         body.update(seller_id=scan['seller'],seller_resolution={'channel':'historical-exact-store-root','run_id':run_id,'sku':sku})
                         c.execute('UPDATE sourcing_seeds SET body=? WHERE owner=? AND shop=? AND offer=?',(json.dumps(body),owner,shop,offer))
         # Completed publications give exact own offer -> original SKU/seller bindings.
+        known_seeds={(r['shop'],r['offer']) for r in c.execute('SELECT shop,offer FROM sourcing_seeds WHERE owner=?',(owner,))} if demand_required else set()
         if c.execute("SELECT 1 FROM sqlite_master WHERE name='plugin_publications'").fetchone():
             for r in c.execute("SELECT " + PUBLICATION_ROOT_PROJECTION + " AS body FROM plugin_publications INDEXED BY source_publication_roots WHERE owner=? AND json_extract(body,'$.verified')=1 ORDER BY sku,seller",(owner,)).fetchall():
                 p=json.loads(r[0]);product=p.get('product') or {}
                 shop=str(product.get('shop_id') or '');sku=str(p.get('sku') or '');seller=str(p.get('seller') or '')
                 offer=p.get('offer_id')
                 if not (shop.isdigit() and sku.isdigit() and seller.isdigit() and offer):continue
+                demand=None
+                if demand_required:
+                    if (shop,offer) in known_seeds:continue
+                    demand=ranking_sources.demand_evidence(c,owner,sku,seller,now)
+                    if not demand:
+                        c.execute('INSERT OR IGNORE INTO source_seed_demand_checks(owner,sku,seller,due) VALUES(?,?,?,0)',(owner,sku,seller))
+                        continue
                 body={'sku':sku,'seller_id':seller,'evidence':{'channel':'verified-publication','offer_id':offer},'online_evidence':product}
+                if demand:
+                    body['sales_qualification']={'at':now,'evidence':demand}
+                    c.execute('UPDATE source_seed_demand_checks SET due=NULL WHERE owner=? AND sku=? AND seller=?',(owner,sku,seller))
                 c.execute('INSERT OR IGNORE INTO sourcing_seeds VALUES(?,?,?,?,?,0,NULL,?)',(owner,shop,offer,sku,json.dumps(body),now))
         for r in c.execute("""SELECT sku,shop,offer,body FROM sourcing_seeds s WHERE owner=? AND archived=0
           AND NOT EXISTS(SELECT 1 FROM blocks b WHERE b.owner=s.owner AND b.source_key=s.sku)""",(owner,)):
+            if demand_required and not ranking_sources.seed_allowed(c,owner,r,now):continue
             body=json.loads(r['body']);seller=str(body.get('seller_id') or '')
             if seller.isdigit() and int(seller)>0:
                 manifest.setdefault(seller,[]).append({'sku':r['sku'],'shop':r['shop'],'offer':r['offer'],'channel':'active-seed'})
@@ -226,7 +241,14 @@ async def tick(db,config):
     with (db.directory/'source-loop.lock').open('a') as lock:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:return {'state':'busy'}
+        from .. import ranking_sources
+        ranking=await ranking_sources.refresh_one(db,owner)
+        if ranking['state'] not in ('ranking_disabled','no_due_ranking'):
+            await database_work(control.record,db,'seed',owner,'',now,ranking['state'],ranking)
         enrolled=await database_work(sync_stores,db,owner,config['run_id'])
+        demand=await ranking_sources.verify_seed_one(db,owner)
+        if demand['state'] not in ('ranking_disabled','no_due_seed_sales'):
+            await database_work(control.record,db,'seed',owner,demand.get('sku',''),now,demand['state'],demand)
         last,backlog=await database_read(backlog_state,db,owner)
         if now-last>=config.get('resolve_interval_seconds',120):
             result=await resolve_one(db,owner)

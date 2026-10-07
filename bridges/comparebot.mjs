@@ -1,3 +1,4 @@
+import {verifiedRankingSource} from './ranking-source-policy.mjs';
 // compareBot supplier binding with existing ERP product, FBS and profit verification.
 import fs from 'node:fs/promises';
 import {cachedCategory} from './category-cache.mjs';
@@ -45,8 +46,9 @@ async function main(){
  const weightFirst=product.weight_first_valuation===true && product.profit_evaluation_only===true
   && Number(product.valuation_weight_g)>0 && Number.isFinite(Number(product.valuation_weight_g))
   && String(plugin?.sku||product.direct_source_facts?.sku)===String(product.sku)
-  && String(product.source_relation?.seller_id)===String(product.seller_id)
-  && product.expansion_source?.contract==='flowhub-same-seller-v1' && product.expansion_source.seed_bindings?.length>0
+  && ((String(product.source_relation?.seller_id)===String(product.seller_id)
+    && product.expansion_source?.contract==='flowhub-same-seller-v1' && product.expansion_source.seed_bindings?.length>0)
+    || verifiedRankingSource(product))
   && ['CNY','RUB'].includes(q?.currency) && q.value>0 && Number.isFinite(q.value)
   && Number.isFinite(q.observed_at) && Date.now()/1000-q.observed_at>=0 && Date.now()/1000-q.observed_at<21600;
  const evaluationOnly=weightFirst||verifiedPluginEvaluation(product);

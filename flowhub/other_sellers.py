@@ -63,18 +63,29 @@ def schema(db):
 def replenish(db,owner,limit=20,now=None,explore_pending=False):
     """Only source-qualified goods; no publication/order requirement or invented offer."""
     now=time.time() if now is None else now;added=0
+    from . import ranking_sources
+    demand_required=bool(ranking_sources.policy(db,owner))
+    if demand_required:ranking_sources.activate(db,owner,now)
     with db.connect() as c:
         if c.execute("SELECT COUNT(*) FROM source_discovery_seeds WHERE owner=? AND state!='complete'",(owner,)).fetchone()[0]>=500:return 0
         setting=c.execute('SELECT body FROM sourcing_settings WHERE owner=?',(owner,)).fetchone()
         filters=SourceFilters(**json.loads(setting[0])) if setting else SourceFilters()
         rows=c.execute('''SELECT p.* FROM sourcing_products p WHERE owner=?
-          AND json_extract(body,'$.coverage') IN ('storefront-page','maozi-exact-seller-page')
+          AND (json_extract(body,'$.coverage') IN ('storefront-page','maozi-exact-seller-page')
+            OR (? AND json_extract(body,'$.coverage')='sales-ranking'))
           AND NOT EXISTS(SELECT 1 FROM source_discovery_seeds s WHERE s.owner=p.owner AND s.sku=p.sku)
           AND NOT EXISTS(SELECT 1 FROM source_discovery_checks s WHERE s.owner=p.owner AND s.sku=p.sku AND s.due>?)
           AND NOT EXISTS(SELECT 1 FROM blocks b WHERE b.owner=p.owner AND b.source_key=p.sku)
-          ORDER BY p.id DESC LIMIT 500''',(owner,now)).fetchall()
+          ORDER BY p.id DESC LIMIT 500''',(owner,demand_required,now)).fetchall()
         for r in rows:
-            p=json.loads(r['body']);result=assess(p,filters,now)
+            p=json.loads(r['body'])
+            if demand_required and not ranking_sources.demand_evidence(c,owner,r['sku'],r['seller'],now):
+                c.execute('INSERT OR REPLACE INTO source_discovery_checks VALUES(?,?,?,?)',
+                    (owner,r['sku'],now+3600,json.dumps({'state':'needs_review','missing':['own_recent_sales']})))
+                continue
+            ranking=demand_required and p.get('coverage')=='sales-ranking' and ranking_sources.verified_ranking(p,now)
+            source_filters=SourceFilters(**(vars(filters)|{'same_seller_only':False})) if ranking else filters
+            result=assess(p,source_filters,now)
             c.execute('INSERT OR REPLACE INTO source_discovery_checks VALUES(?,?,?,?)',(owner,r['sku'],now+3600,json.dumps(result)))
             roots=(p.get('source_relation') or {}).get('root_seeds') or []
             exploration=bool(explore_pending and result['state']=='needs_review' and not result['failed']

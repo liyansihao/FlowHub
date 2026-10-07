@@ -315,3 +315,25 @@ def test_follow_readback_is_short_without_changing_historical_scheduling():
     assert pipeline.readback_delay(body,'reconciling',native_follow=True)==60
     assert pipeline.readback_delay(body,'reconciling',native_follow=True)==60
     assert pipeline.readback_delay(body,'stock_verified',verified=True,native_follow=True)==0
+
+
+async def test_ranking_origin_reuses_existing_follow_import_and_stock_readback(native):
+    from flowhub.ranking_sources import CONTRACT
+    db,owner,platform,review,calls=native
+    origin=review['candidate']['origin']
+    origin.pop('source_relation',None)
+    proof={'contract':CONTRACT,'endpoint':'/api.selection.top/lists','sku':'123','seller_id':'456',
+           'period':'28d','sold_count':3,'observed_at':time.time(),'evidence_hash':'ranking-test'}
+    origin.update(coverage='sales-ranking',ranking_source=proof,
+                  expansion_source={'contract':CONTRACT,'coverage':'sales-ranking','ranking':proof})
+    with db.connect() as c:
+        c.execute('UPDATE plugin_reviews SET body=?',(json.dumps(review),))
+    result=await finish(native)
+    assert result['phase']=='stock_verified'
+    assert sum(p=='/api.selection.follow/import' for p,b in calls)==1
+    assert not any(p=='/v3/product/import' for p,b in platform.calls)
+    with db.connect() as c:
+        record=json.loads(c.execute('SELECT body FROM plugin_publications').fetchone()[0])
+        assert record['backend']==follow.BACKEND
+        assert record['offer_id']==platform.offer
+        assert c.execute("SELECT COUNT(*) FROM jobs WHERE phase='selling'").fetchone()[0]==1

@@ -25,8 +25,14 @@ def candidate(product, now=None):
     if weight is None or price is None:raise ValueError('pricing_facts_missing')
     dims_valid=len(dims)==3 and all(positive(v) for v in dims)
     relation = product.get('source_relation') or {}
-    if relation.get('seller_id') != product['seller_id'] or not relation.get('root_seeds'):
+    from .ranking_sources import verified_ranking
+    ranking=product.get('coverage')=='sales-ranking' and verified_ranking(product,now)
+    if not ranking and (relation.get('seller_id') != product['seller_id'] or not relation.get('root_seeds')):
         raise ValueError('source_provenance_missing')
+    provenance=({'contract':'flowhub-sales-ranking-v1','coverage':'sales-ranking',
+                 'ranking':product['ranking_source']} if ranking else
+                {'contract':'flowhub-same-seller-v1','coverage':'storefront-exact-seller',
+                 'seed_bindings':relation['root_seeds'],'evidence_hash':product.get('source_relation_evidence_hash')})
     origin = dict(product)
     origin.update(cover_image=product['image'], product_url=product['url'],
                   category_name=sales.get('category_name') or detail.get('description_type_name') or product.get('category_name',''),
@@ -35,8 +41,7 @@ def candidate(product, now=None):
                   profit_evaluation_only=True, weight_first_valuation=True, valuation_weight_g=weight, commission_fallback_pct=12, publication_blockers=publication_blockers(product,now),
                   category_id=product.get('category_id') or detail.get('description_type'),
                   specifications={'attributes':detail.get('attributes'), 'variant_id':detail.get('variant_id')},
-                  expansion_source={'contract':'flowhub-same-seller-v1','coverage':'storefront-exact-seller',
-                                    'seed_bindings':relation['root_seeds'],'evidence_hash':product.get('source_relation_evidence_hash')})
+                  expansion_source=provenance)
     return {'source_key':str(product['sku']), 'title':product['title'], 'image':image_url(product['image']),
             'price':price, 'weight_g':weight, 'dimensions_cm':[float(v)/10 for v in dims] if dims_valid else None,
             'pure_fbs':sales.get('sales_schema')=='FBS', 'price_currency':quote['currency'],
@@ -77,13 +82,15 @@ async def evaluate(db, owner, sku, seller, *, force=False):
     blocks = await read_delists()
     if sku in blocks['skus']:
         raise ValueError('explicit_delist')
-    roots = eligible_roots(envelope['origin']['expansion_source']['seed_bindings'],blocks,seller)
-    if not roots:
-        raise ValueError('source_roots_delisted')
-    envelope['origin']['expansion_source']['seed_bindings'] = roots
+    provenance=envelope['origin']['expansion_source']
+    roots=[]
+    if provenance['contract']=='flowhub-same-seller-v1':
+        roots=eligible_roots(provenance['seed_bindings'],blocks,seller)
+        if not roots:raise ValueError('source_roots_delisted')
+        provenance['seed_bindings']=roots
     started = time.time()
     matcher_secret=db.open(workflow['secrets'])['flowb-matcher']
-    digest = fingerprint({'credential_revision':fingerprint(matcher_secret),'adapter_version':4,'plugin':product['plugin_detail'],'quote':envelope['origin']['price_evidence'],'roots':roots,'rules':workflow['rules']})
+    digest = fingerprint({'credential_revision':fingerprint(matcher_secret),'adapter_version':4,'plugin':product['plugin_detail'],'quote':envelope['origin']['price_evidence'],'roots':roots,**({'ranking':provenance['ranking']} if 'ranking' in provenance else {}),'rules':workflow['rules']})
     cached=await database_work(reserve_review,db,owner,sku,seller,force,started,digest)
     if cached is not None:return cached
     report={'sku':sku,'seller':seller,'started_at':started,'candidate':envelope,'submitted':False,'input_digest':digest,

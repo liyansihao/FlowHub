@@ -1,3 +1,4 @@
+import {verifiedRankingSource} from './ranking-source-policy.mjs';
 // Read-only publication feedback. Reuses the same exclusions as comparebot.mjs;
 // full catalog attributes are not part of the ERP follow-import contract.
 import fs from 'node:fs/promises';
@@ -17,8 +18,9 @@ export function checkFollowFeedback(product, source, deps, now=Date.now()/1000) 
   const weightFirst=product.weight_first_valuation===true && product.profit_evaluation_only===true
     && Number.isFinite(Number(product.valuation_weight_g)) && Number(product.valuation_weight_g)>0
     && String(product.plugin_detail?.sku||product.direct_source_facts?.sku)===String(product.sku)
-    && String(product.source_relation?.seller_id)===String(product.seller_id)
-    && product.expansion_source.contract==='flowhub-same-seller-v1' && product.expansion_source.seed_bindings?.length>0
+    && ((String(product.source_relation?.seller_id)===String(product.seller_id)
+      && product.expansion_source?.contract==='flowhub-same-seller-v1' && product.expansion_source.seed_bindings?.length>0)
+      || verifiedRankingSource(product,now))
     && ['CNY','RUB'].includes(q?.currency) && Number.isFinite(q.value) && q.value>0
     && Number.isFinite(q.observed_at) && now-q.observed_at>=0 && now-q.observed_at<21600;
   const category=engine.categoryPolicyFor(product);

@@ -101,8 +101,12 @@ async def exact_favorites(client,sku,should_stop=lambda:False):
 
 def lineage(product,sku,seller):
     relation=product.get('source_relation') or {}
+    from ..ranking_sources import verified_ranking
+    ranking=product.get('ranking_source') or {}
+    # Archiving proves the retained lineage, not current demand. Keep its real timestamp.
+    ranked=product.get('coverage')=='sales-ranking' and verified_ranking(product,ranking.get('observed_at',0))
     return (str(product.get('sku'))==sku and str(product.get('seller_id'))==seller
-            and str(relation.get('seller_id'))==seller and bool(relation.get('root_seeds')))
+            and ((str(relation.get('seller_id'))==seller and bool(relation.get('root_seeds'))) or ranked))
 
 
 def candidates(db,owner,settings):
@@ -151,7 +155,7 @@ def archive(db,c,item,favorite,online):
     q=c.execute('SELECT * FROM plugin_pipeline WHERE owner=? AND sku=? AND seller=?',key).fetchone()
     if not q or q['state']!='selling' or json.loads(q['body']).get('offer_id')!=item['offer_id']:return None
     if c.execute('SELECT 1 FROM plugin_pipeline_leases WHERE owner=? AND sku=? AND seller=? AND expires>?',(*key,time.time())).fetchone():return None
-    source=json.loads(product['body']);roots=(source['source_relation']['root_seeds'])
+    source=json.loads(product['body']);roots=(source.get('source_relation') or {}).get('root_seeds') or []
     root_skus={str(r.get('sku') or r.get('source_sku')) for r in roots}
     seeds=[dict(r) for r in c.execute('SELECT * FROM sourcing_seeds WHERE owner=?',(key[0],)) if r['sku'] in root_skus]
     publication=c.execute('SELECT body FROM plugin_publications WHERE owner=? AND sku=? AND seller=?',key).fetchone()

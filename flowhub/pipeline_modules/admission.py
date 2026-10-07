@@ -1,5 +1,6 @@
 """Persistent, bounded admission from the verified source library. No browser fallback."""
 import json
+from itertools import chain
 import re
 import time
 from ..source_library import SourceLibrary
@@ -47,6 +48,9 @@ def admit_one(db, owner, now=None):
     now=time.time() if now is None else now
     schema(db)
     if control.paused(db,'seed'):return {'state':'paused'}
+    from .. import ranking_sources
+    ranking_policy=ranking_sources.policy(db,owner)
+    if ranking_policy:ranking_sources.activate(db,owner,now)
     with db.connect() as c:
         c.execute('BEGIN IMMEDIATE')
         row=c.execute('SELECT * FROM pipeline_campaigns WHERE owner=? AND enabled=1',(owner,)).fetchone()
@@ -117,10 +121,16 @@ def admit_one(db, owner, now=None):
           AND NOT EXISTS(SELECT 1 FROM blocks b WHERE b.owner=p.owner AND b.source_key=p.sku)
           ORDER BY CASE WHEN p.sku IN (SELECT value FROM json_each(?)) THEN 0 ELSE 1 END,
           p.id '''+order,(owner,cohort))
-        for candidate in rows:
+        ranked=ranking_sources.priority_candidates(c,owner,now) if ranking_policy else []
+        for candidate in chain(ranked,rows):
             row=c.execute('SELECT * FROM sourcing_products WHERE id=?',(candidate['id'],)).fetchone()
             p=json.loads(row['body']);relation=p.get('source_relation') or {}
-            if relation.get('seller_id')!=p.get('seller_id') or not relation.get('root_seeds'):continue
+            is_ranking='ranking' in candidate.keys()
+            if is_ranking:
+                p['ranking_source']=json.loads(candidate['ranking'])
+                if not ranking_sources.verified_ranking(p,now):continue
+            bound=relation.get('seller_id')==p.get('seller_id') and bool(relation.get('root_seeds'))
+            if not bound and not (is_ranking and p.get('coverage')=='sales-ranking'):continue
             # All source provenance and live delist checks still run before matching and writing.
             target=stores[total%len(stores)];key=(owner,row['sku'],row['seller'])
             stamp={'run_id':policy['run_id'],'at':now,'source_observed_at':p.get('collected_at'),'target_store':target['id']}
