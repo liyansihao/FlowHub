@@ -244,3 +244,47 @@ async def test_seed_resolution_write_wait_does_not_block_event_loop(tmp_path):
         assert not task.done()
         writer.rollback()
     assert (await asyncio.wait_for(task,2))['state']=='resolved'
+
+
+def test_publication_root_index_is_covering_and_tracks_updates(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    db=setup(tmp_path)
+    # The publication table can appear after source schema has already run.
+    loop.sync_stores(db,'a','scan',100)
+    with db.connect() as c:
+        c.execute('CREATE TABLE plugin_publications(owner TEXT,sku TEXT,seller TEXT,body TEXT,updated REAL,PRIMARY KEY(owner,sku,seller))')
+        for owner,sku,verified in [('a','456',True),('a','457',False),('a','458','1'),('b','459',True)]:
+            body={'verified':verified,'sku':sku,'seller':'14','offer_id':'shared-offer',
+                  'product':{'shop_id':'42','sku':'own-sku','nested':{'unicode':'商品'}}}
+            c.execute('INSERT INTO plugin_publications VALUES(?,?,?,?,?)',(owner,sku,'14',json.dumps(body),100))
+    statements=[];original=db.connect
+    @contextmanager
+    def traced():
+        with original() as c:
+            c.set_trace_callback(statements.append)
+            yield c
+    monkeypatch.setattr(db,'connect',traced)
+    loop.sync_stores(db,'a','scan',101)
+    with db.connect() as c:
+        root=c.execute("SELECT sku,body FROM sourcing_seeds WHERE owner='a' AND shop='42' AND offer='shared-offer'").fetchone()
+        assert root['sku']=='456'
+        assert json.loads(root['body'])['online_evidence']['nested']=={'unicode':'商品'}
+        assert not c.execute("SELECT 1 FROM sourcing_seeds WHERE owner='b'").fetchone()
+        query=next(s for s in statements if ' AS body FROM plugin_publications INDEXED BY ' in s)
+        assert any('source_publication_roots' in r[3] for r in c.execute('EXPLAIN QUERY PLAN '+query))
+        table_root=c.execute("SELECT rootpage FROM sqlite_master WHERE name='plugin_publications'").fetchone()[0]
+        ops=list(c.execute('EXPLAIN '+query))
+        table_cursors={r[2] for r in ops if r[1]=='OpenRead' and r[3]==table_root}
+        assert not any(r[1]=='Column' and r[2] in table_cursors for r in ops)
+        # A later verification and changed offer must be visible without a cursor/cache.
+        c.execute("UPDATE plugin_publications SET body=json_set(body,'$.verified',1,'$.offer_id','new-offer') WHERE owner='a' AND sku='457'")
+    loop.sync_stores(db,'a','scan',102)
+    with db.connect() as c:
+        assert c.execute("SELECT sku FROM sourcing_seeds WHERE owner='a' AND offer='new-offer'").fetchone()[0]=='457'
+        c.execute('DROP INDEX source_publication_roots')
+    # Restoration on an old instance preserves historical exact roots and pauses.
+    reopened=Database.open_existing(db.directory)
+    loop.sync_stores(reopened,'a','scan',103)
+    with reopened.connect() as c:
+        assert c.execute("SELECT sku FROM sourcing_seeds WHERE owner='a' AND offer='shared-offer'").fetchone()[0]=='456'
+        assert c.execute("SELECT 1 FROM sqlite_master WHERE name='source_publication_roots'").fetchone()

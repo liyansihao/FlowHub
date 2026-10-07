@@ -13,6 +13,8 @@ from ..source_acquisition import erp_request
 from . import control
 from .database_work import run as database_work, read as database_read
 
+PUBLICATION_ROOT_PROJECTION = "json_object('sku',json_extract(body,'$.sku'),'seller',json_extract(body,'$.seller'),'offer_id',json_extract(body,'$.offer_id'),'product',json_extract(body,'$.product'))"
+
 SEED_RESOLUTION_MAX_ATTEMPTS = 4  # Initial read plus three delayed retries.
 
 
@@ -39,6 +41,11 @@ def sync_stores(db, owner, run_id, now=None):
     now=time.time() if now is None else now
     service=BrowserSource(db);manifest={}
     with db.connect() as c:
+        if c.execute("SELECT 1 FROM sqlite_master WHERE name='plugin_publications'").fetchone():
+            def index_publication_roots():
+                with db.connect() as index_connection:
+                    index_connection.execute("CREATE INDEX IF NOT EXISTS source_publication_roots ON plugin_publications(owner,sku,seller," + PUBLICATION_ROOT_PROJECTION + ") WHERE json_extract(body,'$.verified')=1")
+            db.schema_once('source_loop.publication_roots', index_publication_roots)
         # Reuse the original exact SKU/offer bindings, not an inferred offer ID.
         for scan in c.execute('SELECT seller,roots FROM browser_source_scans WHERE owner=? AND run_id=?',(owner,run_id)).fetchall():
             for root in json.loads(scan['roots']):
@@ -52,7 +59,7 @@ def sync_stores(db, owner, run_id, now=None):
                         c.execute('UPDATE sourcing_seeds SET body=? WHERE owner=? AND shop=? AND offer=?',(json.dumps(body),owner,shop,offer))
         # Completed publications give exact own offer -> original SKU/seller bindings.
         if c.execute("SELECT 1 FROM sqlite_master WHERE name='plugin_publications'").fetchone():
-            for r in c.execute("SELECT json_object('sku',json_extract(body,'$.sku'),'seller',json_extract(body,'$.seller'),'offer_id',json_extract(body,'$.offer_id'),'product',json_extract(body,'$.product')) AS body FROM plugin_publications WHERE owner=? AND json_extract(body,'$.verified')=1",(owner,)).fetchall():
+            for r in c.execute("SELECT " + PUBLICATION_ROOT_PROJECTION + " AS body FROM plugin_publications INDEXED BY source_publication_roots WHERE owner=? AND json_extract(body,'$.verified')=1 ORDER BY sku,seller",(owner,)).fetchall():
                 p=json.loads(r[0]);product=p.get('product') or {}
                 shop=str(product.get('shop_id') or '');sku=str(p.get('sku') or '');seller=str(p.get('seller') or '')
                 offer=p.get('offer_id')
