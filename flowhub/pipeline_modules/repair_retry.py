@@ -4,6 +4,9 @@ import json
 
 def classify(evidence):
     steps=evidence.get('steps',[])
+    for step in steps:
+        if step.get('source')=='ozon-ranking-quote' and step.get('failure_class') in ('network','remote_pending'):
+            return step['failure_class']
     text=json.dumps(steps,ensure_ascii=False).lower()
     if any(x in text for x in ('connecttimeout','connecterror','connect_timeout','readtimeout','remoteprotocolerror','readerror','writeerror','pooltimeout','econnreset','enotfound','fetch failed','maozi_api_pacing_wait','maozi_pacing_lock_timeout','timeout_error','timeouterror','etimedout','rate_limited')):
         return 'network'

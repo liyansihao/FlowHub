@@ -52,10 +52,18 @@ async def supplement(db,owner,sku,seller,p,review,context,evidence,require_dossi
     if direct_enabled and any(k in needed for k in ('weight_g','dimensions_mm')):
         requests['category']=('GET','/api.tool/get_category_by_sku',{'params':{'keyword':sku}})
     if 'sale_price' in needed:
-        requests['price']=('POST','/api.chrome/sku3',{'params':{'sku':sku},'body':{'sku':sku}})
+        from ..ranking_sources import verified_ranking
+        if not require_dossier and p.get('coverage')=='sales-ranking' and verified_ranking(p):
+            requests['ranking_quote']=('GET','ozon-product-page',{})
+        else:
+            requests['price']=('POST','/api.chrome/sku3',{'params':{'sku':sku},'body':{'sku':sku}})
     async def read(kind,request):
         began=time.monotonic();method,path,kwargs=request
         try:
+            if kind=='ranking_quote':
+                from . import ranking_quote
+                quote,step=await ranking_quote.read(db,owner,p)
+                return kind,quote,step
             response=(await RepairReads.get(MaoziPublisher(context),path,params=kwargs.get('params'))
                       if method=='GET' else await MaoziPublisher(context).erp(method,path,**kwargs))
             return kind,response,{'source':kind,'endpoint':path,'elapsed_ms':round((time.monotonic()-began)*1000),'ok':True}
@@ -66,6 +74,8 @@ async def supplement(db,owner,sku,seller,p,review,context,evidence,require_dossi
         responses[kind]=response;evidence['steps'].append(step)
     if 'category' in responses:
         p,step=direct_facts.from_category(p,responses['category'],time.time());evidence['steps'].append(step)
+    if responses.get('ranking_quote'):
+        p['proposed_sale_price']=responses['ranking_quote']
     if 'price' in responses:
         response=responses['price']
         if direct_enabled:

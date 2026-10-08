@@ -1,0 +1,46 @@
+{
+  "sku": "3027500170",
+  "seller_id": "3471788",
+  "expected_value": 350.0,
+  "expected_currency": "RUB",
+  "observed_at": 1791427137.479,
+  "url": "https://www.ozon.ru/product/3027500170/?__rr=1&abt_att=1",
+  "widgets": {
+    "main": {
+      "sku": "3027500170",
+      "url": "/product/samokleyashchiysya-uplotnitel-uplotnitelnaya-lenta-dlya-okon-3027500170/?__rr=1&abt_att=1&sh=n0lwKufjAg"
+    },
+    "seller": {
+      "sellerCell": {
+        "common": {
+          "action": {
+            "behavior": "BEHAVIOR_TYPE_REDIRECT",
+            "link": "https://www.ozon.ru/seller/yameiguoji1/"
+          }
+        }
+      },
+      "header": {
+        "badge": {
+          "subscribed": {
+            "common": {
+              "action": {
+                "behavior": "BEHAVIOR_TYPE_COMPOSER_ACTION",
+                "link": "sisUnlike",
+                "id": "sisUnlike",
+                "params": {
+                  "sellerId": "3471788"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "price": {
+      "isAvailable": true,
+      "price": "350 ₽",
+      "cardPrice": "317 ₽",
+      "link": "/modal/pdpListOfBanks?product_id=3027500170"
+    }
+  }
+}

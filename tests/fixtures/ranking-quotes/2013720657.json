@@ -1,0 +1,46 @@
+{
+  "sku": "2013720657",
+  "seller_id": "2505349",
+  "expected_value": 150.0,
+  "expected_currency": "RUB",
+  "observed_at": 1791427262.632,
+  "url": "https://www.ozon.ru/product/2013720657/?__rr=1&sh=n0lwKrXYmA",
+  "widgets": {
+    "main": {
+      "sku": "2013720657",
+      "url": "/product/noski-muzhskie-zhenskie-1-para-2013720657/?__rr=1&sh=n0lwKrXYmA"
+    },
+    "seller": {
+      "sellerCell": {
+        "common": {
+          "action": {
+            "behavior": "BEHAVIOR_TYPE_REDIRECT",
+            "link": "https://www.ozon.ru/seller/anke-2505349/"
+          }
+        }
+      },
+      "header": {
+        "badge": {
+          "subscribed": {
+            "common": {
+              "action": {
+                "behavior": "BEHAVIOR_TYPE_COMPOSER_ACTION",
+                "link": "sisUnlike",
+                "id": "sisUnlike",
+                "params": {
+                  "sellerId": "2505349"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "price": {
+      "isAvailable": true,
+      "price": "150 ₽",
+      "cardPrice": "141 ₽",
+      "link": "/modal/pdpListOfBanks?product_id=2013720657"
+    }
+  }
+}
