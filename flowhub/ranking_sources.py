@@ -187,6 +187,7 @@ def commit_page(db, owner, task, rows, last, query, blocks, now):
             # Save zero/missing/latest evidence too: old positive sales must not stay preferred.
             c.execute('INSERT INTO source_rankings VALUES(?,?,?,?,?) ON CONFLICT(owner,sku,seller) DO UPDATE SET body=excluded.body,observed=excluded.observed',
                       (owner, sku, seller, json.dumps(evidence), now))
+            product.update(coverage='sales-ranking', ranking_source=evidence)
             if (not fresh_sales(evidence, sku, seller, now) or sku in blocks['skus']
                     or assess(product, filters, now)['failed']):
                 continue
@@ -198,7 +199,6 @@ def commit_page(db, owner, task, rows, last, query, blocks, now):
                 c.execute("UPDATE sourcing_products SET body=json_set(body,'$.ranking_source',json(?)) WHERE owner=? AND sku=? AND seller=? AND json_extract(body,'$.coverage')='sales-ranking'",
                           (json.dumps(evidence), owner, sku, seller))
                 continue
-            product.update(coverage='sales-ranking', ranking_source=evidence)
             added += library.put(owner, product, {'channel': 'sales-ranking', 'query': query}, connection=c)
         ended = not rows or (last is not None and page >= last)
         refresh_due = now + 21600 if task['head'] else task['refresh_due']

@@ -340,3 +340,59 @@ async def test_existing_ranking_proof_refresh_preserves_review_price_and_queue(t
         assert proof['observed_at']==100+8*86400 and proof['sold_count']==4
         saved=c.execute('SELECT body FROM sourcing_evidence WHERE owner=? AND hash=?',(owner,proof['evidence_hash'])).fetchone()
         assert json.loads(saved[0])['row']['sold_count']==4
+
+
+@pytest.mark.asyncio
+async def test_ranking_follow_flag_is_advisory_without_changing_other_source_rules(tmp_path):
+    from flowhub.source_library import SourceFilters, assess
+    from flowhub.plugin_publication import require_source_modes
+    db, owner = setup(tmp_path)
+    with db.connect() as c:
+        c.execute("UPDATE sourcing_settings SET body=? WHERE owner=?",
+                  (json.dumps({'sales_min': 1, 'pure_fbs': True, 'require_follow_allowed': True}), owner))
+    result, _ = await refresh(db, owner, [row(blocked_by_seller=True)])
+    assert result['added'] == 1
+    assert admit_one(db, owner, 101)['sku'] == '10'
+    with db.connect() as c:
+        p = json.loads(c.execute("SELECT body FROM sourcing_products WHERE sku='10'").fetchone()[0])
+        evidence = json.loads(c.execute('SELECT body FROM sourcing_evidence WHERE hash=?',
+                                       (p['ranking_source']['evidence_hash'],)).fetchone()[0])
+    assert p['raw']['blocked_by_seller'] is True
+    assert evidence['row']['blocked_by_seller'] is True
+    filters = SourceFilters(require_follow_allowed=True)
+    assessment = assess(p, filters, 101)
+    assert 'follow_allowed' not in assessment['failed']
+    assert 'follow_allowed' in assessment['missing']
+    assert 'follow_allowed' not in assessment['passed']
+    # A label alone, mismatched evidence or a non-ranking source cannot relax the old rule.
+    for change in ({'coverage': 'storefront-page'}, {'ranking_source': {}},
+                   {'ranking_source': dict(p['ranking_source'], seller_id='99')}):
+        assert 'follow_allowed' in assess(p | change, filters, 101)['failed']
+    with pytest.raises(ValueError, match='seller_explicitly_blocks_follow'):
+        require_source_modes(('FBS',), {'blocked_by_seller': True}, allow_unknown=True, now=101)
+    # Refresh does not replay the admitted item or overwrite its decision.
+    with db.connect() as c:
+        c.execute("UPDATE plugin_pipeline SET state='rejected' WHERE sku='10'")
+    assert (await refresh(db, owner, [row(blocked_by_seller=True)], 21700))[0]['added'] == 0
+    assert admit_one(db, owner, 21701)['sku'] == '1'
+
+
+@pytest.mark.asyncio
+async def test_advisory_ranking_flag_keeps_sales_price_weight_fbs_and_explicit_blocks(tmp_path):
+    db, owner = setup(tmp_path)
+    with db.connect() as c:
+        c.execute("UPDATE sourcing_settings SET body=? WHERE owner=?",
+                  (json.dumps({'sales_min': 1, 'price_min': 100, 'price_max': 1500,
+                               'weight_max_g': 500, 'pure_fbs': True, 'require_follow_allowed': True}), owner))
+        c.execute('INSERT INTO blocks(owner,source_key,reason) VALUES(?,?,?)', (owner, '17', 'manual'))
+    rows = [row('10', blocked_by_seller=True), row('11', sales=0, blocked_by_seller=True),
+            row('12', avg_price=99, blocked_by_seller=True), row('13', avg_price=1501, blocked_by_seller=True),
+            row('14', weight=501, blocked_by_seller=True), row('15', sales_schema='FBO', blocked_by_seller=True),
+            row('16', update_time=1, blocked_by_seller=True), row('17', blocked_by_seller=True),
+            row('18', blocked_by_seller=True)]
+    result = await ranking.refresh_one(db, owner, 700000, AsyncMock(return_value={'data': rows, 'last_page': 1}),
+                                      AsyncMock(return_value={'skus': ['18'], 'offers': []}))
+    assert result['added'] == 1
+    assert admit_one(db, owner, 700001)['sku'] == '10'
+    with db.connect() as c:
+        assert c.execute("SELECT COUNT(*) FROM sourcing_products WHERE sku IN ('11','12','13','14','15','16','17','18')").fetchone()[0] == 0

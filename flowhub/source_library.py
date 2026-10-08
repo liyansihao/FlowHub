@@ -80,7 +80,11 @@ def assess(product, filters, now=None):
         (missing if not value else passed if value in filters.categories else failed).append("category")
     if filters.require_follow_allowed:
         blocked = (product.get("raw") or {}).get("blocked_by_seller")
-        (passed if blocked is False else failed if blocked is True else missing).append("follow_allowed")
+        from .ranking_sources import verified_ranking
+        # The ranking provider flag has real follow-import counterexamples.
+        # Keep it as unknown permission, never rewrite it as permission granted.
+        advisory = product.get("coverage") == "sales-ranking" and verified_ranking(product, now)
+        (passed if blocked is False else failed if blocked is True and not advisory else missing).append("follow_allowed")
     if filters.same_seller_only:
         relation = product.get("source_relation") or {}
         valid = (
