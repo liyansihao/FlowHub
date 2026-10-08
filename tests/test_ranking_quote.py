@@ -139,11 +139,11 @@ async def test_busy_retries_but_bad_product_evidence_does_not_pass(tmp_path, mon
     if failure: assert json.loads(q['body'])['repair_workflow']['failure_class'] == failure
 
 
-async def test_shared_profile_busy_never_launches_second_browser(tmp_path, monkeypatch):
+async def test_quote_profile_busy_never_launches_second_quote_browser(tmp_path, monkeypatch):
     db, owner = configured(tmp_path)
     spawn = AsyncMock(side_effect=AssertionError('must not launch'))
     monkeypatch.setattr(asyncio, 'create_subprocess_exec', spawn)
-    with (tmp_path/'source-loop.lock').open('a') as lock:
+    with (tmp_path/'ranking-quote.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         quote, step = await ranking_quote.read(db, owner, {'sku': '1'})
     assert quote is None and repair_retry.classify({'steps': [step]}) == 'remote_pending'
@@ -160,7 +160,7 @@ async def test_cancellation_closes_browser_before_releasing_profile(tmp_path, mo
         def terminate(self): self.terminated = True
         async def wait(self):
             assert self.terminated
-            with (tmp_path/'source-loop.lock').open('a') as lock:
+            with (tmp_path/'ranking-quote.lock').open('a') as lock:
                 with pytest.raises(BlockingIOError): fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.returncode = 0
     process = Process()
@@ -169,7 +169,24 @@ async def test_cancellation_closes_browser_before_releasing_profile(tmp_path, mo
     await entered.wait(); task.cancel()
     with pytest.raises(asyncio.CancelledError): await task
     assert process.returncode == 0
-    with (tmp_path/'source-loop.lock').open('a') as lock: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with (tmp_path/'ranking-quote.lock').open('a') as lock: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+async def test_source_collection_lock_cannot_starve_quote_read(tmp_path, monkeypatch):
+    db, owner = configured(tmp_path)
+    f = fixture(); f['observed_at'] = time.time()
+    class Process:
+        returncode = 0
+        async def communicate(self): return json.dumps(packet(f)).encode(), b''
+    async def spawn(*args, **kwargs):
+        assert kwargs['env']['FLOWHUB_SOURCE_PROFILE'] == str(tmp_path/'ranking-quote-browser-profile')
+        assert kwargs['env']['FLOWHUB_SOURCE_PROFILE'] != str(tmp_path/'browser')
+        return Process()
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', spawn)
+    with (tmp_path/'source-loop.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        quote, _ = await ranking_quote.read(db, owner, f)
+    assert quote['value'] == 350
 
 
 async def test_storefront_with_existing_quote_never_uses_ranking_browser(tmp_path, monkeypatch):

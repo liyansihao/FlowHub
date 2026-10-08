@@ -88,15 +88,16 @@ async def read(db, owner, product):
     config = json.loads(config_path.read_text()) if config_path.exists() else {}
     if not config.get('enabled') or config.get('owner') != owner or not config.get('profile'):
         return None, step | {'reason': 'quote_source_browser_unconfigured'}
-    # The existing source loop holds this same lock for every use of its dedicated profile.
-    with (db.directory / 'source-loop.lock').open('a') as lock:
+    # The source loop holds its lock across unrelated ERP/database work. A separate
+    # public-page profile avoids starving quote reads or delaying seed collection.
+    with (db.directory / 'ranking-quote.lock').open('a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return None, step | {'reason': 'quote_source_browser_busy', 'failure_class': 'remote_pending'}
         process = None
         try:
-            env = os.environ | {'FLOWHUB_SOURCE_PROFILE': config['profile'],
+            env = os.environ | {'FLOWHUB_SOURCE_PROFILE': str(db.directory / 'ranking-quote-browser-profile'),
                                 'FLOWHUB_DATA': str(db.directory.resolve())}
             for key, variable in [('extension_dir', 'FLOWHUB_SOURCE_EXTENSION_DIR'),
                                   ('chromium_executable', 'FLOWHUB_SOURCE_CHROMIUM_EXECUTABLE')]:
@@ -121,7 +122,7 @@ async def read(db, owner, product):
         except (ValueError, KeyError, TypeError, AttributeError) as error:
             return None, step | {'reason': str(error) if type(error) is ValueError else type(error).__name__}
         finally:
-            # Cancellation must close the browser before releasing the shared profile lock.
+            # Cancellation must close the browser before releasing this profile's lock.
             if process and process.returncode is None:
                 process.terminate()
                 try:
