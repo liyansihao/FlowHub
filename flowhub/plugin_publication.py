@@ -11,6 +11,7 @@ from pathlib import Path
 
 import httpx
 
+from .source_modes import supported_source_modes
 from .db import DATA
 from .maozi import MaoziPublisher
 from .source_delists import read_delists
@@ -43,17 +44,17 @@ def same_postal_package(detail,facts):
 
 def unknown_restrictions_allowed(review):
     monthly=review.get('candidate',{}).get('origin',{}).get('plugin_detail',{}).get('monthly_sales',{})
-    return monthly.get('sales_schema') in (None,'','FBS') and monthly.get('blocked_by_seller') in (None,False)
+    return (monthly.get('sales_schema') in (None,'') or supported_source_modes(monthly.get('sales_schema'))) and monthly.get('blocked_by_seller') in (None,False)
 
 
 def require_source_modes(modes, monthly, allow_unknown=False, now=None):
     now=time.time() if now is None else now
     if monthly.get('blocked_by_seller') is True:
         raise ValueError('seller_explicitly_blocks_follow')
-    if allow_unknown and monthly.get('sales_schema') in (None,'','FBS') and (not modes or tuple(modes)==('FBS',)):
+    if allow_unknown and (monthly.get('sales_schema') in (None,'') or supported_source_modes(monthly.get('sales_schema'))) and (not modes or supported_source_modes(modes)):
         return
-    if tuple(modes)!=('FBS',) and not (not modes and monthly.get('sales_schema')=='FBS' and monthly.get('blocked_by_seller') is False and 0<=now-monthly.get('observed_at',0)<900):
-        raise ValueError('fresh_fbs_required')
+    if not supported_source_modes(modes) and not (not modes and supported_source_modes(monthly.get('sales_schema')) and monthly.get('blocked_by_seller') is False and 0<=now-monthly.get('observed_at',0)<900):
+        raise ValueError('fresh_source_modes_required')
 
 
 def approved(review, rules, now=None, allow_unknown=False, *, native_follow=False):

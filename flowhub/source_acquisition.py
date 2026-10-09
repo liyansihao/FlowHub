@@ -42,8 +42,7 @@ def ranking_query(body, page, filters):
         value = getattr(filters, field)
         if value is not None:
             query[parameter] = value
-    if filters.pure_fbs:
-        query["sales_schema"] = "FBS"
+    query.pop("sales_schema", None)  # Do not retain an old FBS-only task filter.
     return query
 
 

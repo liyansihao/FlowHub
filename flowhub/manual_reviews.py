@@ -77,7 +77,7 @@ REASON_LABELS = {
     'price_evidence_stale':'售价依据已过期，需要更新价格并重新测算',
     'plugin_facts_missing_or_stale':'商品资料缺失或过期，需要重新采集',
     'pricing_facts_missing':'利润测算所需的价格、重量或尺寸缺失',
-    'fresh_pure_fbs_required':'缺少有效的纯 FBS 发货方式证明',
+    'fresh_pure_fbs_required':'缺少有效的 FBO/FBS 发货方式证明',
     'follow_permission_unverified_or_blocked':'跟卖许可尚未核实或卖家禁止跟卖',
     'explicit_source_restriction':'商品存在明确的发货方式或跟卖限制',
     'profit_below_workflow_threshold':'成本利润率未达到工作流门槛',

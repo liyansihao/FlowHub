@@ -337,12 +337,13 @@ async def test_auth_failure_pauses_task_and_seed_revocation_stops_expansion(libr
     assert result["reason"] == "seed_not_current"
 
 
-def test_latest_live_mode_overrides_statistical_mode(library):
+@pytest.mark.parametrize("schema", ["FBO", "FBS", "FBO,FBS", "FBS,FBO"])
+def test_both_source_modes_are_eligible_with_legacy_filter(library, schema):
     p = product()
-    p["live_check"] = {"observed_at": time.time(), "sales_schema": "FBO,FBS"}
+    p["live_check"] = {"observed_at": time.time(), "sales_schema": schema}
     library.put("a", p, {})
-    assert assess(p, SourceFilters())["state"] == "rejected"
-    assert library.query("a", state="qualified")["items"] == []
+    assert assess(p, SourceFilters(pure_fbs=True))["state"] == "qualified"
+    assert len(library.query("a", state="qualified")["items"]) == 1
 
 
 def test_handoff_is_idempotent_and_holds_unknown_price(library, monkeypatch):
@@ -404,7 +405,7 @@ def test_ranking_pushdown_and_keyword_normalization():
         3,
         SourceFilters(price_min=100, price_max=1000, weight_max_g=2000, sales_min=1),
     )
-    assert query["page"] == 3 and query["sales_schema"] == "FBS"
+    assert query["page"] == 3 and "sales_schema" not in query
     assert query["avg_price_min"] == 100 and query["weight_max"] == 2000
     assert "seed_sku" not in query
     assert keyword_terms([{"keyword": "#защитный_чехол"}, {"keyword": "#чехол_для_телефона"}]) == ["чехол"]
@@ -436,7 +437,7 @@ async def test_seed_resolves_category_then_filtered_expansion(library):
         assert c.execute("SELECT COUNT(*) FROM sourcing_tasks WHERE kind='category'").fetchone()[0] == 3
         c.execute("UPDATE sourcing_tasks SET due=9999 WHERE kind<>'category'")
     await acquirer.cycle("a", "token", 1002)
-    assert calls[-1]["weight_max"] == 2000 and calls[-1]["sales_schema"] == "FBS"
+    assert calls[-1]["weight_max"] == 2000 and "sales_schema" not in calls[-1]
     assert "weight_max" not in calls[0]  # Seed identity lookup must not hide an FBO source.
     with library.db.connect() as c:
         assert c.execute("SELECT COUNT(*) FROM sourcing_products").fetchone()[0] == 2

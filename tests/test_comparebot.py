@@ -218,8 +218,9 @@ async def test_cli_reads_result_and_keeps_keys_off_arguments(monkeypatch, candid
     assert await comparebot.screen(candidate, "private-key", ranking=result["search_and_rank"]) == result
 
 
+@pytest.mark.parametrize("source_modes", [("FBS",), ("FBO",), ("FBO", "FBS")])
 async def test_real_node_bridge_uses_selected_price_without_legacy_search(
-    tmp_path, monkeypatch, candidate, result
+    tmp_path, monkeypatch, candidate, result, source_modes
 ):
     files = {
         "ozon-runtime/lib/plugin-source-policy.mjs": "export function verifiedPluginSource(){return false};export function verifiedPluginEvaluation(){return false}",
@@ -244,6 +245,7 @@ export async function maoziProfit({purchasePrice}){return {
         "maozi_direct_new_method/prohibited-categories.json": "{}",
         "flow_b_ef/state/config.json": '{"flow_f":{"blocked_source_brands":[]}}',
     }
+    files["maozi_direct_new_method/maozi_new_method_direct.mjs"] = files["maozi_direct_new_method/maozi_new_method_direct.mjs"].replace("return {verified:true}", "return " + json.dumps({"verified": source_modes == ("FBS",), "modes": source_modes}))
     for name, content in files.items():
         path = tmp_path / name
         path.parent.mkdir(parents=True, exist_ok=True)

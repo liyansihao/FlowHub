@@ -433,8 +433,6 @@ class Worker:
                 capacity = min(30 - pending, (rules["max_items"] - total) if rules.get("max_items") else 30)
                 with self.db.connect() as db:
                     for p in items[:capacity]:
-                        if not p["pure_fbs"] and not library_source:
-                            continue
                         now = time.time()
                         db.execute(
                             "INSERT OR IGNORE INTO jobs(id,owner,source_key,phase,data,modules,next_at,created,updated) VALUES(?,?,?,?,?,?,?,?,?)",

@@ -1,5 +1,6 @@
 """Reuse the exact reviewed source packet; never create another ERP draft for it."""
 import time
+from ..source_modes import supported_source_modes
 
 STATIC_DOSSIER_MAX_AGE = 7 * 86400
 
@@ -49,7 +50,7 @@ def require_unchanged_source(review, latest):
         if after.get(field) and after[field]!=before.get(field):
             raise ValueError('source_package_or_attributes_changed')
     monthly=after.get('monthly_sales') or {}
-    if monthly.get('blocked_by_seller') is True or monthly.get('sales_schema') not in (None,'','FBS'):
+    if monthly.get('blocked_by_seller') is True or (monthly.get('sales_schema') not in (None,'') and not supported_source_modes(monthly.get('sales_schema'))):
         raise ValueError('explicit_source_restriction')
 
 

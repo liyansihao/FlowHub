@@ -55,7 +55,7 @@ def test_scoped_unknown_permission_only_removes_the_two_unknown_checks():
     with pytest.raises(ValueError,match='publication_attributes_missing'):approved(r,{},now=101,allow_unknown=True)
 
 
-@pytest.mark.parametrize('monthly',[{'sales_schema':'FBO'},{'sales_schema':'FBS,FBO'},{'blocked_by_seller':True}])
+@pytest.mark.parametrize('monthly',[{'sales_schema':'UNKNOWN'},{'blocked_by_seller':True}])
 def test_permission_cannot_override_explicit_restrictions(monthly):
     r=report();r['candidate']={'origin':{'plugin_detail':{'monthly_sales':monthly}}}
     with pytest.raises(ValueError,match='explicit_source_restriction'):approved(r,{},now=101,allow_unknown=True)
@@ -65,7 +65,7 @@ def test_live_modes_are_still_checked_with_permission():
     from flowhub.plugin_publication import require_source_modes
     require_source_modes((),{},True,now=101)
     require_source_modes(('FBS',),{},True,now=101)
-    for modes,monthly in [(('FBO',),{}),(('FBS','FBO'),{}),((),{'blocked_by_seller':True}),((),{'sales_schema':'FBO'})]:
+    for modes,monthly in [(('UNKNOWN',),{}),(('FBS','UNKNOWN'),{}),((),{'blocked_by_seller':True}),((),{'sales_schema':'UNKNOWN'})]:
         with pytest.raises(ValueError):require_source_modes(modes,monthly,True,now=101)
     with pytest.raises(ValueError):require_source_modes((),{},False,now=101)
 
@@ -73,3 +73,22 @@ def test_live_modes_are_still_checked_with_permission():
 def test_unknown_permission_never_renews_expired_price():
     r=report();r['candidate']={'origin':{'price_evidence':{'value':40,'currency':'CNY','observed_at':-30000}}}
     with pytest.raises(ValueError,match='price_evidence_stale'):approved(r,{},now=101,allow_unknown=True)
+
+
+@pytest.mark.parametrize('schema,modes', [('FBO',('FBO',)),('FBS',('FBS',)),('FBS,FBO',('FBS','FBO')),('FBO,FBS',('FBO','FBS'))])
+def test_both_source_modes_pass_publication_without_bypassing_follow_or_freshness(schema,modes):
+    from flowhub.plugin_publication import require_source_modes
+    from flowhub.evaluation_requirements import publication_blockers
+    monthly={'sales_schema':schema,'blocked_by_seller':False,'observed_at':100}
+    require_source_modes(modes,monthly,False,now=101)
+    require_source_modes((),monthly,False,now=101)
+    require_source_modes(modes,monthly,True,now=101)
+    r=report();r['candidate']={'origin':{'plugin_detail':{'monthly_sales':monthly}}}
+    r['publication_blockers']=publication_blockers({'plugin_detail':{'monthly_sales':monthly,'attributes':[{}]}},now=101)
+    assert r['publication_blockers']==[]
+    approved(r,{},now=101)
+    approved(r,{},now=101,allow_unknown=True)
+    with pytest.raises(ValueError,match='seller_explicitly_blocks_follow'):
+        require_source_modes(modes,dict(monthly,blocked_by_seller=True),True,now=101)
+    with pytest.raises(ValueError,match='fresh_source_modes_required'):
+        require_source_modes((),monthly,False,now=1001)

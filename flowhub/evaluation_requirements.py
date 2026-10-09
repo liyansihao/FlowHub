@@ -1,5 +1,6 @@
 """Separate usable valuation inputs from publication eligibility."""
 import re,time
+from .source_modes import supported_source_modes
 from .plugin_detail import positive
 
 
@@ -70,7 +71,7 @@ def publication_blockers(product,now=None):
  now=time.time() if now is None else now
  d=product.get('plugin_detail') or {};sales=d.get('monthly_sales') or {};result=[]
  fresh=0<=now-sales.get('observed_at',0)<900
- if not fresh or sales.get('sales_schema')!='FBS':result.append('fresh_pure_fbs_required')
+ if not fresh or not supported_source_modes(sales.get('sales_schema')):result.append('fresh_pure_fbs_required')
  if not fresh or sales.get('blocked_by_seller') is not False:result.append('follow_permission_unverified_or_blocked')
  if not d.get('attributes'):result.append('publication_attributes_missing')
  return result

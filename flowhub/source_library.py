@@ -36,7 +36,7 @@ class SourceFilters:
     weight_max_g: float | None = None
     sales_min: float | None = None
     categories: list[str] = field(default_factory=list)
-    pure_fbs: bool = True
+    pure_fbs: bool = False  # Legacy input retained for saved filter compatibility.
     require_follow_allowed: bool = False
     same_seller_only: bool = False
     max_age_hours: float = 168
@@ -54,6 +54,7 @@ class SourceFilters:
             raise ValueError("invalid follow rule")
         if not isinstance(self.pure_fbs, bool) or self.max_age_hours is None or self.max_age_hours <= 0:
             raise ValueError("invalid freshness or shipping rule")
+        self.pure_fbs = False  # Both FBO and FBS sources are eligible, including old saved filters.
 
 
 def assess(product, filters, now=None):
@@ -89,15 +90,12 @@ def assess(product, filters, now=None):
             and bool(relation.get("root_seeds"))
         )
         (passed if valid else missing).append("same_seller")
-    if filters.pure_fbs:
-        live = product.get("live_check")
-        value = live.get("sales_schema") if live else product.get("sales_schema")
-        (missing if not value else passed if value == "FBS" else failed).append("pure_fbs")
-        if live:
-            observed = numeric(live.get("observed_at"))
-            (missing if observed is None or observed > now or now - observed > 21600 else passed).append(
-                "live_freshness"
-            )
+    live = product.get("live_check")
+    if live:
+        observed = numeric(live.get("observed_at"))
+        (missing if observed is None or observed > now or now - observed > 21600 else passed).append(
+            "live_freshness"
+        )
     at = numeric(product.get("collected_at"))
     (missing if at is None or at > now or now - at > filters.max_age_hours * 3600 else passed).append(
         "freshness"
@@ -549,10 +547,6 @@ class SourceLibrary:
                     + ")"
                 )
                 parameters.extend(filters.categories)
-            if filters.pure_fbs:
-                clauses.append(
-                    "CASE WHEN json_extract(p.body,'$.live_check') IS NULL THEN json_extract(p.body,'$.sales_schema') ELSE json_extract(p.body,'$.live_check.sales_schema') END='FBS'"
-                )
             clauses.extend(["p.updated>=?", "p.updated<=?"])
             now = time.time()
             parameters.extend([now - filters.max_age_hours * 3600, now])

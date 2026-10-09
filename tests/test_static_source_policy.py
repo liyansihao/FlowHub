@@ -24,7 +24,7 @@ def test_old_static_evidence_is_reused_without_renewing_its_timestamp():
 @pytest.mark.parametrize('field,value',[
     ('weight_g',30),('dimensions_mm',[100,50,20]),('attributes',[{'id':1,'values':['b']}]),
     ('variant_id','new'),('monthly_sales',{'blocked_by_seller':True}),
-    ('monthly_sales',{'sales_schema':'FBO'})])
+    ('monthly_sales',{'sales_schema':'UNKNOWN'})])
 def test_newer_changed_facts_or_explicit_restrictions_still_block(field,value):
     review,product=packet();require_unchanged_source(review,product)
     product['plugin_detail'][field]=value
@@ -58,3 +58,10 @@ def test_repair_keeps_expired_or_incomplete_dossier_missing(monkeypatch):
     monkeypatch.setattr('time.time',lambda:100+15*3600)
     product['plugin_detail']['attributes']=[]
     assert {'attributes','fresh_dossier'}<=set(missing_fields(product))
+
+
+@pytest.mark.parametrize('schema',['FBO','FBS','FBO,FBS'])
+def test_fbo_and_fbs_do_not_invalidate_unchanged_source(schema):
+    review,product=packet()
+    product['plugin_detail']['monthly_sales']={'sales_schema':schema}
+    require_unchanged_source(review,product)

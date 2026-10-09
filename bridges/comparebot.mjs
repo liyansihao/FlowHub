@@ -1,5 +1,6 @@
-// compareBot supplier binding with existing ERP product, FBS and profit verification.
+// compareBot supplier binding with existing ERP product, source fulfillment and profit verification.
 import fs from 'node:fs/promises';
+import {verifiedPluginSource,verifiedPluginEvaluation,supportedSourceModes} from './plugin-source-policy.mjs';
 import {cachedCategory} from './category-cache.mjs';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
@@ -39,7 +40,6 @@ async function main(){
  const {blockedImportBrand}=await load('flow_ef_category_fbs/lib/brand-import-conflict.mjs');
  const category=engine.categoryPolicyFor(product);
  const plugin=product.plugin_detail, monthly=plugin?.monthly_sales;
- const {verifiedPluginSource,verifiedPluginEvaluation}=await load('ozon-runtime/lib/plugin-source-policy.mjs');
  const explicitPluginSource=verifiedPluginSource(product);
  const q=product.price_evidence;
  const weightFirst=product.weight_first_valuation===true && product.profit_evaluation_only===true
@@ -93,8 +93,9 @@ async function main(){
  if(engine.prohibitedLeafCategoryMatch(categoryData))return {rejected:'prohibited_leaf'};
  stage('fbs_verification');
  let fbs=evaluationOnly?{verified:false,source:'deferred_until_publication',raw_mode:monthly?.sales_schema??null}:await engine.observePureFbs(transport,product,'flowef-production-decision');
+ if(!evaluationOnly&&supportedSourceModes(fbs.modes))fbs={...fbs,verified:true,rule:'FBO and FBS source modes allowed'};
  if(!fbs.verified&&(fbs.raw_mode===null||fbs.raw_mode===undefined||fbs.raw_mode==='')&&explicitPluginSource&&Date.now()/1000-monthly.observed_at<900){
-  fbs={...fbs,verified:true,modes:['FBS'],raw_mode:'FBS',source:'plugin-seller-sku-sales',observed_at:new Date(monthly.observed_at*1000).toISOString(),cache_observation:fbs};
+  fbs={...fbs,verified:true,modes:monthly.sales_schema.split(','),raw_mode:monthly.sales_schema,source:'plugin-seller-sku-sales',observed_at:new Date(monthly.observed_at*1000).toISOString(),cache_observation:fbs};
  }
  if(!fbs.verified&&!evaluationOnly)return {rejected:'source_unverified'};
  const evaluatedSell=evaluationOnly?Math.round(product.price_evidence.value*(product.price_evidence.currency==='CNY'?1:rubCny)*100)/100:undefined;
